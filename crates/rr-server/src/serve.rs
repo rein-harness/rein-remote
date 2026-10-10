@@ -140,7 +140,7 @@ pub fn run(source: Box<dyn Source>, opts: Options) -> Result<(), String> {
         let Ok(stream) = conn else { continue };
         let (source, stats, opts, wt, tls) = (source.clone(), stats.clone(), opts.clone(), wt.clone(), tls.clone());
         std::thread::spawn(move || {
-            if let Err(e) = handle(stream, source, stats, &opts, &wt, tls.as_ref()) {
+            if let Err(e) = handle(stream, source, stats, &opts, &wt, tls.as_ref()).or_else(|e| if e.is_empty() { Ok(()) } else { Err(e) }) {
                 eprintln!("rein-remote: {e}");
             }
         });

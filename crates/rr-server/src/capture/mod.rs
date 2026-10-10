@@ -5,6 +5,7 @@
 
 #[cfg(target_os = "macos")]
 pub mod mac;
+pub mod pipe;
 pub mod vnc;
 #[cfg(windows)]
 pub mod win;

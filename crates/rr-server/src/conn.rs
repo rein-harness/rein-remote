@@ -32,6 +32,10 @@ impl Conn {
         let mut b = [0u8; 1024];
         while !head.windows(4).any(|w| w == b"\r\n\r\n") {
             let n = self.read(&mut b).map_err(|e| e.to_string())?;
+            // Nothing at all: a connection a browser opened ahead and never used (not worth a word).
+            if n == 0 && head.is_empty() {
+                return Err(String::new());
+            }
             if n == 0 || head.len() > 16 * 1024 {
                 return Err("an incomplete request".into());
             }

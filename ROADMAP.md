@@ -53,6 +53,9 @@ has been verified.
 - VNC as a source (any OS): a VM's or an emulator's screen as video. **Status:** in (RFB 3.3–3.8,
   none or VNC's password, raw and copy-rect, BGRX so rows go in as they come); verified against
   Xvnc with a password in a Linux container: an xterm streamed and a typed command ran.
+- Frames from another program (`--pipe WxH`: length-prefixed JPEGs on stdin, the viewer's input as
+  JSON lines on stdout), for Rein's headless browser: web-app previews as video. **Status:** in;
+  verified with JPEGs fed at 20 fps (47 frames in 3 s) and a click coming back as events.
 - Zero-copy on the GPU, capture to encoder: DXGI / Windows Graphics Capture textures into NVENC,
   AMF or QSV; ScreenCaptureKit IOSurfaces into VideoToolbox; on Linux, PipeWire or KMS DMA-BUF
   into VA-API or NVENC. The CPU never copies a frame.
