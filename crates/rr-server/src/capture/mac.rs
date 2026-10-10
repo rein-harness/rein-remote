@@ -192,9 +192,8 @@ pub fn windows() -> Result<Vec<WindowInfo>, String> {
 /// The latest frame ScreenCaptureKit delivered, and how many it has.
 #[derive(Default)]
 struct Latest {
-    bgra: Vec<u8>,
-    stride: usize,
-    rows: usize,
+    /// The latest image as ScreenCaptureKit gave it (in GPU memory): read only when needed.
+    image: Option<Sendable<objc2_core_foundation::CFRetained<objc2_core_video::CVBuffer>>>,
     count: u64,
 }
 
@@ -213,21 +212,12 @@ define_class!(
             if kind != SCStreamOutputType::Screen {
                 return;
             }
-            // An idle frame (nothing changed) has no image.
+            // An idle frame (nothing changed) has no image. The image is kept, not copied: the
+            // hardware encoder reads it where it is.
             let Some(pb) = (unsafe { sample.image_buffer() }) else { return };
-            unsafe { CVPixelBufferLockBaseAddress(&pb, CVPixelBufferLockFlags::ReadOnly) };
-            let base = CVPixelBufferGetBaseAddress(&pb) as *const u8;
-            let (stride, rows) = (CVPixelBufferGetBytesPerRow(&pb), CVPixelBufferGetHeight(&pb));
-            if !base.is_null() {
-                let bytes = unsafe { std::slice::from_raw_parts(base, stride * rows) };
-                let mut l = self.ivars().lock().unwrap();
-                l.bgra.clear();
-                l.bgra.extend_from_slice(bytes);
-                l.stride = stride;
-                l.rows = rows;
-                l.count += 1;
-            }
-            unsafe { CVPixelBufferUnlockBaseAddress(&pb, CVPixelBufferLockFlags::ReadOnly) };
+            let mut l = self.ivars().lock().unwrap();
+            l.image = Some(Sendable(pb));
+            l.count += 1;
         }
     }
 );
@@ -446,14 +436,32 @@ impl Source for MacWindow {
         Some(self.latest.lock().unwrap().count)
     }
 
-    fn grab(&mut self) -> Result<Frame<'_>, String> {
+    fn surface(&mut self) -> Option<super::Surface> {
         let l = self.latest.lock().unwrap();
-        if l.count > 0 && l.rows >= self.h && l.stride >= self.w * 4 {
-            self.frame.clear();
-            self.frame.extend_from_slice(&l.bgra[..l.stride * self.h]);
-            self.stride = l.stride;
+        let pb = l.image.as_ref()?;
+        // Retained for the encoder; released when it drops the Surface.
+        let ptr = objc2_core_foundation::CFRetained::as_ptr(&pb.0).as_ptr() as *mut std::ffi::c_void;
+        extern "C" {
+            fn CFRetain(p: *const std::ffi::c_void) -> *const std::ffi::c_void;
         }
-        drop(l);
+        unsafe { CFRetain(ptr) };
+        Some(super::Surface(ptr))
+    }
+
+    fn grab(&mut self) -> Result<Frame<'_>, String> {
+        // The software encoder's way: the image read into memory.
+        let image = self.latest.lock().unwrap().image.as_ref().map(|i| Sendable(i.0.clone()));
+        if let Some(Sendable(pb)) = image {
+            unsafe { CVPixelBufferLockBaseAddress(&pb, CVPixelBufferLockFlags::ReadOnly) };
+            let base = CVPixelBufferGetBaseAddress(&pb) as *const u8;
+            let (stride, rows) = (CVPixelBufferGetBytesPerRow(&pb), CVPixelBufferGetHeight(&pb));
+            if !base.is_null() && rows >= self.h && stride >= self.w * 4 {
+                self.frame.clear();
+                self.frame.extend_from_slice(unsafe { std::slice::from_raw_parts(base, stride * self.h) });
+                self.stride = stride;
+            }
+            unsafe { CVPixelBufferUnlockBaseAddress(&pb, CVPixelBufferLockFlags::ReadOnly) };
+        }
         Ok(Frame {
             bgra: &self.frame,
             stride: self.stride,

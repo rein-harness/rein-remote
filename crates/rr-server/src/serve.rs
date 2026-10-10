@@ -304,9 +304,16 @@ fn session(mut ws: WebSocket<TcpStream>, source: Arc<Mutex<Box<dyn Source>>>, st
                 let captured_at = now_us();
                 let (encoded, grab_ms) = {
                     let mut src = source.lock().unwrap();
-                    let frame = src.grab()?;
-                    let grab_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                    (enc.encode(frame.bgra, frame.stride)?, grab_ms)
+                    // Zero copy where both ends can: the system's own frame straight into the hardware encoder.
+                    let surface = if enc.takes_surfaces() { src.surface() } else { None };
+                    if let Some(surface) = surface {
+                        let grab_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                        (enc.encode_surface(&surface)?, grab_ms)
+                    } else {
+                        let frame = src.grab()?;
+                        let grab_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                        (enc.encode(frame.bgra, frame.stride)?, grab_ms)
+                    }
                 };
                 let encode_ms = t0.elapsed().as_secs_f64() * 1000.0 - grab_ms;
                 if let Some(e) = encoded {

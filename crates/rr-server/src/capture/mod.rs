@@ -35,6 +35,28 @@ pub trait Source: Send {
     fn generation(&mut self) -> Option<u64> {
         None
     }
+    /// The latest frame as the system's own image (macOS: a CVPixelBuffer in GPU memory), for an
+    /// encoder that takes it as it is: no copy at all. None: use `grab`.
+    fn surface(&mut self) -> Option<Surface> {
+        None
+    }
+}
+
+/// A frame the hardware encoder reads in place: a retained CVPixelBuffer (macOS).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // only macOS sources make one so far
+pub struct Surface(pub *mut std::ffi::c_void);
+
+// Retained for as long as it's held; released when dropped.
+unsafe impl Send for Surface {}
+
+#[cfg(target_os = "macos")]
+impl Drop for Surface {
+    fn drop(&mut self) {
+        extern "C" {
+            fn CFRelease(p: *const std::ffi::c_void);
+        }
+        unsafe { CFRelease(self.0) }
+    }
 }
 
 pub struct Pointer {

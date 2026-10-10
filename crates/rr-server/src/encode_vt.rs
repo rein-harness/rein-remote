@@ -243,7 +243,7 @@ impl VideoToolbox {
         }
         unsafe {
             let mut pixels: *mut c_void = std::ptr::null_mut();
-            // The frame's own memory, valid until the encode below returns (it waits for the frame).
+            // The frame's own memory, valid until the encode returns (it waits for the frame).
             let status = CVPixelBufferCreateWithBytes(
                 std::ptr::null(),
                 self.width,
@@ -259,34 +259,45 @@ impl VideoToolbox {
             if status != 0 || pixels.is_null() {
                 return Err(format!("VideoToolbox: can't wrap the frame ({status})"));
             }
-            let force = std::mem::take(&mut self.keyframe_next);
-            let props = force.then(|| {
-                CFDictionary::from_CFType_pairs(&[(
-                    CFString::wrap_under_get_rule(kVTEncodeFrameOptionKey_ForceKeyFrame),
-                    CFBoolean::true_value().as_CFType(),
-                )])
-            });
-            self.frame_no += 1;
-            let pts = CMTime {
-                value: self.frame_no,
-                timescale: self.fps,
-                flags: VALID,
-                epoch: 0,
-            };
-            let status = VTCompressionSessionEncodeFrame(
-                self.session,
-                pixels,
-                pts,
-                INVALID_TIME,
-                props.as_ref().map_or(std::ptr::null(), |p| p.as_concrete_TypeRef() as *const c_void),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            );
-            VTCompressionSessionCompleteFrames(self.session, INVALID_TIME);
+            let r = self.encode_image(pixels);
             CFRelease(pixels as CFTypeRef);
-            if status != 0 {
-                return Err(format!("VideoToolbox: encode failed ({status})"));
-            }
+            r
+        }
+    }
+
+    /// A frame already in the system's own form (a CVPixelBuffer from ScreenCaptureKit), read where
+    /// it is: no copy.
+    pub fn encode_surface(&mut self, surface: &crate::capture::Surface) -> Result<Option<Encoded>, String> {
+        unsafe { self.encode_image(surface.0) }
+    }
+
+    unsafe fn encode_image(&mut self, pixels: *mut c_void) -> Result<Option<Encoded>, String> {
+        let force = std::mem::take(&mut self.keyframe_next);
+        let props = force.then(|| {
+            CFDictionary::from_CFType_pairs(&[(
+                CFString::wrap_under_get_rule(kVTEncodeFrameOptionKey_ForceKeyFrame),
+                CFBoolean::true_value().as_CFType(),
+            )])
+        });
+        self.frame_no += 1;
+        let pts = CMTime {
+            value: self.frame_no,
+            timescale: self.fps,
+            flags: VALID,
+            epoch: 0,
+        };
+        let status = VTCompressionSessionEncodeFrame(
+            self.session,
+            pixels,
+            pts,
+            INVALID_TIME,
+            props.as_ref().map_or(std::ptr::null(), |p| p.as_concrete_TypeRef() as *const c_void),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        VTCompressionSessionCompleteFrames(self.session, INVALID_TIME);
+        if status != 0 {
+            return Err(format!("VideoToolbox: encode failed ({status})"));
         }
         self.out.lock().unwrap().take().transpose()
     }

@@ -135,6 +135,20 @@ impl Video {
             Self::Hardware(e) => e.encode(bgra, stride),
         }
     }
+
+    /// Whether this encoder reads the system's own frames in place (zero copy).
+    pub fn takes_surfaces(&self) -> bool {
+        !matches!(self, Self::Software(_))
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+    pub fn encode_surface(&mut self, surface: &crate::capture::Surface) -> Result<Option<Encoded>, String> {
+        match self {
+            Self::Software(_) => Err("the software encoder reads frames from memory".into()),
+            #[cfg(target_os = "macos")]
+            Self::Hardware(e) => e.encode_surface(surface),
+        }
+    }
 }
 
 #[cfg(test)]
