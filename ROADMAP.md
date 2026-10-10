@@ -50,8 +50,17 @@ has been verified.
 - macOS: ScreenCaptureKit (window, app, display), VideoToolbox H.264/HEVC, CGEvent input.
 - Windows: Windows Graphics Capture, Media Foundation / NVENC / AMF / QSV, SendInput.
 - Hardware detection with the software fallback.
+- Zero-copy on the GPU, capture to encoder: DXGI / Windows Graphics Capture textures into NVENC,
+  AMF or QSV; ScreenCaptureKit IOSurfaces into VideoToolbox; on Linux, PipeWire or KMS DMA-BUF
+  into VA-API or NVENC. The CPU never copies a frame.
+- High refresh: the client reports its display's real refresh rate (measured, not assumed) and the
+  server paces to it, up to 240 Hz. Budget at 200 Hz: 5 ms a frame end to end.
+- Near-zero cost: a still screen sends and encodes nothing (no periodic refresh while nothing
+  changes); under motion a few percent of one core with a hardware encoder. Software encoding
+  stays the fallback, at the frame rate the CPU can hold.
 - **Verified:** a window on each streams with input (macOS on a real Mac; Windows on CI runners and a
-  real machine), hardware and software paths both.
+  real machine), hardware and software paths both; 200 fps measured glass to glass on a machine
+  with a hardware encoder, with the server's CPU use written down (idle and under motion).
 
 ## Phase 4 — fast transport and adaptation
 
