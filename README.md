@@ -23,16 +23,29 @@ Early: the design is done and being built one verified piece at a time
 | Piece | Status |
 |---|---|
 | Protocol (`rr-proto`), versioned per message | done (phase 0: CI on Linux, macOS, Windows, WebAssembly) |
-| Server: Linux | todo (phase 1) |
+| Server: Linux (X11, a real or virtual display) | working: capture, software H.264, mouse, wheel and keyboard input (phase 1) |
 | Server: macOS | todo (phase 3) |
 | Server: Windows | todo (phase 3) |
-| Client: web (WebCodecs) | todo (phase 1) |
+| Client: web (WebCodecs, embeddable `<rein-remote>`) | working: decode (hardware when there is), mouse, wheel, keyboard (phase 1) |
 | Client: Windows / macOS / Linux | todo (phase 5) |
 | Client: iOS / iPadOS / Android | todo (phase 5) |
-| Transport: WebSocket over HTTPS | todo (phase 1) |
+| Transport: WebSocket | working, with keyframe-and-skip when the link backs up (phase 1) |
 | Transport: QUIC / WebTransport, relay | todo (phase 4) |
 | Adaptive bitrate, audio | todo (phase 4) |
 | Pairing, enterprise sign-in and policy | todo (phases 4, 6) |
+
+## Try it
+
+```sh
+cargo build --release -p rr-server
+./target/release/rein-remote serve --display :0        # a Linux X display (or a virtual one: Xvfb :20)
+./target/release/rein-remote serve --test-pattern      # any platform: a moving test pattern
+# then open http://127.0.0.1:7979 in a browser
+```
+
+Measured (phase 1, software H.264, 1280×720, an x86 container, decoded in Chrome in software):
+capture to decoded **32 ms median, 47 ms at p95**; encoding 22 ms a frame. Hardware encoders and
+faster capture are what come next (see the roadmap).
 
 ## How it works
 

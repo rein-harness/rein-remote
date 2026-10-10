@@ -19,6 +19,11 @@ has been verified.
 - Web client: WebCodecs decode, canvas present, pointer/keyboard/touch input, cursor apart.
 - **Verified:** in a Linux container, an app on a virtual display streams to headless Chrome; input
   reaches the app; glass-to-glass latency measured with a timestamp overlay and written down.
+- **Status:** the stream works and is measured: an xterm on Xvfb streamed to Chrome, a click
+  focused it and typed text (capitals and symbols included) ran, 32 ms median / 47 ms p95 capture
+  to decoded, 22 ms encode at 1280×720 in software. Still to do in this phase: the cursor sent
+  apart, touch input in the web client, MIT-SHM + XDamage capture and a faster encode path (to hold
+  60 fps in software).
 
 ## Phase 2 — Rein previews through Rein Remote
 

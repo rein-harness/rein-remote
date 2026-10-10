@@ -117,6 +117,11 @@ Three tiers, picked automatically, fastest first:
 Licensing: Rein Remote is MIT. GPL code (x264, ffmpeg's GPL parts) is never linked. The software
 encoders above are BSD-licensed; hardware encoders are the operating systems' and vendors' own APIs.
 
+Patents: H.264 and HEVC are covered by patent pools. Cisco pays the H.264 royalties for its own
+prebuilt openh264 binaries, not for openh264 built from source, so a distributor should either load
+Cisco's binary at runtime (the openh264 crate's `libloading` mode) or rely on the platform's
+encoder; VP9 and AV1 are royalty-free and are the safe software default to ship.
+
 ## Capture and input, per platform
 
 | | Capture | Input |
