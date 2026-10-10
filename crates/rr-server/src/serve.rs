@@ -38,6 +38,10 @@ pub struct Stats {
     pub grab_ms: Vec<f64>,
     /// Ticks with nothing to read or encode (the screen didn't change).
     pub still: u64,
+    /// What the link takes now (the adaptive controller's target) and its queuing.
+    pub kbps: u32,
+    pub fps: u32,
+    pub queuing_ms: f64,
 }
 
 fn now_us() -> u64 {
@@ -90,6 +94,11 @@ fn handle(mut stream: TcpStream, source: Arc<Mutex<Box<dyn Source>>>, stats: Arc
         return Ok(());
     }
     if path.starts_with("/stream") && upgrade {
+        // Frames go at once, and the kernel holds only ~50 ms of them at the top bitrate: a slow link
+        // shows up as a connection that backs up within a frame or two (keyframe-and-skip, and the
+        // controller backs off), instead of a second of video queued where neither can see it.
+        let _ = stream.set_nodelay(true);
+        let _ = socket2::SockRef::from(&stream).set_send_buffer_size((opts.bitrate_kbps as usize * 1000 / 8 / 20).max(64 * 1024));
         let ws = tungstenite::accept(stream).map_err(|e| format!("websocket: {e}"))?;
         return session(ws, source, stats, opts);
     }
@@ -118,7 +127,7 @@ fn stats_json(s: &Stats) -> String {
         v[((v.len() - 1) as f64 * p) as usize]
     };
     format!(
-        r#"{{"frames":{},"keyframes":{},"skipped_backed_up":{},"bytes":{},"rtt_ms":{:.1},"latency_ms":{{"p50":{:.1},"p95":{:.1},"samples":{}}},"encode_ms":{{"p50":{:.1},"p95":{:.1}}},"grab_ms":{{"p50":{:.1},"p95":{:.1}}},"still":{}}}"#,
+        r#"{{"frames":{},"keyframes":{},"skipped_backed_up":{},"bytes":{},"rtt_ms":{:.1},"latency_ms":{{"p50":{:.1},"p95":{:.1},"samples":{}}},"encode_ms":{{"p50":{:.1},"p95":{:.1}}},"grab_ms":{{"p50":{:.1},"p95":{:.1}}},"still":{},"kbps":{},"fps":{},"queuing_ms":{:.1}}}"#,
         s.frames,
         s.keyframes,
         s.skipped_backed_up,
@@ -132,6 +141,9 @@ fn stats_json(s: &Stats) -> String {
         pct(&s.grab_ms, 0.5),
         pct(&s.grab_ms, 0.95),
         s.still,
+        s.kbps,
+        s.fps,
+        s.queuing_ms,
     )
 }
 
@@ -203,9 +215,13 @@ fn session(mut ws: WebSocket<TcpStream>, source: Arc<Mutex<Box<dyn Source>>>, st
     ws.get_mut().set_nonblocking(true).map_err(|e| e.to_string())?;
     eprintln!("rein-remote: {} connected ({:?} {ew}×{eh} at {} fps)", client.name, codec, opts.fps);
 
-    let frame_time = Duration::from_secs_f64(1.0 / opts.fps.max(1) as f64);
+    let mut frame_time = Duration::from_secs_f64(1.0 / opts.fps.max(1) as f64);
+    let mut adapt = crate::adapt::Adapt::new(opts.bitrate_kbps, opts.fps);
+    let mut last_adapt = Instant::now();
     let mut frame_no: u32 = 0;
-    let mut captured: std::collections::VecDeque<(u32, u64)> = Default::default();
+    // Frames sent: number, capture time (µs, for latency) and when they went out (for the round trip).
+    let mut captured: std::collections::VecDeque<(u32, u64, Instant)> = Default::default();
+    let mut next_frame = Instant::now();
     let mut backed_up = false;
     let mut last_ping = Instant::now() - Duration::from_secs(10);
     let mut pings: std::collections::HashMap<u32, Instant> = Default::default();
@@ -216,8 +232,7 @@ fn session(mut ws: WebSocket<TcpStream>, source: Arc<Mutex<Box<dyn Source>>>, st
     let mut last_frame = Instant::now();
     const REFRESH: Duration = Duration::from_secs(1);
     loop {
-        let tick = Instant::now();
-        // Everything the client sent since the last frame.
+        // Everything the client sent (as soon as it arrives: see the wait at the end).
         loop {
             match ws.read() {
                 Ok(Ws::Binary(b)) => {
@@ -231,7 +246,10 @@ fn session(mut ws: WebSocket<TcpStream>, source: Arc<Mutex<Box<dyn Source>>>, st
                             }
                             Some(Message::KeyframeRequest) => enc.keyframe(),
                             Some(Message::Feedback(f)) => {
-                                if let Some(&(_, at_us)) = captured.iter().find(|(n, _)| *n == f.frame) {
+                                if let Some(&(_, at_us, sent)) = captured.iter().find(|(n, _, _)| *n == f.frame) {
+                                    // The frame's round trip on this machine's clock alone (the client's can
+                                    // be offset and drift, as a VM's does): queuing shows as it growing.
+                                    adapt.feedback(sent.elapsed().as_secs_f64() * 1000.0, Instant::now());
                                     let mut s = stats.lock().unwrap();
                                     let l = (now_us().saturating_sub(at_us)) as f64 / 1000.0 - s.rtt_ms / 2.0;
                                     s.latency_ms.push(l.max(0.0));
@@ -280,67 +298,70 @@ fn session(mut ws: WebSocket<TcpStream>, source: Arc<Mutex<Box<dyn Source>>>, st
             pings.insert(id, Instant::now());
             send(&mut ws, &Message::Ping { id, sent_us: now_us() })?;
         }
-        // Backed up: send nothing new until what's queued is out, then start again on a keyframe
-        // (the client never decodes a frame whose reference it didn't get, and never falls behind).
-        if !flushed(&mut ws)? {
-            if !backed_up {
-                backed_up = true;
-            }
-            stats.lock().unwrap().skipped_backed_up += 1;
-        } else {
-            if backed_up {
-                backed_up = false;
-                enc.keyframe();
-            }
-            // A still screen (the source says nothing changed) is neither read nor encoded, except for a
-            // keyframe someone needs and a refresh each second.
-            let generation = source.lock().unwrap().generation();
-            if generation.is_some() && generation == seen_generation && !enc.wants_keyframe() && last_frame.elapsed() < REFRESH {
-                stats.lock().unwrap().still += 1;
+        // A frame when one is due (input is handled between frames, the moment it comes).
+        if Instant::now() >= next_frame {
+            next_frame = (next_frame + frame_time).max(Instant::now());
+            // Backed up: encode nothing new until what's queued is out. No keyframe after: nothing was
+            // encoded meanwhile, so the next frame refers to the last one sent, which the client has (a
+            // keyframe here would be the biggest frame at the worst moment).
+            if !flushed(&mut ws)? {
+                if !backed_up {
+                    backed_up = true;
+                }
+                adapt.backed_up();
+                stats.lock().unwrap().skipped_backed_up += 1;
             } else {
-                seen_generation = generation;
-                last_frame = Instant::now();
-                let t0 = Instant::now();
-                let captured_at = now_us();
-                let (encoded, grab_ms) = {
-                    let mut src = source.lock().unwrap();
-                    // Zero copy where both ends can: the system's own frame straight into the hardware encoder.
-                    let surface = if enc.takes_surfaces() { src.surface() } else { None };
-                    if let Some(surface) = surface {
-                        let grab_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                        (enc.encode_surface(&surface)?, grab_ms)
-                    } else {
-                        let frame = src.grab()?;
-                        let grab_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                        (enc.encode(frame.bgra, frame.stride)?, grab_ms)
-                    }
-                };
-                let encode_ms = t0.elapsed().as_secs_f64() * 1000.0 - grab_ms;
-                if let Some(e) = encoded {
-                    frame_no = frame_no.wrapping_add(1);
-                    captured.push_back((frame_no, captured_at));
-                    if captured.len() > 600 {
-                        captured.pop_front();
-                    }
-                    let len = e.data.len() as u64;
-                    send(
-                        &mut ws,
-                        &Message::Video(Video {
-                            keyframe: e.keyframe,
-                            frame: frame_no,
-                            timestamp_us: captured_at,
-                            data: e.data,
-                        }),
-                    )?;
-                    let mut s = stats.lock().unwrap();
-                    s.frames += 1;
-                    s.bytes += len;
-                    s.keyframes += e.keyframe as u64;
-                    s.encode_ms.push(encode_ms);
-                    s.grab_ms.push(grab_ms);
-                    if s.encode_ms.len() > 2000 {
-                        s.encode_ms.drain(..1000);
-                        s.grab_ms.drain(..1000);
+                backed_up = false;
+                // A still screen (the source says nothing changed) is neither read nor encoded, except for a
+                // keyframe someone needs and a refresh each second.
+                let generation = source.lock().unwrap().generation();
+                if generation.is_some() && generation == seen_generation && !enc.wants_keyframe() && last_frame.elapsed() < REFRESH {
+                    stats.lock().unwrap().still += 1;
+                } else {
+                    seen_generation = generation;
+                    last_frame = Instant::now();
+                    let t0 = Instant::now();
+                    let captured_at = now_us();
+                    let (encoded, grab_ms) = {
+                        let mut src = source.lock().unwrap();
+                        // Zero copy where both ends can: the system's own frame straight into the hardware encoder.
+                        let surface = if enc.takes_surfaces() { src.surface() } else { None };
+                        if let Some(surface) = surface {
+                            let grab_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                            (enc.encode_surface(&surface)?, grab_ms)
+                        } else {
+                            let frame = src.grab()?;
+                            let grab_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                            (enc.encode(frame.bgra, frame.stride)?, grab_ms)
+                        }
+                    };
+                    let encode_ms = t0.elapsed().as_secs_f64() * 1000.0 - grab_ms;
+                    if let Some(e) = encoded {
+                        frame_no = frame_no.wrapping_add(1);
+                        captured.push_back((frame_no, captured_at, Instant::now()));
+                        if captured.len() > 600 {
+                            captured.pop_front();
+                        }
+                        let len = e.data.len() as u64;
+                        send(
+                            &mut ws,
+                            &Message::Video(Video {
+                                keyframe: e.keyframe,
+                                frame: frame_no,
+                                timestamp_us: captured_at,
+                                data: e.data,
+                            }),
+                        )?;
+                        let mut s = stats.lock().unwrap();
+                        s.frames += 1;
+                        s.bytes += len;
+                        s.keyframes += e.keyframe as u64;
+                        s.encode_ms.push(encode_ms);
+                        s.grab_ms.push(grab_ms);
+                        if s.encode_ms.len() > 2000 {
+                            s.encode_ms.drain(..1000);
+                            s.grab_ms.drain(..1000);
+                        }
                     }
                 }
             }
@@ -349,8 +370,30 @@ fn session(mut ws: WebSocket<TcpStream>, source: Arc<Mutex<Box<dyn Source>>>, st
             last_report = Instant::now();
             eprintln!("rein-remote: {}", stats_json(&stats.lock().unwrap()));
         }
-        if let Some(rest) = frame_time.checked_sub(tick.elapsed()) {
-            std::thread::sleep(rest);
+        // A few times a second: what the link takes now.
+        if last_adapt.elapsed() > Duration::from_millis(250) {
+            last_adapt = Instant::now();
+            let off = std::env::var("RR_ADAPT").as_deref() == Ok("off");
+            if let Some(t) = adapt.tick(last_adapt).filter(|_| !off) {
+                enc.set_bitrate(t.kbps)?;
+                frame_time = Duration::from_secs_f64(1.0 / t.fps.max(1) as f64);
+            }
+            let t = adapt.target();
+            if std::env::var_os("RR_DEBUG_ADAPT").is_some() {
+                eprintln!("adapt: queuing {:.0} ms, target {:?}", adapt.queuing_ms(), t);
+            }
+            let mut s = stats.lock().unwrap();
+            (s.kbps, s.fps, s.queuing_ms) = (t.kbps, t.fps, adapt.queuing_ms());
+        }
+        // Until the next frame is due, wait for the client: a message wakes this at once (input
+        // reaches the source and feedback is timed without waiting for the next frame).
+        let rest = next_frame.saturating_duration_since(Instant::now());
+        if !rest.is_zero() {
+            let sock = ws.get_mut();
+            let _ = sock.set_nonblocking(false);
+            let _ = sock.set_read_timeout(Some(rest));
+            let _ = sock.peek(&mut [0u8; 1]);
+            let _ = sock.set_nonblocking(true);
         }
     }
 }

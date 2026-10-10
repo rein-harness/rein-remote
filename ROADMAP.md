@@ -81,6 +81,17 @@ has been verified.
 - LAN discovery (mDNS), pairing codes, mutual keys.
 - Rendezvous with NAT hole punching; the relay (self-hostable).
 - Delay-based bitrate controller; frame rate and resolution adaptation; intra refresh.
+  - **Status:** a delay-based controller (each frame's round trip on the server's own clock, its
+    rise over the lowest of the last 10 s is queuing; a backed-up socket counts too) cuts the
+    bitrate and frame rate at once and climbs back slowly; both encoders change bitrate live (our own
+    binding to openh264, which also encodes in 4 slices on 4 cores: 8.6 ms at 1080p, was 12.9).
+    The socket's send buffer holds ~50 ms, so congestion shows within a frame; input and feedback are
+    handled the moment they arrive, not once a frame; no keyframe after a backlog. Measured with tc
+    (netem 40 ms + tbf) in a Linux container, a log-scrolling terminal at 1280×720: 22 ms p50 on an
+    open link (28 before), ~48 ms at 1.5 Mbit/s and 800 kbit/s with no false alarms; full-screen
+    random text over 1.5 Mbit/s (more than the link can carry): 229 ms p50 adapting against 505 ms
+    not. Still to tune: the target oscillates above capacity on such content, and the first keyframe
+    takes a second on a 300 kbit/s link (resolution adaptation and a smaller first keyframe are next).
 - Opus audio, synchronized with video.
 - **Verified:** latency and quality measured on LAN, on a throttled link (tc netem: loss, delay,
   low bandwidth) and through the relay; a fast-moving game scene stays smooth on the bad link.

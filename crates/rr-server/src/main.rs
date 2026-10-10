@@ -10,6 +10,7 @@
 //!   rein-remote serve --listen 127.0.0.1:0 --token T   # a free port (printed), the stream needs ?token=T
 //!                                                      # (or REIN_REMOTE_TOKEN; kept out of `ps`)
 
+mod adapt;
 mod capture;
 mod encode;
 #[cfg(target_os = "macos")]

@@ -2,17 +2,25 @@
 //! no B-frames, bitrate rate control, a keyframe on request. Hardware encoders come per platform in
 //! later phases behind the same `encode` call.
 
-use openh264::encoder::{Encoder, EncoderConfig, FrameType, RateControlMode, UsageType};
-use openh264::formats::YUVSlices;
-use openh264::OpenH264API;
+use openh264_sys2::*;
+use std::ptr::null_mut;
 
+/// H.264 in software: openh264's own interface, so its bitrate changes live (no keyframe) and a
+/// frame is cut into slices encoded on several cores at once.
 pub struct H264 {
-    enc: Encoder,
+    api: DynamicAPI,
+    enc: *mut ISVCEncoder,
     width: usize,
     height: usize,
     keyframe_next: bool,
     yuv: crate::yuv::I420,
+    kbps: u32,
+    bs: Box<SFrameBSInfo>,
+    started: std::time::Instant,
 }
+
+// The encoder is only used by whoever holds it.
+unsafe impl Send for H264 {}
 
 pub struct Encoded {
     pub data: Vec<u8>,
@@ -23,20 +31,58 @@ impl H264 {
     pub fn new(width: usize, height: usize, fps: f32, bitrate_kbps: u32) -> Result<Self, String> {
         // H.264 needs even dimensions.
         let (width, height) = (width & !1, height & !1);
-        let config = EncoderConfig::new()
-            .usage_type(UsageType::ScreenContentRealTime)
-            .rate_control_mode(RateControlMode::Bitrate)
-            .set_bitrate_bps(bitrate_kbps.saturating_mul(1000))
-            .max_frame_rate(fps)
-            // A still screen sends almost nothing.
-            .enable_skip_frame(true);
-        let enc = Encoder::with_api_config(OpenH264API::from_source(), config).map_err(|e| format!("openh264: {e}"))?;
+        let api = DynamicAPI::from_source();
+        let mut enc: *mut ISVCEncoder = null_mut();
+        // Slices, one a core (up to 4): a frame is encoded in parallel.
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 4) as u16;
+        unsafe {
+            if api.WelsCreateSVCEncoder(&mut enc) != 0 || enc.is_null() {
+                return Err("openh264: can't create an encoder".into());
+            }
+            let vt = &**enc;
+            let mut p: SEncParamExt = std::mem::zeroed();
+            vt.GetDefaultParams.ok_or("openh264")?(enc, &mut p);
+            let bps = bitrate_kbps.saturating_mul(1000) as i32;
+            p.iUsageType = SCREEN_CONTENT_REAL_TIME;
+            p.iPicWidth = width as i32;
+            p.iPicHeight = height as i32;
+            p.iTargetBitrate = bps;
+            p.iMaxBitrate = bps;
+            p.iRCMode = RC_BITRATE_MODE;
+            p.fMaxFrameRate = fps;
+            // A still screen sends almost nothing; a keyframe only when one is needed.
+            p.bEnableFrameSkip = true;
+            p.uiIntraPeriod = 0;
+            p.eSpsPpsIdStrategy = CONSTANT_ID;
+            p.bEnableBackgroundDetection = false;
+            p.iComplexityMode = LOW_COMPLEXITY;
+            p.iMultipleThreadIdc = threads;
+            p.iSpatialLayerNum = 1;
+            let l = &mut p.sSpatialLayers[0];
+            l.iVideoWidth = width as i32;
+            l.iVideoHeight = height as i32;
+            l.fFrameRate = fps;
+            l.iSpatialBitrate = bps;
+            l.iMaxSpatialBitrate = bps;
+            l.sSliceArgument.uiSliceMode = if threads > 1 { SM_FIXEDSLCNUM_SLICE } else { SM_SINGLE_SLICE };
+            l.sSliceArgument.uiSliceNum = threads as u32;
+            let mut quiet = WELS_LOG_QUIET;
+            vt.SetOption.ok_or("openh264")?(enc, ENCODER_OPTION_TRACE_LEVEL, &mut quiet as *mut i32 as *mut _);
+            if vt.InitializeExt.ok_or("openh264")?(enc, &p) != 0 {
+                api.WelsDestroySVCEncoder(enc);
+                return Err("openh264: can't start the encoder with these settings".into());
+            }
+        }
         Ok(Self {
+            api,
             enc,
             width,
             height,
             keyframe_next: true,
             yuv: crate::yuv::I420::new(width, height),
+            kbps: bitrate_kbps,
+            bs: Box::new(unsafe { std::mem::zeroed() }),
+            started: std::time::Instant::now(),
         })
     }
 
@@ -53,26 +99,78 @@ impl H264 {
         self.keyframe_next
     }
 
+    /// A new target bitrate, taken at once.
+    pub fn set_bitrate(&mut self, kbps: u32) -> Result<(), String> {
+        let mut info = SBitrateInfo {
+            iLayer: SPATIAL_LAYER_ALL,
+            iBitrate: kbps.saturating_mul(1000) as i32,
+        };
+        unsafe {
+            let vt = &**self.enc;
+            let set = vt.SetOption.ok_or("openh264")?;
+            // The cap first when going down (the target can't be above it), last when going up.
+            let order = if kbps < self.kbps {
+                [ENCODER_OPTION_MAX_BITRATE, ENCODER_OPTION_BITRATE]
+            } else {
+                [ENCODER_OPTION_BITRATE, ENCODER_OPTION_MAX_BITRATE]
+            };
+            for o in order {
+                set(self.enc, o, &mut info as *mut SBitrateInfo as *mut _);
+            }
+        }
+        self.kbps = kbps;
+        Ok(())
+    }
+
     /// One frame of BGRA pixels (`stride` bytes a row, at least `width * 4`). `None`: the encoder
-    /// skipped it (nothing changed enough to send).
+    /// skipped it (nothing changed enough to send, or the bitrate is spent).
     pub fn encode(&mut self, bgra: &[u8], stride: usize) -> Result<Option<Encoded>, String> {
         // Into the encoder's YUV, fast (see yuv.rs); a frame one pixel wider or taller than the even
         // size just leaves its last column or row out.
         self.yuv.convert(bgra, stride);
         let (w, h) = (self.width, self.height);
-        let yuv = YUVSlices::new((&self.yuv.y, &self.yuv.u, &self.yuv.v), (w, h), (w, w / 2, w / 2));
-        if std::mem::take(&mut self.keyframe_next) {
-            self.enc.force_intra_frame();
+        let mut pic: SSourcePicture = unsafe { std::mem::zeroed() };
+        pic.iColorFormat = videoFormatI420;
+        pic.iStride = [w as i32, (w / 2) as i32, (w / 2) as i32, 0];
+        pic.pData = [self.yuv.y.as_mut_ptr(), self.yuv.u.as_mut_ptr(), self.yuv.v.as_mut_ptr(), null_mut()];
+        pic.iPicWidth = w as i32;
+        pic.iPicHeight = h as i32;
+        // Real time: the rate control spends the bitrate by the clock, whatever the frame rate.
+        pic.uiTimeStamp = self.started.elapsed().as_millis() as i64;
+        unsafe {
+            let vt = &**self.enc;
+            if std::mem::take(&mut self.keyframe_next) {
+                vt.ForceIntraFrame.ok_or("openh264")?(self.enc, true);
+            }
+            if vt.EncodeFrame.ok_or("openh264")?(self.enc, &pic, &mut *self.bs) != 0 {
+                return Err("openh264: encode failed".into());
+            }
         }
-        let bits = self.enc.encode(&yuv).map_err(|e| format!("openh264: {e}"))?;
-        let frame_type = bits.frame_type();
-        if matches!(frame_type, FrameType::Skip | FrameType::Invalid) {
+        let bs = &*self.bs;
+        if bs.eFrameType == videoFrameTypeSkip || bs.eFrameType == videoFrameTypeInvalid {
             return Ok(None);
         }
+        let mut data = Vec::with_capacity(bs.iFrameSizeInBytes.max(0) as usize);
+        for layer in &bs.sLayerInfo[..bs.iLayerNum.max(0) as usize] {
+            let lens = unsafe { std::slice::from_raw_parts(layer.pNalLengthInByte, layer.iNalCount.max(0) as usize) };
+            let size: usize = lens.iter().map(|&n| n.max(0) as usize).sum();
+            data.extend_from_slice(unsafe { std::slice::from_raw_parts(layer.pBsBuf, size) });
+        }
         Ok(Some(Encoded {
-            data: bits.to_vec(),
-            keyframe: matches!(frame_type, FrameType::IDR | FrameType::I),
+            data,
+            keyframe: bs.eFrameType == videoFrameTypeIDR || bs.eFrameType == videoFrameTypeI,
         }))
+    }
+}
+
+impl Drop for H264 {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(un) = (**self.enc).Uninitialize {
+                un(self.enc);
+            }
+            self.api.WelsDestroySVCEncoder(self.enc);
+        }
     }
 }
 
@@ -117,6 +215,15 @@ impl Video {
             Self::Software(e) => e.keyframe(),
             #[cfg(target_os = "macos")]
             Self::Hardware(e) => e.keyframe(),
+        }
+    }
+
+    /// A new target bitrate, taken at once (no keyframe).
+    pub fn set_bitrate(&mut self, kbps: u32) -> Result<(), String> {
+        match self {
+            Self::Software(e) => e.set_bitrate(kbps),
+            #[cfg(target_os = "macos")]
+            Self::Hardware(e) => e.set_bitrate(kbps),
         }
     }
 
@@ -180,7 +287,6 @@ mod tests {
 mod bench {
     use super::*;
     use crate::yuv::I420;
-    use openh264::formats::{BgraSliceU8, YUVBuffer};
     use std::time::Instant;
 
     /// `cargo test --release -p rr-server -- --ignored bench --nocapture`: where the time goes.
@@ -192,11 +298,6 @@ mod bench {
         for (i, b) in frame.iter_mut().enumerate() {
             *b = (i * 7 % 251) as u8;
         }
-        let t = Instant::now();
-        for _ in 0..30 {
-            let _ = std::hint::black_box(YUVBuffer::from_rgb_source(BgraSliceU8::new(&frame, (w, h))));
-        }
-        println!("bgra→yuv (openh264's): {:.1} ms", t.elapsed().as_secs_f64() * 1000.0 / 30.0);
         let mut f = I420::new(w, h);
         let t = Instant::now();
         for _ in 0..30 {
@@ -253,5 +354,29 @@ mod bench {
                 (cpu() - c) / n
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod rc {
+    use super::*;
+    /// Does the software encoder keep to a low bitrate on full-screen motion? (sizes per frame)
+    #[test]
+    #[ignore]
+    fn sizes_at_low_bitrate() {
+        let (w, h) = (1280, 720);
+        let mut enc = H264::new(w, h, 5.0, 250).unwrap();
+        let mut sizes = vec![];
+        for n in 0..20 {
+            let mut f = vec![0u8; w * h * 4];
+            for (i, px) in f.chunks_mut(4).enumerate() {
+                let (x, y) = (i % w, i / w);
+                let v = (((x / 8) * 31 + (y / 12 + n * 3) * 17) % 251) as u8;
+                px.copy_from_slice(&[v, v, v, 255]);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            sizes.push(enc.encode(&f, w * 4).unwrap().map_or(0, |e| e.data.len()));
+        }
+        println!("bytes per frame at 250 kbit/s, 5 fps: {sizes:?}");
     }
 }

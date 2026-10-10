@@ -229,6 +229,15 @@ impl VideoToolbox {
         (self.width, self.height)
     }
 
+    /// A new target bitrate, taken at once (no keyframe).
+    pub fn set_bitrate(&mut self, kbps: u32) -> Result<(), String> {
+        let n = CFNumber::from(kbps as i64 * 1000);
+        match unsafe { VTSessionSetProperty(self.session, kVTCompressionPropertyKey_AverageBitRate, n.as_CFTypeRef()) } {
+            0 => Ok(()),
+            s => Err(format!("VideoToolbox: can't set the bitrate ({s})")),
+        }
+    }
+
     pub fn keyframe(&mut self) {
         self.keyframe_next = true;
     }

@@ -12,8 +12,9 @@ name = "rein-remote"
 path = "src/main.rs"
 
 [dependencies]
-openh264 = "0.6.5"
+openh264-sys2 = "0.6.6"
 rr-proto = {path = "../rr-proto"}
+socket2 = "0.6.1"
 tungstenite = "0.29.0"
 
 [target.'cfg(unix)'.dependencies]
