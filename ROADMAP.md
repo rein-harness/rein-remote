@@ -20,10 +20,12 @@ has been verified.
 - **Verified:** in a Linux container, an app on a virtual display streams to headless Chrome; input
   reaches the app; glass-to-glass latency measured with a timestamp overlay and written down.
 - **Status:** the stream works and is measured: an xterm on Xvfb streamed to Chrome, a click
-  focused it and typed text (capitals and symbols included) ran, 32 ms median / 47 ms p95 capture
-  to decoded, 22 ms encode at 1280×720 in software. Still to do in this phase: the cursor sent
-  apart, touch input in the web client, MIT-SHM + XDamage capture and a faster encode path (to hold
-  60 fps in software).
+  focused it and typed text (capitals and symbols included) ran. With the terminal scrolling
+  full-screen at 1280×720 on a 4-core VM: 33 ms median / 44 ms p95 capture to decoded, 3 ms to
+  read the screen, 19 ms to encode (BGRA→YUV went from 8.8 ms to 0.7 ms with our own conversion).
+  Still to do in this phase: the cursor sent apart, touch input in the web client, MIT-SHM +
+  XDamage capture, and multi-slice threaded encoding (needs our own binding to openh264's C API;
+  the crate's wrapper encodes one slice).
 
 ## Phase 2 — Rein previews through Rein Remote
 

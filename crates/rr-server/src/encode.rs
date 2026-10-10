@@ -3,7 +3,7 @@
 //! later phases behind the same `encode` call.
 
 use openh264::encoder::{Encoder, EncoderConfig, FrameType, RateControlMode, UsageType};
-use openh264::formats::{BgraSliceU8, YUVBuffer};
+use openh264::formats::YUVSlices;
 use openh264::OpenH264API;
 
 pub struct H264 {
@@ -11,6 +11,7 @@ pub struct H264 {
     width: usize,
     height: usize,
     keyframe_next: bool,
+    yuv: crate::yuv::I420,
 }
 
 pub struct Encoded {
@@ -35,6 +36,7 @@ impl H264 {
             width,
             height,
             keyframe_next: true,
+            yuv: crate::yuv::I420::new(width, height),
         })
     }
 
@@ -50,19 +52,11 @@ impl H264 {
     /// One frame of BGRA pixels (`stride` bytes a row, at least `width * 4`). `None`: the encoder
     /// skipped it (nothing changed enough to send).
     pub fn encode(&mut self, bgra: &[u8], stride: usize) -> Result<Option<Encoded>, String> {
-        let packed;
-        let pixels = if stride == self.width * 4 && bgra.len() >= self.width * self.height * 4 {
-            &bgra[..self.width * self.height * 4]
-        } else {
-            // Rows padded, or the frame one pixel wider/taller than the even size: repack.
-            let mut p = Vec::with_capacity(self.width * self.height * 4);
-            for row in 0..self.height {
-                p.extend_from_slice(&bgra[row * stride..row * stride + self.width * 4]);
-            }
-            packed = p;
-            &packed
-        };
-        let yuv = YUVBuffer::from_rgb_source(BgraSliceU8::new(pixels, (self.width, self.height)));
+        // Into the encoder's YUV, fast (see yuv.rs); a frame one pixel wider or taller than the even
+        // size just leaves its last column or row out.
+        self.yuv.convert(bgra, stride);
+        let (w, h) = (self.width, self.height);
+        let yuv = YUVSlices::new((&self.yuv.y, &self.yuv.u, &self.yuv.v), (w, h), (w, w / 2, w / 2));
         if std::mem::take(&mut self.keyframe_next) {
             self.enc.force_intra_frame();
         }
@@ -100,5 +94,43 @@ mod tests {
         assert!(!delta.keyframe);
         enc.keyframe();
         assert!(enc.encode(&frame, w * 4).unwrap().unwrap().keyframe);
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use crate::yuv::I420;
+    use openh264::formats::{BgraSliceU8, YUVBuffer};
+    use std::time::Instant;
+
+    /// `cargo test --release -p rr-server -- --ignored bench --nocapture`: where the time goes.
+    #[test]
+    #[ignore]
+    fn bench_1280x720() {
+        let (w, h) = (1280, 720);
+        let mut frame = vec![0u8; w * h * 4];
+        for (i, b) in frame.iter_mut().enumerate() {
+            *b = (i * 7 % 251) as u8;
+        }
+        let t = Instant::now();
+        for _ in 0..30 {
+            let _ = std::hint::black_box(YUVBuffer::from_rgb_source(BgraSliceU8::new(&frame, (w, h))));
+        }
+        println!("bgra→yuv (openh264's): {:.1} ms", t.elapsed().as_secs_f64() * 1000.0 / 30.0);
+        let mut f = I420::new(w, h);
+        let t = Instant::now();
+        for _ in 0..30 {
+            f.convert(&frame, w * 4);
+        }
+        println!("bgra→yuv (ours): {:.2} ms", t.elapsed().as_secs_f64() * 1000.0 / 30.0);
+        let mut enc = H264::new(w, h, 60.0, 8000).unwrap();
+        let t = Instant::now();
+        for n in 0..60 {
+            let at = (n * 4096) % frame.len();
+            frame[at] ^= 0xff;
+            enc.encode(&frame, w * 4).unwrap();
+        }
+        println!("encode (incl. conversion): {:.1} ms", t.elapsed().as_secs_f64() * 1000.0 / 60.0);
     }
 }

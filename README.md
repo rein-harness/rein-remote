@@ -43,9 +43,9 @@ cargo build --release -p rr-server
 # then open http://127.0.0.1:7979 in a browser
 ```
 
-Measured (phase 1, software H.264, 1280×720, an x86 container, decoded in Chrome in software):
-capture to decoded **32 ms median, 47 ms at p95**; encoding 22 ms a frame. Hardware encoders and
-faster capture are what come next (see the roadmap).
+Measured (phase 1, software H.264, 1280×720, a terminal scrolling full-screen, a 4-core x86 VM,
+decoded in Chrome in software): capture to decoded **33 ms median, 44 ms at p95**; reading the
+screen 3 ms, encoding 19 ms a frame. Hardware encoders are what come next (see the roadmap).
 
 ## How it works
 

@@ -8,6 +8,7 @@
 mod capture;
 mod encode;
 mod serve;
+mod yuv;
 
 use capture::{Source, TestPattern};
 

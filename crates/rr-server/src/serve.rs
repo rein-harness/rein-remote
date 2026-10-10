@@ -31,6 +31,8 @@ pub struct Stats {
     /// Capture to decoded on the client, estimated: feedback arrival minus capture, less half the RTT.
     pub latency_ms: Vec<f64>,
     pub encode_ms: Vec<f64>,
+    /// Reading the screen, apart from encoding it.
+    pub grab_ms: Vec<f64>,
 }
 
 fn now_us() -> u64 {
@@ -92,7 +94,7 @@ fn stats_json(s: &Stats) -> String {
         v[((v.len() - 1) as f64 * p) as usize]
     };
     format!(
-        r#"{{"frames":{},"keyframes":{},"skipped_backed_up":{},"bytes":{},"rtt_ms":{:.1},"latency_ms":{{"p50":{:.1},"p95":{:.1},"samples":{}}},"encode_ms":{{"p50":{:.1},"p95":{:.1}}}}}"#,
+        r#"{{"frames":{},"keyframes":{},"skipped_backed_up":{},"bytes":{},"rtt_ms":{:.1},"latency_ms":{{"p50":{:.1},"p95":{:.1},"samples":{}}},"encode_ms":{{"p50":{:.1},"p95":{:.1}}},"grab_ms":{{"p50":{:.1},"p95":{:.1}}}}}"#,
         s.frames,
         s.keyframes,
         s.skipped_backed_up,
@@ -103,6 +105,8 @@ fn stats_json(s: &Stats) -> String {
         s.latency_ms.len(),
         pct(&s.encode_ms, 0.5),
         pct(&s.encode_ms, 0.95),
+        pct(&s.grab_ms, 0.5),
+        pct(&s.grab_ms, 0.95),
     )
 }
 
@@ -242,12 +246,13 @@ fn session(mut ws: WebSocket<TcpStream>, source: Arc<Mutex<Box<dyn Source>>>, st
             }
             let t0 = Instant::now();
             let captured_at = now_us();
-            let encoded = {
+            let (encoded, grab_ms) = {
                 let mut src = source.lock().unwrap();
                 let frame = src.grab()?;
-                enc.encode(frame.bgra, frame.stride)?
+                let grab_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                (enc.encode(frame.bgra, frame.stride)?, grab_ms)
             };
-            let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let encode_ms = t0.elapsed().as_secs_f64() * 1000.0 - grab_ms;
             if let Some(e) = encoded {
                 frame_no = frame_no.wrapping_add(1);
                 captured.push_back((frame_no, captured_at));
@@ -269,8 +274,10 @@ fn session(mut ws: WebSocket<TcpStream>, source: Arc<Mutex<Box<dyn Source>>>, st
                 s.bytes += len;
                 s.keyframes += e.keyframe as u64;
                 s.encode_ms.push(encode_ms);
+                s.grab_ms.push(grab_ms);
                 if s.encode_ms.len() > 2000 {
                     s.encode_ms.drain(..1000);
+                    s.grab_ms.drain(..1000);
                 }
             }
         }
