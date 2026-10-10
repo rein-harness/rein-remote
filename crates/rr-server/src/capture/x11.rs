@@ -1,9 +1,10 @@
 //! An X11 display (a desktop's, or a virtual one: Xvfb, Xvnc): captured with GetImage, input sent
 //! with XTest. Phase 1; MIT-SHM capture and XDamage (only what changed) come next for speed.
 
-use super::{Frame, Source};
-use rr_proto::{Button, Input};
+use super::{Frame, Pointer, Source};
+use rr_proto::{Button, CursorShape, Input};
 use x11rb::connection::Connection;
+use x11rb::protocol::xfixes::ConnectionExt as _;
 use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat, Window};
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
@@ -19,6 +20,8 @@ pub struct X11 {
     keymap: std::collections::HashMap<u32, (u8, bool)>,
     /// The client is holding Shift (so a shifted character needs nothing more).
     shift_held: bool,
+    /// The display has XFixes (the pointer's image and place, apart from the screen).
+    xfixes: bool,
 }
 
 const KEY_PRESS: u8 = 2;
@@ -38,6 +41,7 @@ impl X11 {
             .reply()
             .map_err(|_| "the display has no XTest (input won't work)".to_string())?;
         let keymap = keymap(&conn)?;
+        let xfixes = conn.xfixes_query_version(4, 0).ok().and_then(|c| c.reply().ok()).is_some();
         Ok(Self {
             conn,
             root,
@@ -46,6 +50,7 @@ impl X11 {
             frame: Vec::new(),
             keymap,
             shift_held: false,
+            xfixes,
         })
     }
 
@@ -150,6 +155,32 @@ pub fn keysym(key: &str) -> Option<u32> {
 }
 
 impl Source for X11 {
+    fn cursor(&mut self) -> Option<Pointer> {
+        if !self.xfixes {
+            return None;
+        }
+        let c = self.conn.xfixes_get_cursor_image().ok()?.reply().ok()?;
+        // Premultiplied ARGB → straight RGBA.
+        let mut rgba = Vec::with_capacity(c.cursor_image.len() * 4);
+        for p in &c.cursor_image {
+            let a = (p >> 24) & 0xff;
+            let un = |v: u32| (v * 255 + a / 2).checked_div(a).map_or(0, |v| v.min(255) as u8);
+            rgba.extend_from_slice(&[un((p >> 16) & 0xff), un((p >> 8) & 0xff), un(p & 0xff), a as u8]);
+        }
+        Some(Pointer {
+            x: c.x.max(0) as u16,
+            y: c.y.max(0) as u16,
+            serial: c.cursor_serial,
+            shape: CursorShape {
+                w: c.width,
+                h: c.height,
+                hx: c.xhot,
+                hy: c.yhot,
+                rgba,
+            },
+        })
+    }
+
     fn size(&self) -> (usize, usize) {
         (self.w as usize, self.h as usize)
     }

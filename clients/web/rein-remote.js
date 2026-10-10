@@ -197,6 +197,13 @@ export function connect(url, canvas, opts = {}) {
             continue;
           }
           decodeOne({key, n, data});
+        } else if (f.kind === K.CURSOR) {
+          const x = r.u16(), y = r.u16(), visible = r.u8() !== 0;
+          if (r.u8() === 1) {
+            const w = r.u16(), h = r.u16(), hx = r.u16(), hy = r.u16(), rgba = r.bytes();
+            pointer.shape(w, h, hx, hy, rgba);
+          }
+          pointer.remote(x, y, visible);
         } else if (f.kind === K.PING) {
           // The server measures the round trip: answer at once.
           const w = new W();
@@ -211,6 +218,51 @@ export function connect(url, canvas, opts = {}) {
       }
     }
   };
+
+  // ---- the pointer, drawn here: at once where the local mouse is, else where the server says ----
+  const pointer = (() => {
+    const el = document.createElement('canvas');
+    el.style.cssText = 'position:fixed;left:0;top:0;pointer-events:none;z-index:2147483647;display:none;image-rendering:pixelated';
+    (canvas.parentNode ?? document.body).append(el);
+    let hot = [0, 0], remoteAt = [0, 0], localAt = null, localTime = 0, visible = true, hasShape = false;
+    const place = () => {
+      const rect = canvas.getBoundingClientRect();
+      if (!hasShape || !visible || !canvas.width) return (el.style.display = 'none');
+      const k = Math.max(rect.width / canvas.width, 0.6);
+      el.style.width = `${el.width * k}px`;
+      el.style.height = `${el.height * k}px`;
+      let [x, y] = localAt && performance.now() - localTime < 250 ? localAt : remoteAt.map((v, i) => (i ? rect.top + (v * rect.height) / canvas.height : rect.left + (v * rect.width) / canvas.width));
+      el.style.transform = `translate(${x - hot[0] * k}px, ${y - hot[1] * k}px)`;
+      el.style.display = '';
+    };
+    return {
+      shape(w, h, hx, hy, rgba) {
+        el.width = w;
+        el.height = h;
+        if (w && h) el.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(rgba), w, h), 0, 0);
+        hot = [hx, hy];
+        hasShape = w > 0 && h > 0;
+        // The remote pointer is drawn: hide this device's over the screen.
+        canvas.style.cursor = hasShape ? 'none' : '';
+        place();
+      },
+      remote(x, y, v) {
+        remoteAt = [x, y];
+        visible = v;
+        place();
+      },
+      local(e) {
+        localAt = [e.clientX, e.clientY];
+        localTime = performance.now();
+        place();
+      },
+      leave() {
+        localAt = null;
+        place();
+      },
+      remove: () => el.remove(),
+    };
+  })();
 
   // ---- input ----
   const at = (e) => {
@@ -243,8 +295,10 @@ export function connect(url, canvas, opts = {}) {
     button(btn(e.button), false);
   });
   canvas.addEventListener('pointercancel', (e) => e.pointerType === 'touch' && touch.up(e, true));
+  canvas.addEventListener('pointerleave', (e) => e.pointerType !== 'touch' && pointer.leave());
   canvas.addEventListener('pointermove', (e) => {
     if (e.pointerType === 'touch') return touch.move(e);
+    pointer.local(e);
     if (performance.now() - lastMove < 8) return;
     lastMove = performance.now();
     move(...at(e));
@@ -363,7 +417,7 @@ export function connect(url, canvas, opts = {}) {
     stats,
     /** Show the device's on-screen keyboard (call it from a tap: browsers allow it only then). */
     keyboard: () => keys.focus({preventScroll: true}),
-    close: () => (ws.close(), decoder?.close?.(), keys.remove()),
+    close: () => (ws.close(), decoder?.close?.(), keys.remove(), pointer.remove()),
   };
 }
 

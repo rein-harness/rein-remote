@@ -6,7 +6,7 @@
 #[cfg(target_os = "linux")]
 pub mod x11;
 
-use rr_proto::Input;
+use rr_proto::{CursorShape, Input};
 
 pub struct Frame<'a> {
     pub bgra: &'a [u8],
@@ -21,6 +21,18 @@ pub trait Source: Send {
     fn input(&mut self, _ev: &Input) -> Result<(), String> {
         Ok(())
     }
+    /// The pointer, when the source can see it apart from the screen (so a moving pointer costs
+    /// no video): where it is, and its image with a serial that changes when the image does.
+    fn cursor(&mut self) -> Option<Pointer> {
+        None
+    }
+}
+
+pub struct Pointer {
+    pub x: u16,
+    pub y: u16,
+    pub serial: u32,
+    pub shape: CursorShape,
 }
 
 /// A moving pattern with a frame counter: something to stream without a display.

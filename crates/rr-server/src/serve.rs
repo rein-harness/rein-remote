@@ -4,7 +4,7 @@
 
 use crate::capture::Source;
 use crate::encode::H264;
-use rr_proto::{Codec, CodecCap, Config, Hello, Message, Video, INPUT_KEYBOARD, INPUT_POINTER, INPUT_TOUCH, VERSION_MAX, VERSION_MIN};
+use rr_proto::{Codec, CodecCap, Config, Cursor, Hello, Message, Video, INPUT_KEYBOARD, INPUT_POINTER, INPUT_TOUCH, VERSION_MAX, VERSION_MIN};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -184,6 +184,8 @@ fn session(mut ws: WebSocket<TcpStream>, source: Arc<Mutex<Box<dyn Source>>>, st
     let mut last_ping = Instant::now() - Duration::from_secs(10);
     let mut pings: std::collections::HashMap<u32, Instant> = Default::default();
     let mut last_report = Instant::now();
+    // The pointer as last sent: its place, and its image's serial (the image goes only when it changes).
+    let mut cursor_sent: Option<(u16, u16, u32)> = None;
     loop {
         let tick = Instant::now();
         // Everything the client sent since the last frame.
@@ -224,6 +226,23 @@ fn session(mut ws: WebSocket<TcpStream>, source: Arc<Mutex<Box<dyn Source>>>, st
                 Err(tungstenite::Error::Io(e)) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => return Ok(()),
                 Err(e) => return Err(e.to_string()),
+            }
+        }
+        let pointer = source.lock().unwrap().cursor();
+        if let Some(p) = pointer {
+            let new_shape = cursor_sent.map_or(true, |(_, _, s)| s != p.serial);
+            if new_shape || cursor_sent.map_or(true, |(x, y, _)| (x, y) != (p.x, p.y)) {
+                cursor_sent = Some((p.x, p.y, p.serial));
+                let shape = new_shape.then_some(p.shape);
+                send(
+                    &mut ws,
+                    &Message::Cursor(Cursor {
+                        x: p.x,
+                        y: p.y,
+                        visible: true,
+                        shape,
+                    }),
+                )?;
             }
         }
         if last_ping.elapsed() > Duration::from_secs(1) {
