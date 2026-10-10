@@ -4,15 +4,15 @@
 
 use crate::capture::Source;
 use crate::encode::Video as Encoder;
-use crate::link::{Link, Recv, WsLink};
+use crate::link::{E2eLink, Link, Recv, WsLink};
 use rr_proto::{Codec, CodecCap, Config, Cursor, Hello, Message, Video, INPUT_KEYBOARD, INPUT_POINTER, INPUT_TOUCH, VERSION_MAX, VERSION_MIN};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const INDEX: &str = include_str!("../../../clients/web/index.html");
-const CLIENT_JS: &str = include_str!("../../../clients/web/rein-remote.js");
+pub const INDEX: &str = include_str!("../../../clients/web/index.html");
+pub const CLIENT_JS: &str = include_str!("../../../clients/web/rein-remote.js");
 
 pub struct Options {
     pub listen: String,
@@ -23,6 +23,10 @@ pub struct Options {
     pub token: Option<String>,
     /// WebTransport (QUIC) next to the WebSocket, on the same port number over UDP.
     pub webtransport: bool,
+    /// A relay to connect out to (ws:// or wss://), the room there, and the relay's secret for hosts.
+    pub relay: Option<(String, String, Option<String>)>,
+    /// The end-to-end key for sessions through the relay (in the viewer's link, after #).
+    pub e2e_key: [u8; 32],
 }
 
 /// Latency and throughput, kept per session and shown by /stats.
@@ -80,6 +84,16 @@ pub fn run(source: Box<dyn Source>, opts: Options) -> Result<(), String> {
         }
         _ => None,
     });
+    if let Some((relay, room, secret)) = opts.relay.clone() {
+        let (source, stats, opts) = (source.clone(), stats.clone(), opts.clone());
+        let page = relay.replacen("ws", "http", 1);
+        eprintln!(
+            "rein-remote: through the relay: open {}/?room={room}#k={}",
+            page.trim_end_matches('/'),
+            crate::e2e::b64url(&opts.e2e_key)
+        );
+        std::thread::spawn(move || through_relay(&relay, &room, secret.as_deref(), source, stats, &opts));
+    }
     for conn in listener.incoming() {
         let Ok(stream) = conn else { continue };
         let (source, stats, opts, wt) = (source.clone(), stats.clone(), opts.clone(), wt.clone());
@@ -90,6 +104,40 @@ pub fn run(source: Box<dyn Source>, opts: Options) -> Result<(), String> {
         });
     }
     Ok(())
+}
+
+/// Connected out to a relay: one viewer at a time, then the room again for the next.
+fn through_relay(relay: &str, room: &str, secret: Option<&str>, source: Arc<Mutex<Box<dyn Source>>>, stats: Arc<Mutex<Stats>>, opts: &Options) {
+    let url = format!(
+        "{}/host?room={room}{}",
+        relay.trim_end_matches('/'),
+        secret.map(|s| format!("&secret={s}")).unwrap_or_default()
+    );
+    loop {
+        match tungstenite::connect(&url) {
+            Ok((ws, _)) => {
+                use crate::link::Sock;
+                let _ = ws.get_ref().tcp().set_nodelay(true);
+                let _ = socket2::SockRef::from(ws.get_ref().tcp()).set_send_buffer_size((opts.bitrate_kbps as usize * 1000 / 8 / 20).max(64 * 1024));
+                // Sealed end to end: the relay passes what it can't read.
+                let link = match E2eLink::host(Box::new(WsLink(ws)), &opts.e2e_key) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        eprintln!("rein-remote: {e}");
+                        continue;
+                    }
+                };
+                if let Err(e) = session(Box::new(link), source.clone(), stats.clone(), opts) {
+                    eprintln!("rein-remote: {e}");
+                }
+            }
+            Err(e) => {
+                eprintln!("rein-remote: the relay ({relay}): {e}");
+                std::thread::sleep(Duration::from_secs(4));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 
 fn handle(

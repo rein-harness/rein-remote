@@ -144,6 +144,74 @@ function openLink(url, wt) {
   return link;
 }
 
+/**
+ * A link whose every message is sealed (AES-256-GCM, keys derived with HKDF from the link's key and
+ * the salt the machine sends first; one key a direction, a counter nonce): what's between (a relay)
+ * can't read or change it. The same scheme as crates/rr-server/src/e2e.rs.
+ */
+function sealed(inner, keyB64) {
+  const link = {kind: inner.kind, onopen: () => {}, ondata: () => {}, onclose: () => {}, send: () => true, close: () => inner.close()};
+  if (!crypto?.subtle) {
+    // WebCrypto needs a secure page (HTTPS or localhost).
+    setTimeout(() => (link.onerror?.('end-to-end encryption needs the page over HTTPS'), link.onclose()));
+    return link;
+  }
+  const raw = Uint8Array.from(atob(keyB64.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0));
+  const enc = new TextEncoder();
+  let keys, sent = 0n, last = -1n;
+  let ready;
+  const keysReady = new Promise((r) => (ready = r));
+  let inbound = Promise.resolve(), outbound = Promise.resolve();
+  const iv = (n) => {
+    const b = new Uint8Array(12);
+    new DataView(b.buffer).setBigUint64(4, n);
+    return b;
+  };
+  const derive = async (salt) => {
+    const base = await crypto.subtle.importKey('raw', raw, 'HKDF', false, ['deriveKey']);
+    const k = (info, use) => crypto.subtle.deriveKey({name: 'HKDF', hash: 'SHA-256', salt, info: enc.encode(info)}, base, {name: 'AES-GCM', length: 256}, false, [use]);
+    keys = {send: await k('rein-remote e2e: viewer to machine', 'encrypt'), recv: await k('rein-remote e2e: machine to viewer', 'decrypt')};
+    ready();
+  };
+  const prefix = enc.encode('RRE2E1');
+  inner.onopen = () => {
+    link.kind = inner.kind;
+    link.onopen();
+  };
+  inner.onclose = () => link.onclose();
+  inner.ondata = (bytes) => {
+    // In order: each message waits for the one before it.
+    inbound = inbound.then(async () => {
+      if (!keys) {
+        if (bytes.length === prefix.length + 16 && prefix.every((c, i) => bytes[i] === c)) await derive(bytes.slice(prefix.length));
+        return;
+      }
+      const n = new DataView(bytes.buffer, bytes.byteOffset, 8).getBigUint64(0);
+      if (n <= last) return; // a replay
+      try {
+        const plain = await crypto.subtle.decrypt({name: 'AES-GCM', iv: iv(n)}, keys.recv, bytes.subarray(8));
+        last = n;
+        link.ondata(new Uint8Array(plain));
+      } catch {
+        link.onerror?.("a message didn't open: the link's key is wrong, or something changed it on the way");
+      }
+    });
+  };
+  link.send = (bytes) => {
+    outbound = outbound.then(async () => {
+      await keysReady;
+      sent += 1n;
+      const ct = new Uint8Array(await crypto.subtle.encrypt({name: 'AES-GCM', iv: iv(sent)}, keys.send, bytes));
+      const out = new Uint8Array(8 + ct.length);
+      new DataView(out.buffer).setBigUint64(0, sent);
+      out.set(ct, 8);
+      inner.send(out);
+    });
+    return true;
+  };
+  return link;
+}
+
 // ---- the session ----
 
 /**
@@ -155,7 +223,9 @@ export function connect(url, canvas, opts = {}) {
   // to-glass latency when the server shares this device's clock (rein-remote serve --test-pattern).
   const measure = opts.measure ?? (typeof location !== 'undefined' && new URLSearchParams(location.search).has('measure'));
   const ctx = canvas.getContext('2d', measure ? {willReadFrequently: true} : undefined);
-  const link = openLink(url, opts.webtransport);
+  // Through a relay, sealed end to end: the key is in the page's address after # (never sent to a server).
+  const e2eKey = opts.e2eKey ?? (typeof location !== 'undefined' ? new URLSearchParams(location.hash.slice(1)).get('k') : null);
+  const link = e2eKey ? sealed(openLink(url, opts.webtransport), e2eKey) : openLink(url, opts.webtransport);
   const stats = {frames: 0, keyframes: 0, bytes: 0, decoder: '', rttMs: 0, state: 'connecting', error: '', glassMs: []};
   let config, decoder, waitKey = true, lost = 0, codec;
   const sent = new Map(); // frame number → received time (µs, client clock)
@@ -253,7 +323,13 @@ export function connect(url, canvas, opts = {}) {
     }, 1000);
   };
   link.onclose = () => ((stats.state = 'closed'), clearInterval(pingTimer));
+  link.onerror = (e) => (stats.error = e);
   link.ondata = (bytes) => {
+    // A sealed session (through a relay) opened without its key: say what's missing.
+    if (!e2eKey && bytes.length === 22 && new TextDecoder().decode(bytes.subarray(0, 6)) === 'RRE2E1') {
+      stats.error = "this link is missing its key (the part after #k=): open the whole link the machine printed";
+      return link.close();
+    }
     for (const f of frames(bytes)) {
       const r = new R(f.body);
       try {
