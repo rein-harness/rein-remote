@@ -18,6 +18,9 @@ pub struct Options {
     pub listen: String,
     pub fps: u32,
     pub bitrate_kbps: u32,
+    /// When set, /stream and /stats need `?token=` this (another program on the machine, a proxy
+    /// that didn't check who's asking, can't reach the screen).
+    pub token: Option<String>,
 }
 
 /// Latency and throughput, kept per session and shown by /stats.
@@ -44,7 +47,9 @@ fn now_us() -> u64 {
 pub fn run(source: Box<dyn Source>, opts: Options) -> Result<(), String> {
     let listener = TcpListener::bind(&opts.listen).map_err(|e| format!("can't listen on {}: {e}", opts.listen))?;
     let (w, h) = source.size();
-    eprintln!("rein-remote: streaming a {w}×{h} screen on http://{} (open it in a browser)", opts.listen);
+    // The address it got (a port of 0 picks a free one): a program that started it reads this line.
+    let addr = listener.local_addr().map_or(opts.listen.clone(), |a| a.to_string());
+    eprintln!("rein-remote: streaming a {w}×{h} screen on http://{addr} (open it in a browser)");
     let source = Arc::new(Mutex::new(source));
     let stats = Arc::new(Mutex::new(Stats::default()));
     let opts = Arc::new(opts);
@@ -66,8 +71,24 @@ fn handle(mut stream: TcpStream, source: Arc<Mutex<Box<dyn Source>>>, stats: Arc
     let n = stream.peek(&mut head).map_err(|e| e.to_string())?;
     let req = String::from_utf8_lossy(&head[..n]);
     // The path without its query string ("/?measure" is the page).
-    let path = req.split_whitespace().nth(1).unwrap_or("/").split(['?', '#']).next().unwrap_or("/").to_string();
+    let target = req.split_whitespace().nth(1).unwrap_or("/");
+    let path = target.split(['?', '#']).next().unwrap_or("/").to_string();
     let upgrade = req.to_ascii_lowercase().contains("upgrade: websocket");
+    let token_ok = opts.token.as_deref().map_or(true, |t| {
+        let given = target
+            .split_once('?')
+            .map_or("", |(_, q)| q)
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("token="))
+            .unwrap_or("");
+        // Compared in full, not stopping at the first difference.
+        given.len() == t.len() && given.bytes().zip(t.bytes()).fold(0u8, |d, (a, b)| d | (a ^ b)) == 0
+    });
+    if (path.starts_with("/stream") || path == "/stats") && !token_ok {
+        let _ = stream.read(&mut head);
+        let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        return Ok(());
+    }
     if path.starts_with("/stream") && upgrade {
         let ws = tungstenite::accept(stream).map_err(|e| format!("websocket: {e}"))?;
         return session(ws, source, stats, opts);

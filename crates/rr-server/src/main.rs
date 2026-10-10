@@ -4,6 +4,8 @@
 //!   rein-remote serve --display :20        # a virtual display (Xvfb, Xvnc)
 //!   rein-remote serve --test-pattern       # a moving pattern, no display needed
 //!   rein-remote serve --listen 0.0.0.0:7979 --fps 60 --bitrate 8000
+//!   rein-remote serve --listen 127.0.0.1:0 --token T   # a free port (printed), the stream needs ?token=T
+//!                                                      # (or REIN_REMOTE_TOKEN; kept out of `ps`)
 
 mod capture;
 mod encode;
@@ -14,7 +16,7 @@ use capture::{Source, TestPattern};
 
 fn usage() -> ! {
     eprintln!(
-        "rein-remote {}\n\nusage:\n  rein-remote serve [--display :N | --test-pattern [WxH]] [--listen ADDR] [--fps N] [--bitrate KBPS]\n  rein-remote --version",
+        "rein-remote {}\n\nusage:\n  rein-remote serve [--display :N | --test-pattern [WxH]] [--listen ADDR] [--fps N] [--bitrate KBPS] [--token T]\n  rein-remote --version",
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(2);
@@ -39,6 +41,7 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
         listen: "127.0.0.1:7979".into(),
         fps: 60,
         bitrate_kbps: 8000,
+        token: std::env::var("REIN_REMOTE_TOKEN").ok().filter(|t| !t.is_empty()),
     };
     let mut display: Option<String> = None;
     let mut pattern: Option<(usize, usize)> = None;
@@ -50,6 +53,7 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
             "--fps" => opts.fps = val()?.parse().map_err(|_| "--fps is a number")?,
             "--bitrate" => opts.bitrate_kbps = val()?.parse().map_err(|_| "--bitrate is kbit/s")?,
             "--display" => display = Some(val()?),
+            "--token" => opts.token = Some(val()?),
             "--test-pattern" => {
                 pattern = Some((1280, 720));
                 if let Some(size) = it.clone().next().filter(|s| s.contains('x')) {
