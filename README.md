@@ -30,7 +30,8 @@ Early: the design is done and being built one verified piece at a time
 | Client: Windows / macOS / Linux | todo (phase 5) |
 | Client: iOS / iPadOS / Android | todo (phase 5) |
 | Transport: WebSocket | working, with keyframe-and-skip when the link backs up (phase 1) |
-| Transport: QUIC / WebTransport, relay | todo (phase 4) |
+| Transport: WebTransport (QUIC) | working: a stream per frame, self-signed certificate by hash, falls back to the WebSocket by itself (phase 4) |
+| Transport: relay (NAT traversal) | todo (phase 4) |
 | Adaptive bitrate, audio | todo (phase 4) |
 | Pairing, enterprise sign-in and policy | todo (phases 4, 6) |
 
