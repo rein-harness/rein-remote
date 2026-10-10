@@ -49,6 +49,10 @@ impl H264 {
         self.keyframe_next = true;
     }
 
+    pub fn wants_keyframe(&self) -> bool {
+        self.keyframe_next
+    }
+
     /// One frame of BGRA pixels (`stride` bytes a row, at least `width * 4`). `None`: the encoder
     /// skipped it (nothing changed enough to send).
     pub fn encode(&mut self, bgra: &[u8], stride: usize) -> Result<Option<Encoded>, String> {

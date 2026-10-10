@@ -26,6 +26,11 @@ pub trait Source: Send {
     fn cursor(&mut self) -> Option<Pointer> {
         None
     }
+    /// A count that goes up when the screen changes, when the source can tell (so a still screen is
+    /// neither read nor encoded). None: it can't, read every frame.
+    fn generation(&mut self) -> Option<u64> {
+        None
+    }
 }
 
 pub struct Pointer {

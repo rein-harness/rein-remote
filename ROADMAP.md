@@ -27,9 +27,13 @@ has been verified.
   device's keyboard typed and ran a command). The pointer goes apart from the video (XFixes): its
   image once per shape, its place when it moves, drawn by the client at the local mouse at once.
   Latency is measured from the client's per-frame feedback (capture time to decoded, less half the
-  round trip), not yet with a timestamp overlay. Still to do in this phase: MIT-SHM + XDamage
-  capture, and multi-slice threaded encoding (needs our own binding to openh264's C API; the
-  crate's wrapper encodes one slice).
+  round trip), not yet with a timestamp overlay. Capture is in shared memory (MIT-SHM 1.2, the
+  segment passed as a file descriptor; GetImage where there's none), and XDamage skips a still
+  screen: at 1920×1080 scrolling full-screen, 1.7 ms to read the screen, 16 ms to encode,
+  26 ms / 36 ms capture to decoded; a still terminal sent 8 frames in 8 seconds. A display with
+  only its abstract socket (the file missing) connects too. Still to do in this phase: multi-slice
+  threaded encoding (needs our own binding to openh264's C API; the crate's wrapper encodes one
+  slice).
 
 ## Phase 2 — Rein previews through Rein Remote
 

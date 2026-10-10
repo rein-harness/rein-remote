@@ -43,9 +43,16 @@ cargo build --release -p rr-server
 # then open http://127.0.0.1:7979 in a browser
 ```
 
-Measured (phase 1, software H.264, 1280×720, a terminal scrolling full-screen, a 4-core x86 VM,
-decoded in Chrome in software): capture to decoded **33 ms median, 44 ms at p95**; reading the
-screen 3 ms, encoding 19 ms a frame. Hardware encoders are what come next (see the roadmap).
+Measured (phase 1, software H.264, a terminal scrolling full-screen, a 4-core x86 VM, decoded in
+Chrome in software):
+
+| Screen | Capture to decoded (p50 / p95) | Read the screen | Encode |
+|---|---|---|---|
+| 1920×1080 | 26 ms / 36 ms | 1.7 ms (shared memory) | 16 ms |
+| 1280×720 | 33 ms / 44 ms | 3 ms (GetImage) | 19 ms |
+
+A still screen is neither read nor encoded (XDamage): one refresh a second. Hardware encoders are
+what come next (see the roadmap).
 
 ## How it works
 

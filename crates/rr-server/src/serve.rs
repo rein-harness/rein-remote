@@ -33,6 +33,8 @@ pub struct Stats {
     pub encode_ms: Vec<f64>,
     /// Reading the screen, apart from encoding it.
     pub grab_ms: Vec<f64>,
+    /// Ticks with nothing to read or encode (the screen didn't change).
+    pub still: u64,
 }
 
 fn now_us() -> u64 {
@@ -94,7 +96,7 @@ fn stats_json(s: &Stats) -> String {
         v[((v.len() - 1) as f64 * p) as usize]
     };
     format!(
-        r#"{{"frames":{},"keyframes":{},"skipped_backed_up":{},"bytes":{},"rtt_ms":{:.1},"latency_ms":{{"p50":{:.1},"p95":{:.1},"samples":{}}},"encode_ms":{{"p50":{:.1},"p95":{:.1}}},"grab_ms":{{"p50":{:.1},"p95":{:.1}}}}}"#,
+        r#"{{"frames":{},"keyframes":{},"skipped_backed_up":{},"bytes":{},"rtt_ms":{:.1},"latency_ms":{{"p50":{:.1},"p95":{:.1},"samples":{}}},"encode_ms":{{"p50":{:.1},"p95":{:.1}}},"grab_ms":{{"p50":{:.1},"p95":{:.1}}},"still":{}}}"#,
         s.frames,
         s.keyframes,
         s.skipped_backed_up,
@@ -107,6 +109,7 @@ fn stats_json(s: &Stats) -> String {
         pct(&s.encode_ms, 0.95),
         pct(&s.grab_ms, 0.5),
         pct(&s.grab_ms, 0.95),
+        s.still,
     )
 }
 
@@ -186,6 +189,9 @@ fn session(mut ws: WebSocket<TcpStream>, source: Arc<Mutex<Box<dyn Source>>>, st
     let mut last_report = Instant::now();
     // The pointer as last sent: its place, and its image's serial (the image goes only when it changes).
     let mut cursor_sent: Option<(u16, u16, u32)> = None;
+    let mut seen_generation: Option<u64> = None;
+    let mut last_frame = Instant::now();
+    const REFRESH: Duration = Duration::from_secs(1);
     loop {
         let tick = Instant::now();
         // Everything the client sent since the last frame.
@@ -263,40 +269,49 @@ fn session(mut ws: WebSocket<TcpStream>, source: Arc<Mutex<Box<dyn Source>>>, st
                 backed_up = false;
                 enc.keyframe();
             }
-            let t0 = Instant::now();
-            let captured_at = now_us();
-            let (encoded, grab_ms) = {
-                let mut src = source.lock().unwrap();
-                let frame = src.grab()?;
-                let grab_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                (enc.encode(frame.bgra, frame.stride)?, grab_ms)
-            };
-            let encode_ms = t0.elapsed().as_secs_f64() * 1000.0 - grab_ms;
-            if let Some(e) = encoded {
-                frame_no = frame_no.wrapping_add(1);
-                captured.push_back((frame_no, captured_at));
-                if captured.len() > 600 {
-                    captured.pop_front();
-                }
-                let len = e.data.len() as u64;
-                send(
-                    &mut ws,
-                    &Message::Video(Video {
-                        keyframe: e.keyframe,
-                        frame: frame_no,
-                        timestamp_us: captured_at,
-                        data: e.data,
-                    }),
-                )?;
-                let mut s = stats.lock().unwrap();
-                s.frames += 1;
-                s.bytes += len;
-                s.keyframes += e.keyframe as u64;
-                s.encode_ms.push(encode_ms);
-                s.grab_ms.push(grab_ms);
-                if s.encode_ms.len() > 2000 {
-                    s.encode_ms.drain(..1000);
-                    s.grab_ms.drain(..1000);
+            // A still screen (the source says nothing changed) is neither read nor encoded, except for a
+            // keyframe someone needs and a refresh each second.
+            let generation = source.lock().unwrap().generation();
+            if generation.is_some() && generation == seen_generation && !enc.wants_keyframe() && last_frame.elapsed() < REFRESH {
+                stats.lock().unwrap().still += 1;
+            } else {
+                seen_generation = generation;
+                last_frame = Instant::now();
+                let t0 = Instant::now();
+                let captured_at = now_us();
+                let (encoded, grab_ms) = {
+                    let mut src = source.lock().unwrap();
+                    let frame = src.grab()?;
+                    let grab_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    (enc.encode(frame.bgra, frame.stride)?, grab_ms)
+                };
+                let encode_ms = t0.elapsed().as_secs_f64() * 1000.0 - grab_ms;
+                if let Some(e) = encoded {
+                    frame_no = frame_no.wrapping_add(1);
+                    captured.push_back((frame_no, captured_at));
+                    if captured.len() > 600 {
+                        captured.pop_front();
+                    }
+                    let len = e.data.len() as u64;
+                    send(
+                        &mut ws,
+                        &Message::Video(Video {
+                            keyframe: e.keyframe,
+                            frame: frame_no,
+                            timestamp_us: captured_at,
+                            data: e.data,
+                        }),
+                    )?;
+                    let mut s = stats.lock().unwrap();
+                    s.frames += 1;
+                    s.bytes += len;
+                    s.keyframes += e.keyframe as u64;
+                    s.encode_ms.push(encode_ms);
+                    s.grab_ms.push(grab_ms);
+                    if s.encode_ms.len() > 2000 {
+                        s.encode_ms.drain(..1000);
+                        s.grab_ms.drain(..1000);
+                    }
                 }
             }
         }

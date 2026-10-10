@@ -1,12 +1,18 @@
-//! An X11 display (a desktop's, or a virtual one: Xvfb, Xvnc): captured with GetImage, input sent
-//! with XTest. Phase 1; MIT-SHM capture and XDamage (only what changed) come next for speed.
+//! An X11 display (a desktop's, or a virtual one: Xvfb, Xvnc). Captured into shared memory (MIT-SHM:
+//! the X server writes the screen straight into our memory, no copy over the socket), or with
+//! GetImage where that isn't there (a display on another machine). XDamage says when the screen
+//! changed, so a still screen costs nothing. Input goes in with XTest; the pointer comes out apart
+//! with XFixes.
 
 use super::{Frame, Pointer, Source};
 use rr_proto::{Button, CursorShape, Input};
 use x11rb::connection::Connection;
+use x11rb::protocol::damage::{self, ConnectionExt as _};
+use x11rb::protocol::shm::ConnectionExt as _;
 use x11rb::protocol::xfixes::ConnectionExt as _;
 use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat, Window};
 use x11rb::protocol::xtest::ConnectionExt as _;
+use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 use x11rb::CURRENT_TIME;
 
@@ -22,6 +28,58 @@ pub struct X11 {
     shift_held: bool,
     /// The display has XFixes (the pointer's image and place, apart from the screen).
     xfixes: bool,
+    shm: Option<Shm>,
+    /// Damage on the root window, and a count of the changes it reported.
+    damage: Option<damage::Damage>,
+    generation: u64,
+}
+
+/// A shared memory segment the X server writes frames into.
+struct Shm {
+    seg: u32,
+    ptr: *mut u8,
+    len: usize,
+}
+
+// The mapping is only touched by whoever holds the source (it's behind a lock).
+unsafe impl Send for Shm {}
+
+impl Drop for Shm {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.ptr.cast(), self.len) };
+    }
+}
+
+/// A local display that only has its abstract socket (Linux: "@/tmp/.X11-unix/X20"; the socket file
+/// can be missing, as when two X servers start at once). Xlib tries it; x11rb doesn't.
+fn abstract_socket(display: Option<&str>) -> Option<(RustConnection, usize)> {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixStream};
+    let name = display.map(str::to_string).or_else(|| std::env::var("DISPLAY").ok())?;
+    let (num, screen) = name
+        .strip_prefix(':')?
+        .split_once('.')
+        .map_or((name[1..].to_string(), 0), |(n, s)| (n.to_string(), s.parse().unwrap_or(0)));
+    num.parse::<u32>().ok()?;
+    let addr = SocketAddr::from_abstract_name(format!("/tmp/.X11-unix/X{num}")).ok()?;
+    let stream = UnixStream::connect_addr(&addr).ok()?;
+    let (stream, _) = x11rb::rust_connection::DefaultStream::from_unix_stream(stream).ok()?;
+    Some((RustConnection::connect_to_stream(stream, screen).ok()?, screen))
+}
+
+fn shm(conn: &RustConnection, w: u16, h: u16) -> Option<Shm> {
+    use std::os::fd::AsRawFd;
+    conn.shm_query_version().ok()?.reply().ok()?;
+    let len = w as usize * h as usize * 4;
+    let seg = conn.generate_id().ok()?;
+    // MIT-SHM 1.2: the server makes the segment and passes it as a file descriptor.
+    let reply = conn.shm_create_segment(seg, len as u32, false).ok()?.reply().ok()?;
+    let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, reply.shm_fd.as_raw_fd(), 0) };
+    if ptr == libc::MAP_FAILED {
+        let _ = conn.shm_detach(seg);
+        return None;
+    }
+    Some(Shm { seg, ptr: ptr.cast(), len })
 }
 
 const KEY_PRESS: u8 = 2;
@@ -33,7 +91,9 @@ const MOTION: u8 = 6;
 impl X11 {
     /// `display`: ":20", or None for $DISPLAY.
     pub fn open(display: Option<&str>) -> Result<Self, String> {
-        let (conn, screen) = x11rb::connect(display).map_err(|e| format!("can't open the X display {}: {e}", display.unwrap_or("$DISPLAY")))?;
+        let (conn, screen) = x11rb::connect(display)
+            .or_else(|e| abstract_socket(display).ok_or(e))
+            .map_err(|e| format!("can't open the X display {}: {e}", display.unwrap_or("$DISPLAY")))?;
         let root_screen = &conn.setup().roots[screen];
         let (root, w, h) = (root_screen.root, root_screen.width_in_pixels, root_screen.height_in_pixels);
         conn.xtest_get_version(2, 2)
@@ -42,6 +102,23 @@ impl X11 {
             .map_err(|_| "the display has no XTest (input won't work)".to_string())?;
         let keymap = keymap(&conn)?;
         let xfixes = conn.xfixes_query_version(4, 0).ok().and_then(|c| c.reply().ok()).is_some();
+        let shm = shm(&conn, w, h);
+        let damage = (|| {
+            conn.damage_query_version(1, 1).ok()?.reply().ok()?;
+            let id = conn.generate_id().ok()?;
+            conn.damage_create(id, root, damage::ReportLevel::NON_EMPTY).ok()?.check().ok()?;
+            Some(id)
+        })();
+        eprintln!(
+            "rein-remote: X display {}: capture {}, {}",
+            display.unwrap_or("$DISPLAY"),
+            if shm.is_some() { "in shared memory" } else { "with GetImage (no MIT-SHM)" },
+            if damage.is_some() {
+                "changes from XDamage"
+            } else {
+                "every frame (no XDamage)"
+            }
+        );
         Ok(Self {
             conn,
             root,
@@ -51,6 +128,9 @@ impl X11 {
             keymap,
             shift_held: false,
             xfixes,
+            shm,
+            damage,
+            generation: 0,
         })
     }
 
@@ -185,18 +265,50 @@ impl Source for X11 {
         (self.w as usize, self.h as usize)
     }
 
+    fn generation(&mut self) -> Option<u64> {
+        let damage = self.damage?;
+        let mut changed = false;
+        while let Ok(Some(ev)) = self.conn.poll_for_event() {
+            if let Event::DamageNotify(_) = ev {
+                changed = true;
+            }
+        }
+        if changed {
+            // Clear what was reported so the next change reports again (NonEmpty level).
+            let _ = self.conn.damage_subtract(damage, x11rb::NONE, x11rb::NONE);
+            let _ = self.conn.flush();
+            self.generation += 1;
+        }
+        Some(self.generation)
+    }
+
     fn grab(&mut self) -> Result<Frame<'_>, String> {
+        if let Some(shm) = &self.shm {
+            let ok = self
+                .conn
+                .shm_get_image(self.root, 0, 0, self.w, self.h, !0, ImageFormat::Z_PIXMAP.into(), shm.seg, 0)
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .is_some();
+            if ok {
+                // B, G, R, X: the encoder ignores the X byte, so the frame is used as the server wrote it.
+                let bgra = unsafe { std::slice::from_raw_parts(shm.ptr, shm.len) };
+                return Ok(Frame {
+                    bgra,
+                    stride: self.w as usize * 4,
+                });
+            }
+            eprintln!("rein-remote: shared-memory capture failed; using GetImage");
+            self.shm = None;
+        }
         let reply = self
             .conn
             .get_image(ImageFormat::Z_PIXMAP, self.root, 0, 0, self.w, self.h, !0)
             .map_err(|e| e.to_string())?
             .reply()
             .map_err(|e| e.to_string())?;
-        // 24-bit depth in 32-bit pixels, little-endian: B, G, R, X. Make X opaque.
+        // 24-bit depth in 32-bit pixels, little-endian: B, G, R, X (the encoder ignores X).
         self.frame = reply.data;
-        for px in self.frame.chunks_exact_mut(4) {
-            px[3] = 255;
-        }
         Ok(Frame {
             bgra: &self.frame,
             stride: self.w as usize * 4,
