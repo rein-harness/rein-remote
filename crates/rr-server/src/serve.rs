@@ -6,7 +6,7 @@ use crate::capture::Source;
 use crate::encode::Video as Encoder;
 use crate::link::{E2eLink, Link, Recv, WsLink};
 use rr_proto::{Codec, CodecCap, Config, Cursor, Hello, Message, Video, INPUT_KEYBOARD, INPUT_POINTER, INPUT_TOUCH, VERSION_MAX, VERSION_MIN};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -27,6 +27,10 @@ pub struct Options {
     pub relay: Option<(String, String, Option<String>)>,
     /// The end-to-end key for sessions through the relay (in the viewer's link, after #).
     pub e2e_key: [u8; 32],
+    /// HTTPS on the page's port: a certificate and its key (PEM files). With `auto`, a real one for
+    /// the machine's tailnet name from Tailscale when it can give one.
+    pub tls: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    pub tailscale_cert: bool,
 }
 
 /// Latency and throughput, kept per session and shown by /stats.
@@ -55,19 +59,57 @@ fn now_us() -> u64 {
 }
 
 pub fn run(source: Box<dyn Source>, opts: Options) -> Result<(), String> {
-    let listener = TcpListener::bind(&opts.listen).map_err(|e| format!("can't listen on {}: {e}", opts.listen))?;
+    let tailnet_name = if opts.listen == "auto" { crate::links::magic_dns() } else { None };
+    // "auto": every interface, the first free port from 7979.
+    let listener = if opts.listen == "auto" {
+        (7979..=7999)
+            .find_map(|p| TcpListener::bind(("0.0.0.0", p)).ok())
+            .ok_or("no free port from 7979 to 7999 (give one with --listen)")?
+    } else {
+        TcpListener::bind(&opts.listen).map_err(|e| format!("can't listen on {}: {e}", opts.listen))?
+    };
+    // HTTPS: the certificate given, or (listening everywhere) Tailscale's for this machine's name.
+    let mut opts = opts;
+    if opts.tls.is_none() && opts.tailscale_cert && opts.listen == "auto" {
+        if let Some(name) = &tailnet_name {
+            opts.tls = crate::conn::tailscale_cert(name);
+            if opts.tls.is_none() {
+                eprintln!("rein-remote: no HTTPS certificate from Tailscale (turn on HTTPS for your tailnet, or give --tls-cert and --tls-key): over plain HTTP the page works in its slower mode");
+            }
+        }
+    }
     let (w, h) = source.size();
     // The address it got (a port of 0 picks a free one): a program that started it reads this line.
     let addr = listener.local_addr().map_or(opts.listen.clone(), |a| a.to_string());
     eprintln!("rein-remote: streaming a {w}×{h} screen on http://{addr} (open it in a browser)");
+    // On every interface: the links to open, with the token (they're the key: share them as such).
+    if let Ok(at) = listener.local_addr() {
+        if at.ip().is_unspecified() {
+            let token = opts.token.as_deref().map(|t| format!("/?token={t}")).unwrap_or_default();
+            eprintln!("rein-remote: open it from any of your devices (the link is the key):");
+            for p in crate::links::places() {
+                // HTTPS for the name the certificate is for (full quality on every device).
+                let scheme = if opts.tls.is_some() && tailnet_name.as_deref() == Some(p.host.as_str()) {
+                    "https"
+                } else {
+                    "http"
+                };
+                eprintln!("  {:<14} {scheme}://{}:{}{token}", p.label, p.host, at.port());
+            }
+        }
+    }
+    let tls = match &opts.tls {
+        Some((c, k)) => Some(crate::conn::tls_from_pem(c, k)?),
+        None => None,
+    };
     let source = Arc::new(Mutex::new(source));
     let stats = Arc::new(Mutex::new(Stats::default()));
     let opts = Arc::new(opts);
     // WebTransport on the same port over UDP: the page connects with it when the browser can.
-    let wt: Arc<Option<(u16, [u8; 32])>> = Arc::new(match (opts.webtransport, listener.local_addr()) {
+    let wt: Arc<Option<(u16, Option<[u8; 32]>)>> = Arc::new(match (opts.webtransport, listener.local_addr()) {
         (true, Ok(at)) => {
             let (source, stats, o) = (source.clone(), stats.clone(), opts.clone());
-            match crate::link::webtransport(at, opts.token.clone(), move |link| {
+            match crate::link::webtransport(at, opts.token.clone(), opts.tls.clone(), move |link| {
                 if let Err(e) = session(link, source.clone(), stats.clone(), &o) {
                     eprintln!("rein-remote: {e}");
                 }
@@ -96,9 +138,9 @@ pub fn run(source: Box<dyn Source>, opts: Options) -> Result<(), String> {
     }
     for conn in listener.incoming() {
         let Ok(stream) = conn else { continue };
-        let (source, stats, opts, wt) = (source.clone(), stats.clone(), opts.clone(), wt.clone());
+        let (source, stats, opts, wt, tls) = (source.clone(), stats.clone(), opts.clone(), wt.clone(), tls.clone());
         std::thread::spawn(move || {
-            if let Err(e) = handle(stream, source, stats, &opts, &wt) {
+            if let Err(e) = handle(stream, source, stats, &opts, &wt, tls.as_ref()) {
                 eprintln!("rein-remote: {e}");
             }
         });
@@ -141,18 +183,18 @@ fn through_relay(relay: &str, room: &str, secret: Option<&str>, source: Arc<Mute
 }
 
 fn handle(
-    mut stream: TcpStream,
+    stream: TcpStream,
     source: Arc<Mutex<Box<dyn Source>>>,
     stats: Arc<Mutex<Stats>>,
     opts: &Options,
-    wt: &Option<(u16, [u8; 32])>,
+    wt: &Option<(u16, Option<[u8; 32]>)>,
+    tls: Option<&Arc<rustls::ServerConfig>>,
 ) -> Result<(), String> {
-    // Look at the request line without consuming it (the WebSocket handshake needs all of it).
-    let mut head = [0u8; 2048];
-    let n = stream.peek(&mut head).map_err(|e| e.to_string())?;
-    let req = String::from_utf8_lossy(&head[..n]);
+    let mut conn = crate::conn::Conn::accept(stream, tls)?;
+    let head = conn.read_head()?;
+    let req = String::from_utf8_lossy(&head).to_string();
     // The path without its query string ("/?measure" is the page).
-    let target = req.split_whitespace().nth(1).unwrap_or("/");
+    let target = req.split_whitespace().nth(1).unwrap_or("/").to_string();
     let path = target.split(['?', '#']).next().unwrap_or("/").to_string();
     let upgrade = req.to_ascii_lowercase().contains("upgrade: websocket");
     let token_ok = opts.token.as_deref().is_none_or(|t| {
@@ -166,31 +208,31 @@ fn handle(
         given.len() == t.len() && given.bytes().zip(t.bytes()).fold(0u8, |d, (a, b)| d | (a ^ b)) == 0
     });
     if (path.starts_with("/stream") || path == "/stats") && !token_ok {
-        let _ = stream.read(&mut head);
-        let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let _ = conn.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         return Ok(());
     }
     if path.starts_with("/stream") && upgrade {
         // Frames go at once, and the kernel holds only ~50 ms of them at the top bitrate: a slow link
         // shows up as a connection that backs up within a frame or two (keyframe-and-skip, and the
         // controller backs off), instead of a second of video queued where neither can see it.
-        let _ = stream.set_nodelay(true);
-        let _ = socket2::SockRef::from(&stream).set_send_buffer_size((opts.bitrate_kbps as usize * 1000 / 8 / 20).max(64 * 1024));
-        let ws = tungstenite::accept(stream).map_err(|e| format!("websocket: {e}"))?;
+        use crate::link::Sock;
+        let _ = conn.tcp().set_nodelay(true);
+        let _ = socket2::SockRef::from(conn.tcp()).set_send_buffer_size((opts.bitrate_kbps as usize * 1000 / 8 / 20).max(64 * 1024));
+        let ws = tungstenite::accept(crate::conn::Replay::new(head, conn)).map_err(|e| format!("websocket: {e}"))?;
         return session(Box::new(WsLink(ws)), source, stats, opts);
     }
-    // Plain HTTP: read the request, answer with a file.
-    let _ = stream.read(&mut head);
     let (status, kind, body) = match path.as_str() {
         "/" | "/index.html" => ("200 OK", "text/html; charset=utf-8", INDEX.to_string()),
         "/rein-remote.js" => ("200 OK", "text/javascript; charset=utf-8", CLIENT_JS.to_string()),
         "/stats" => ("200 OK", "application/json", stats_json(&stats.lock().unwrap())),
-        // Where WebTransport is and its certificate's SHA-256 (the browser accepts it by hash).
+        // Where WebTransport is, and its certificate's SHA-256 when the browser has to be given it
+        // (a self-signed one; a real certificate needs nothing).
         "/info" => (
             "200 OK",
             "application/json",
             match wt {
-                Some((port, hash)) => format!(r#"{{"webtransport":{{"port":{port},"hash":{hash:?}}}}}"#),
+                Some((port, Some(hash))) => format!(r#"{{"webtransport":{{"port":{port},"hash":{hash:?}}}}}"#),
+                Some((port, None)) => format!(r#"{{"webtransport":{{"port":{port},"hash":null}}}}"#),
                 None => r#"{"webtransport":null}"#.to_string(),
             },
         ),
@@ -200,7 +242,7 @@ fn handle(
         "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    stream.write_all(resp.as_bytes()).map_err(|e| e.to_string())
+    conn.write_all(resp.as_bytes()).map_err(|e| e.to_string())
 }
 
 fn stats_json(s: &Stats) -> String {

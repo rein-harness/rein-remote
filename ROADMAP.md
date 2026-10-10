@@ -88,6 +88,14 @@ has been verified.
     720p on a Mac). Rein's web UI keeps the WebSocket (through its own HTTPS proxy). Next: video as
     datagrams with forward error correction, so a lost packet costs no retransmission.
 - LAN discovery (mDNS), pairing codes, mutual keys.
+  - **Status:** no setup on a tailnet or a local network: `serve` listens on every interface behind a
+    random token and prints a link per way in (tailnet name, tailnet address, local network,
+    localhost). With Tailscale's HTTPS on, a real certificate for the machine's name (`tailscale
+    cert`) and HTTPS on the same port as HTTP (the first byte says which), WebTransport with it too;
+    on plain HTTP (no WebCodecs there) the page plays the H.264 through Media Source. Verified on a Mac
+    on a tailnet: the https:// tailnet link 15 ms glass to glass over WebTransport; the http://
+    tailnet and LAN links ~31 fps at 46–53 ms through Media Source; no token, 403. mDNS discovery is
+    next.
 - Rendezvous with NAT hole punching; the relay (self-hostable).
   - **Status:** the relay is in: `rein-remote relay` (self-hosted, `--secret` for who may host) pairs
     a machine that connected out (`serve --relay ws(s)://…`, a random 24-character room) with a

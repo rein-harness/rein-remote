@@ -38,11 +38,25 @@ Early: the design is done and being built one verified piece at a time
 ## Try it
 
 ```sh
-cargo build --release -p rr-server
-./target/release/rein-remote serve --display :0        # a Linux X display (or a virtual one: Xvfb :20)
-./target/release/rein-remote serve --test-pattern      # any platform: a moving test pattern
-# then open http://127.0.0.1:7979 in a browser
+rein-remote serve --window Simulator     # one app's window (macOS, Windows, Linux)
+rein-remote serve                        # this screen (Linux: $DISPLAY)
+rein-remote serve --test-pattern         # a moving test pattern, any platform
 ```
+
+It prints the links to open, one per way to reach this machine, each carrying this run's key:
+
+```
+  your tailnet   https://box.tail1234.ts.net:7979/?token=…   (Tailscale: a real certificate, full quality)
+  your tailnet   http://100.101.102.103:7979/?token=…
+  this network   http://192.168.1.20:7979/?token=…
+  this computer  http://localhost:7979/?token=…
+```
+
+Nothing to set up: on a tailnet with HTTPS turned on, rein-remote gets a real certificate for the
+machine's name from Tailscale (`tailscale cert`) and serves HTTPS and plain HTTP on the same port.
+Browsers give a page their video decoder only over HTTPS (or on localhost); on a plain-HTTP link the
+page plays the same H.264 through Media Source instead (a little more delay). Behind your own HTTPS:
+`--tls-cert` and `--tls-key`.
 
 Measured (phase 1, software H.264, decoded in Chrome in software):
 
