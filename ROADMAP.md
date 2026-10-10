@@ -60,8 +60,10 @@ has been verified.
   stays the fallback, at the frame rate the CPU can hold.
 - **Status:** macOS windows stream and take input on a real Mac (Calculator: clicks computed
   7 + 2 = 9 with the app starting behind Terminal; keys typed into it in the background).
-  `rein-remote windows` lists them. Next: Windows, Linux windows, the pointer's shape on macOS,
-  VideoToolbox.
+  `rein-remote windows` lists them. Linux windows too (XComposite, so a covered window streams as
+  it is; a press raises and focuses it): verified with one xterm covered by another, its own
+  contents streamed and a command typed into it ran. Next: Windows, the pointer's shape on macOS,
+  hardware encoders.
 - **Verified:** a window on each streams with input (macOS on a real Mac; Windows on CI runners and a
   real machine), hardware and software paths both; 200 fps measured glass to glass on a machine
   with a hardware encoder, with the server's CPU use written down (idle and under motion).

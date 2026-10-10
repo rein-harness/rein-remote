@@ -89,7 +89,12 @@ fn open_window(query: &str) -> Result<Box<dyn Source>, String> {
     Ok(Box::new(capture::mac::MacWindow::open(query)?))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn open_window(query: &str) -> Result<Box<dyn Source>, String> {
+    Ok(Box::new(capture::x11::X11::open_window(None, query)?))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn open_window(_query: &str) -> Result<Box<dyn Source>, String> {
     Err("window capture on this platform is coming (see ROADMAP.md, phase 3)".into())
 }
@@ -98,13 +103,6 @@ fn open_window(_query: &str) -> Result<Box<dyn Source>, String> {
 fn list_windows(json: bool) -> Result<(), String> {
     let list = capture::mac::windows()?;
     if json {
-        let esc = |s: &str| {
-            s.replace('\\', "\\\\")
-                .replace('"', "\\\"")
-                .chars()
-                .filter(|c| !c.is_control())
-                .collect::<String>()
-        };
         let rows: Vec<String> = list
             .iter()
             .map(|w| {
@@ -128,9 +126,41 @@ fn list_windows(json: bool) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn list_windows(json: bool) -> Result<(), String> {
+    let list = capture::x11::windows(None)?;
+    if json {
+        let rows: Vec<String> = list
+            .iter()
+            .map(|w| {
+                format!(
+                    r#"{{"id":{},"app":"{}","title":"{}","width":{},"height":{}}}"#,
+                    w.id,
+                    esc(&w.class),
+                    esc(&w.name),
+                    w.width,
+                    w.height
+                )
+            })
+            .collect();
+        println!("[{}]", rows.join(","));
+    } else {
+        for w in list {
+            println!("{:>10}  {}  {}  ({}×{})", format!("0x{:x}", w.id), w.class, w.name, w.width, w.height);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn list_windows(_json: bool) -> Result<(), String> {
     Err("listing windows on this platform is coming (see ROADMAP.md, phase 3)".into())
+}
+
+/// A string for JSON: quotes and backslashes escaped, control characters left out.
+#[allow(dead_code)] // not on Windows yet
+fn esc(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"").chars().filter(|c| !c.is_control()).collect()
 }
 
 #[cfg(target_os = "linux")]

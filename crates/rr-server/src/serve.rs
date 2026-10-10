@@ -210,7 +210,7 @@ fn session(mut ws: WebSocket<TcpStream>, source: Arc<Mutex<Box<dyn Source>>>, st
     let mut pings: std::collections::HashMap<u32, Instant> = Default::default();
     let mut last_report = Instant::now();
     // The pointer as last sent: its place, and its image's serial (the image goes only when it changes).
-    let mut cursor_sent: Option<(u16, u16, u32)> = None;
+    let mut cursor_sent: Option<(u16, u16, u32, bool)> = None;
     let mut seen_generation: Option<u64> = None;
     let mut last_frame = Instant::now();
     const REFRESH: Duration = Duration::from_secs(1);
@@ -258,16 +258,16 @@ fn session(mut ws: WebSocket<TcpStream>, source: Arc<Mutex<Box<dyn Source>>>, st
         }
         let pointer = source.lock().unwrap().cursor();
         if let Some(p) = pointer {
-            let new_shape = cursor_sent.is_none_or(|(_, _, s)| s != p.serial);
-            if new_shape || cursor_sent.is_none_or(|(x, y, _)| (x, y) != (p.x, p.y)) {
-                cursor_sent = Some((p.x, p.y, p.serial));
+            let new_shape = cursor_sent.is_none_or(|(_, _, s, _)| s != p.serial);
+            if new_shape || cursor_sent.is_none_or(|(x, y, _, v)| (x, y, v) != (p.x, p.y, p.visible)) {
+                cursor_sent = Some((p.x, p.y, p.serial, p.visible));
                 let shape = new_shape.then_some(p.shape);
                 send(
                     &mut ws,
                     &Message::Cursor(Cursor {
                         x: p.x,
                         y: p.y,
-                        visible: true,
+                        visible: p.visible,
                         shape,
                     }),
                 )?;

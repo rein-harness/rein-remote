@@ -40,6 +40,8 @@ pub struct Pointer {
     pub y: u16,
     pub serial: u32,
     pub shape: CursorShape,
+    /// Over what's streamed (a window's stream hides it when it's elsewhere on the screen).
+    pub visible: bool,
 }
 
 /// A moving pattern with a frame counter: something to stream without a display.
