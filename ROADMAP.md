@@ -93,8 +93,11 @@ has been verified.
     a machine that connected out (`serve --relay ws(s)://…`, a random 24-character room) with a
     viewer who opens its page; the machine reconnects for the next viewer. Verified on one Mac:
     14 ms glass to glass through it, two viewers one after the other, a host with the wrong secret
-    refused (403). Still to do: NAT hole punching (straight over QUIC when it works), end-to-end
-    encryption through the relay.
+    refused (403). End to end through it: the key in the link after # (the relay never sees it),
+    AES-256-GCM a message, keys per session and direction (HKDF over a salt sent first), replays
+    and changes refused; verified: the right key streams (14 ms glass to glass), a wrong key is
+    refused at both ends, a link without its key says so. Still to do: NAT hole punching
+    (straight over QUIC when it works).
 - Delay-based bitrate controller; frame rate and resolution adaptation; intra refresh.
   - **Status:** a delay-based controller (each frame's round trip on the server's own clock, its
     rise over the lowest of the last 10 s is queuing; a backed-up socket counts too) cuts the

@@ -22,8 +22,12 @@ pub enum Recv {
 }
 
 pub trait Link {
+    /// Queue a message's bytes without waiting (`video`: a frame, which WebTransport sends apart).
+    fn send_bytes(&mut self, bytes: Vec<u8>, video: bool) -> Result<(), String>;
     /// Queue a message without waiting.
-    fn send(&mut self, m: &Message) -> Result<(), String>;
+    fn send(&mut self, m: &Message) -> Result<(), String> {
+        self.send_bytes(m.encode(), matches!(m, Message::Video(_)))
+    }
     /// Whether what was queued has gone out (false: the link is backed up).
     fn flushed(&mut self) -> Result<bool, String>;
     /// What the client sent, without waiting.
@@ -64,8 +68,8 @@ impl Sock for tungstenite::stream::MaybeTlsStream<TcpStream> {
 pub struct WsLink<S: Sock>(pub WebSocket<S>);
 
 impl<S: Sock> Link for WsLink<S> {
-    fn send(&mut self, m: &Message) -> Result<(), String> {
-        match self.0.write(Ws::Binary(m.encode().into())) {
+    fn send_bytes(&mut self, bytes: Vec<u8>, _video: bool) -> Result<(), String> {
+        match self.0.write(Ws::Binary(bytes.into())) {
             Ok(()) => Ok(()),
             Err(tungstenite::Error::Io(e)) if e.kind() == ErrorKind::WouldBlock => Ok(()), // buffered
             Err(e) => Err(e.to_string()),
@@ -129,9 +133,8 @@ pub struct WtLink {
 const MAX_IN_FLIGHT: usize = 3;
 
 impl Link for WtLink {
-    fn send(&mut self, m: &Message) -> Result<(), String> {
-        let bytes = m.encode();
-        let out = if matches!(m, Message::Video(_)) {
+    fn send_bytes(&mut self, bytes: Vec<u8>, video: bool) -> Result<(), String> {
+        let out = if video {
             self.in_flight.fetch_add(1, Ordering::SeqCst);
             Out::Frame(bytes)
         } else {
@@ -284,4 +287,44 @@ fn whole_frame(b: &[u8]) -> Option<usize> {
     }
     let len = 7 + u32::from_le_bytes([b[3], b[4], b[5], b[6]]) as usize;
     (b.len() >= len).then_some(len)
+}
+
+// ---- end to end ----
+
+/// Another link with every message sealed (e2e.rs): what's between the two ends (a relay) passes
+/// messages it can't read or change.
+pub struct E2eLink {
+    inner: Box<dyn Link + Send>,
+    e2e: crate::e2e::E2e,
+}
+
+impl E2eLink {
+    /// The machine's end: sends the session's salt first, in the clear.
+    pub fn host(mut inner: Box<dyn Link + Send>, key: &[u8; 32]) -> Result<Self, String> {
+        let (e2e, salt) = crate::e2e::E2e::host(key);
+        inner.send_bytes([crate::e2e::SALT_PREFIX, &salt].concat(), false)?;
+        Ok(Self { inner, e2e })
+    }
+}
+
+impl Link for E2eLink {
+    fn send_bytes(&mut self, bytes: Vec<u8>, video: bool) -> Result<(), String> {
+        let sealed = self.e2e.seal(&bytes);
+        self.inner.send_bytes(sealed, video)
+    }
+
+    fn flushed(&mut self) -> Result<bool, String> {
+        self.inner.flushed()
+    }
+
+    fn recv(&mut self) -> Result<Recv, String> {
+        match self.inner.recv()? {
+            Recv::Data(b) => Ok(Recv::Data(self.e2e.open(&b)?)),
+            other => Ok(other),
+        }
+    }
+
+    fn wait(&mut self, d: Duration) {
+        self.inner.wait(d);
+    }
 }

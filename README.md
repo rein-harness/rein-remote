@@ -69,8 +69,10 @@ rein-remote relay --listen 0.0.0.0:7990 --secret S        # on a machine both ca
 rein-remote serve --relay wss://relay.example --relay-secret S   # on the machine to show: prints the viewer's link
 ```
 
-The relay passes the stream along; it can see it (TLS protects it on the way). End-to-end encryption
-is on the roadmap.
+The relay can't read what it passes: the machine makes a key and puts it in the viewer's link after
+`#` (browsers never send that part of an address to a server), and every message is sealed end to
+end with AES-256-GCM (keys per session and direction, from HKDF). A wrong key or an altered message
+is refused. The viewer's page needs HTTPS (or localhost) for the browser's crypto.
 
 ## How it works
 

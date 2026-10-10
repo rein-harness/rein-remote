@@ -12,6 +12,7 @@
 
 mod adapt;
 mod capture;
+mod e2e;
 mod encode;
 #[cfg(target_os = "macos")]
 mod encode_vt;
@@ -81,6 +82,11 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
         token: std::env::var("REIN_REMOTE_TOKEN").ok().filter(|t| !t.is_empty()),
         webtransport: true,
         relay: None,
+        e2e_key: {
+            let mut k = [0u8; 32];
+            let _ = getrandom::fill(&mut k);
+            k
+        },
     };
     let (mut relay, mut room, mut relay_secret) = (None, None, std::env::var("REIN_REMOTE_RELAY_SECRET").ok());
     let mut display: Option<String> = None;
