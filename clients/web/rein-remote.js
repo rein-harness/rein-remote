@@ -228,19 +228,98 @@ export function connect(url, canvas, opts = {}) {
   canvas.tabIndex = 0;
   canvas.style.touchAction = 'none';
   let lastMove = 0;
+  // A mouse or pen: straight through. A finger: gestures (below).
   canvas.addEventListener('pointerdown', (e) => {
-    canvas.focus();
+    canvas.focus({preventScroll: true});
     e.preventDefault();
     canvas.setPointerCapture?.(e.pointerId);
+    if (e.pointerType === 'touch') return touch.down(e);
     move(...at(e));
     button(btn(e.button), true);
   });
-  canvas.addEventListener('pointerup', (e) => (move(...at(e)), button(btn(e.button), false)));
+  canvas.addEventListener('pointerup', (e) => {
+    if (e.pointerType === 'touch') return touch.up(e);
+    move(...at(e));
+    button(btn(e.button), false);
+  });
+  canvas.addEventListener('pointercancel', (e) => e.pointerType === 'touch' && touch.up(e, true));
   canvas.addEventListener('pointermove', (e) => {
+    if (e.pointerType === 'touch') return touch.move(e);
     if (performance.now() - lastMove < 8) return;
     lastMove = performance.now();
     move(...at(e));
   });
+
+  // Touch, for a server that drives a mouse (as every desktop does): tap clicks, a swipe scrolls,
+  // hold then move drags, a two-finger tap right-clicks.
+  const touch = (() => {
+    const fingers = new Map(); // pointerId → {x, y, x0, y0, t0}
+    let mode = 'idle'; // idle | maybe | scroll | drag | two
+    let holdTimer = 0;
+    let scrollAt = null;
+    const HOLD_MS = 400, SLOP = 10;
+    const wheel = (dx, dy) => input((w) => (w.u8(4), w.i16(Math.round(dx)), w.i16(Math.round(dy))));
+    return {
+      down(e) {
+        fingers.set(e.pointerId, {x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY, t0: performance.now()});
+        if (fingers.size === 1) {
+          mode = 'maybe';
+          clearTimeout(holdTimer);
+          holdTimer = setTimeout(() => {
+            if (mode !== 'maybe') return;
+            mode = 'drag';
+            move(...at(e));
+            button(0, true);
+            navigator.vibrate?.(15);
+          }, HOLD_MS);
+        } else if (fingers.size === 2 && mode === 'maybe') {
+          mode = 'two';
+          clearTimeout(holdTimer);
+        }
+      },
+      move(e) {
+        const f = fingers.get(e.pointerId);
+        if (!f) return;
+        const [px, py] = [f.x, f.y];
+        f.x = e.clientX;
+        f.y = e.clientY;
+        if (mode === 'drag') return move(...at(e));
+        if (mode === 'maybe' && Math.hypot(f.x - f.x0, f.y - f.y0) > SLOP) {
+          mode = 'scroll';
+          clearTimeout(holdTimer);
+          scrollAt = at(e);
+          move(...scrollAt); // scroll what's under the finger
+        }
+        if (mode === 'scroll') {
+          // Content follows the finger: moving up scrolls down. Canvas pixels, like a trackpad.
+          const k = canvas.width / canvas.getBoundingClientRect().width;
+          wheel((px - f.x) * k, (py - f.y) * k);
+        }
+      },
+      up(e, cancelled = false) {
+        const f = fingers.get(e.pointerId);
+        fingers.delete(e.pointerId);
+        clearTimeout(holdTimer);
+        if (!f) return;
+        if (mode === 'drag') {
+          move(...at(e));
+          button(0, false);
+        } else if (mode === 'maybe' && !cancelled) {
+          move(...at(e));
+          button(0, true);
+          button(0, false);
+        } else if (mode === 'two' && fingers.size === 1 && !cancelled) {
+          const o = [...fingers.values()][0];
+          move(...at({clientX: (o.x + f.x) / 2, clientY: (o.y + f.y) / 2}));
+          button(1, true);
+          button(1, false);
+          mode = 'done';
+          return;
+        }
+        if (fingers.size === 0) mode = 'idle';
+      },
+    };
+  })();
   canvas.addEventListener('wheel', (e) => (e.preventDefault(), input((w) => (w.u8(4), w.i16(Math.round(e.deltaX)), w.i16(Math.round(e.deltaY))))), {passive: false});
   canvas.addEventListener('contextmenu', (e) => e.preventDefault());
   const key = (e, down) => {
@@ -254,7 +333,38 @@ export function connect(url, canvas, opts = {}) {
     if (text) (e.preventDefault(), input((w) => (w.u8(6), w.str(text))));
   });
 
-  return {stats, close: () => (ws.close(), decoder?.close?.())};
+  // The device's own keyboard (a phone, a tablet): a hidden text field takes the typing. Text goes as
+  // text (any language, emoji, autocorrect); Backspace and Enter go as keys.
+  const keys = document.createElement('textarea');
+  keys.setAttribute('autocapitalize', 'off');
+  keys.setAttribute('autocomplete', 'off');
+  keys.setAttribute('autocorrect', 'off');
+  keys.setAttribute('spellcheck', 'false');
+  keys.setAttribute('aria-label', 'Type into the remote screen');
+  keys.style.cssText = 'position:fixed;left:0;bottom:0;width:1px;height:1px;opacity:0;border:0;padding:0;font-size:16px';
+  const tap = (name) => (input((w) => (w.u8(5), w.u16(0), w.u8(1), w.str(name))), input((w) => (w.u8(5), w.u16(0), w.u8(0), w.str(name))));
+  keys.addEventListener('beforeinput', (e) => {
+    e.preventDefault();
+    if (e.inputType === 'insertText' || e.inputType === 'insertReplacementText' || e.inputType === 'insertFromPaste') {
+      const text = e.data ?? e.dataTransfer?.getData('text') ?? '';
+      // A newline is the Enter key, not a character.
+      text.split(/\r?\n/).forEach((line, i) => (i && tap('Enter'), line && input((w) => (w.u8(6), w.str(line)))));
+    } else if (e.inputType === 'insertLineBreak' || e.inputType === 'insertParagraph') tap('Enter');
+    else if (e.inputType.startsWith('deleteContentBackward')) tap('Backspace');
+    else if (e.inputType.startsWith('deleteContentForward')) tap('Delete');
+  });
+  keys.addEventListener('keydown', (e) => {
+    // Keys with no text (arrows, Escape, Tab) from a hardware keyboard on a tablet.
+    if (e.key.length > 1 && !['Unidentified', 'Process', 'Backspace', 'Enter'].includes(e.key)) key(e, true), key(e, false);
+  });
+  (canvas.parentNode ?? document.body).append(keys);
+
+  return {
+    stats,
+    /** Show the device's on-screen keyboard (call it from a tap: browsers allow it only then). */
+    keyboard: () => keys.focus({preventScroll: true}),
+    close: () => (ws.close(), decoder?.close?.(), keys.remove()),
+  };
 }
 
 // ---- <rein-remote src="wss://…"> ----
@@ -266,6 +376,7 @@ if (typeof customElements !== 'undefined' && !customElements.get('rein-remote'))
       canvas.style.cssText = 'max-width:100%;max-height:100%;display:block;outline:none;background:#000';
       this.append(canvas);
       this.session = connect(this.getAttribute('src'), canvas);
+      this.keyboard = () => this.session.keyboard();
     }
     disconnectedCallback() {
       this.session?.close();

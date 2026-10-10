@@ -23,7 +23,8 @@ has been verified.
   focused it and typed text (capitals and symbols included) ran. With the terminal scrolling
   full-screen at 1280×720 on a 4-core VM: 33 ms median / 44 ms p95 capture to decoded, 3 ms to
   read the screen, 19 ms to encode (BGRA→YUV went from 8.8 ms to 0.7 ms with our own conversion).
-  Still to do in this phase: the cursor sent apart, touch input in the web client, MIT-SHM +
+  Touch works on a phone-size screen (a swipe scrolled the terminal's history, a tap and the
+  device's keyboard typed and ran a command). Still to do in this phase: the cursor sent apart, MIT-SHM +
   XDamage capture, and multi-slice threaded encoding (needs our own binding to openh264's C API;
   the crate's wrapper encodes one slice).
 

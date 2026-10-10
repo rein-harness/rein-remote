@@ -26,7 +26,7 @@ Early: the design is done and being built one verified piece at a time
 | Server: Linux (X11, a real or virtual display) | working: capture, software H.264, mouse, wheel and keyboard input (phase 1) |
 | Server: macOS | todo (phase 3) |
 | Server: Windows | todo (phase 3) |
-| Client: web (WebCodecs, embeddable `<rein-remote>`) | working: decode (hardware when there is), mouse, wheel, keyboard (phase 1) |
+| Client: web (WebCodecs, embeddable `<rein-remote>`) | working: decode (hardware when there is), mouse, wheel, keyboard, touch gestures and the device's on-screen keyboard (phase 1) |
 | Client: Windows / macOS / Linux | todo (phase 5) |
 | Client: iOS / iPadOS / Android | todo (phase 5) |
 | Transport: WebSocket | working, with keyframe-and-skip when the link backs up (phase 1) |
