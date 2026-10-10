@@ -43,10 +43,17 @@ cargo build --release -p rr-server
 # then open http://127.0.0.1:7979 in a browser
 ```
 
-Measured (phase 1, software H.264, a terminal scrolling full-screen, a 4-core x86 VM, decoded in
-Chrome in software):
+Measured (phase 1, software H.264, decoded in Chrome in software):
 
-| Screen | Capture to decoded (p50 / p95) | Read the screen | Encode |
+- **Glass to glass, 1280×720, on one Mac (loopback): 10 ms median, 12 ms at p95.** The test pattern
+  draws its capture time as a barcode; the client reads it back from each decoded frame
+  (`rein-remote serve --test-pattern`, then open `http://127.0.0.1:7979/?measure`). That ends when
+  the frame is drawn in the page; the display's next refresh adds up to one more frame.
+- A terminal scrolling full-screen on X11 in a 4-core x86 VM (server-side estimate from the
+  client's feedback, which reads high by up to a frame because the server reads replies once a
+  frame: 27 ms where the barcode says 10):
+
+| Screen | Capture to decoded (p50 / p95, upper bound) | Read the screen | Encode |
 |---|---|---|---|
 | 1920×1080 | 26 ms / 36 ms | 1.7 ms (shared memory) | 16 ms |
 | 1280×720 | 33 ms / 44 ms | 3 ms (GetImage) | 19 ms |

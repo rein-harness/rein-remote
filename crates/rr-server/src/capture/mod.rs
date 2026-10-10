@@ -86,6 +86,29 @@ impl Source for TestPattern {
                 self.buf[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
             }
         }
+        // The capture time as a barcode along the bottom, for measuring glass to glass: a client
+        // that shares this clock reads it from the decoded frame (rein-remote.js, `measure`).
+        // Blocks of 24×24: white, black (sync), then the time in milliseconds, 32 bits, high first.
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64) as u32;
+        const B: usize = 24;
+        if w >= 34 * B && h >= B {
+            for k in 0..34 {
+                let on = match k {
+                    0 => true,
+                    1 => false,
+                    _ => ms >> (33 - k) & 1 == 1,
+                };
+                let v = if on { 255 } else { 0 };
+                for y in h - B..h {
+                    let i = (y * w + k * B) * 4;
+                    for px in self.buf[i..i + B * 4].chunks_exact_mut(4) {
+                        px.copy_from_slice(&[v, v, v, 255]);
+                    }
+                }
+            }
+        }
         if let Some((px, py)) = self.pointer {
             for d in 0..20usize {
                 for (x, y) in [(px + d, py), (px.saturating_sub(d), py), (px, py + d), (px, py.saturating_sub(d))] {

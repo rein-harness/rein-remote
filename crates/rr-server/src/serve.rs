@@ -65,7 +65,8 @@ fn handle(mut stream: TcpStream, source: Arc<Mutex<Box<dyn Source>>>, stats: Arc
     let mut head = [0u8; 2048];
     let n = stream.peek(&mut head).map_err(|e| e.to_string())?;
     let req = String::from_utf8_lossy(&head[..n]);
-    let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+    // The path without its query string ("/?measure" is the page).
+    let path = req.split_whitespace().nth(1).unwrap_or("/").split(['?', '#']).next().unwrap_or("/").to_string();
     let upgrade = req.to_ascii_lowercase().contains("upgrade: websocket");
     if path.starts_with("/stream") && upgrade {
         let ws = tungstenite::accept(stream).map_err(|e| format!("websocket: {e}"))?;

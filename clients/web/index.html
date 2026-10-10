@@ -29,7 +29,9 @@
     document.getElementById('kb').onclick = () => s.keyboard();
     setInterval(() => {
       const t = s.stats;
-      document.getElementById('stats').textContent = `${t.state} · ${t.decoder || '…'} · ${t.frames} frames · ${(t.bytes / 1e6).toFixed(1)} MB · rtt ${t.rttMs.toFixed(0)} ms${t.error ? ' · ' + t.error : ''}`;
+      const g = [...t.glassMs].sort((a, b) => a - b);
+      const glass = g.length ? ` · glass to glass ${g[g.length >> 1]} ms (p95 ${g[Math.floor(g.length * 0.95)]})` : '';
+      document.getElementById('stats').textContent = `${t.state} · ${t.decoder || '…'} · ${t.frames} frames · ${(t.bytes / 1e6).toFixed(1)} MB · rtt ${t.rttMs.toFixed(0)} ms${glass}${t.error ? ' · ' + t.error : ''}`;
     }, 500);
   </script>
 </body>

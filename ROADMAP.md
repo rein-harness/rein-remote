@@ -27,7 +27,10 @@ has been verified.
   device's keyboard typed and ran a command). The pointer goes apart from the video (XFixes): its
   image once per shape, its place when it moves, drawn by the client at the local mouse at once.
   Latency is measured from the client's per-frame feedback (capture time to decoded, less half the
-  round trip), not yet with a timestamp overlay. Capture is in shared memory (MIT-SHM 1.2, the
+  round trip; this reads high by up to a frame, as the server reads replies once a frame) and,
+  glass to glass, with a timestamp overlay: the test pattern draws its capture time as a barcode
+  and the client reads it from each decoded frame, 10 ms median / 12 ms p95 at 1280×720 on one
+  Mac (645 of 645 frames read). Capture is in shared memory (MIT-SHM 1.2, the
   segment passed as a file descriptor; GetImage where there's none), and XDamage skips a still
   screen: at 1920×1080 scrolling full-screen, 1.7 ms to read the screen, 16 ms to encode,
   26 ms / 36 ms capture to decoded; a still terminal sent 8 frames in 8 seconds. A display with

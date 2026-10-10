@@ -76,10 +76,13 @@ function avcCodec(data) {
  * shown, keyframes, the decoder (hardware or software) and the last round trip.
  */
 export function connect(url, canvas, opts = {}) {
-  const ctx = canvas.getContext('2d');
+  // `measure`: read the test pattern's barcode (the capture time) from each frame shown, for glass-
+  // to-glass latency when the server shares this device's clock (rein-remote serve --test-pattern).
+  const measure = opts.measure ?? (typeof location !== 'undefined' && new URLSearchParams(location.search).has('measure'));
+  const ctx = canvas.getContext('2d', measure ? {willReadFrequently: true} : undefined);
   const ws = new WebSocket(url);
   ws.binaryType = 'arraybuffer';
-  const stats = {frames: 0, keyframes: 0, bytes: 0, decoder: '', rttMs: 0, state: 'connecting', error: ''};
+  const stats = {frames: 0, keyframes: 0, bytes: 0, decoder: '', rttMs: 0, state: 'connecting', error: '', glassMs: []};
   let config, decoder, waitKey = true, lost = 0, codec;
   const sent = new Map(); // frame number → received time (µs, client clock)
   const send = (bytes) => ws.readyState === 1 && ws.send(bytes);
@@ -116,6 +119,17 @@ export function connect(url, canvas, opts = {}) {
           canvas.height = frame.displayHeight;
         }
         ctx.drawImage(frame, 0, 0);
+        if (measure && canvas.height >= 24 && canvas.width >= 34 * 24) {
+          const row = ctx.getImageData(0, canvas.height - 12, 34 * 24, 1).data;
+          const bit = (k) => row[(k * 24 + 12) * 4 + 1] > 128;
+          if (bit(0) && !bit(1)) {
+            let ms = 0;
+            for (let k = 2; k < 34; k++) ms = ms * 2 + (bit(k) ? 1 : 0);
+            const now = Date.now() % 2 ** 32;
+            const d = (now - ms + 2 ** 32) % 2 ** 32;
+            if (d < 10_000) stats.glassMs.push(d), stats.glassMs.length > 1000 && stats.glassMs.shift();
+          }
+        }
         const n = Number(frame.timestamp);
         frame.close();
         stats.frames++;
@@ -152,11 +166,18 @@ export function connect(url, canvas, opts = {}) {
     }
   };
 
+  let pingTimer = 0, pingId = 0;
   ws.onopen = async () => {
     stats.state = 'handshake';
     send(await helloFrame());
+    // Our own round trip, each second (the server measures its own the same way).
+    pingTimer = setInterval(() => {
+      const w = new W();
+      w.u32(++pingId); w.u64(nowUs());
+      send(w.frame(K.PING));
+    }, 1000);
   };
-  ws.onclose = () => (stats.state = 'closed');
+  ws.onclose = () => ((stats.state = 'closed'), clearInterval(pingTimer));
   ws.onmessage = (ev) => {
     for (const f of frames(new Uint8Array(ev.data))) {
       const r = new R(f.body);
