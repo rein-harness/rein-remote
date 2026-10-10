@@ -69,6 +69,81 @@ function avcCodec(data) {
   return 'avc1.42e01f';
 }
 
+// ---- the connection ----
+
+/**
+ * WebTransport when it's offered (`wt`: {url, hash}, the certificate's SHA-256) and the browser has it:
+ * QUIC, each video frame on a stream of its own, so a late one never holds up the next. Otherwise, or
+ * if it doesn't open (UDP blocked, an old browser), a WebSocket, which works through anything.
+ * `ondata` gets whole protocol frames.
+ */
+function openLink(url, wt) {
+  const link = {kind: '', onopen: () => {}, ondata: () => {}, onclose: () => {}, send: () => false, close: () => {}};
+  const websocket = () => {
+    const ws = new WebSocket(url);
+    ws.binaryType = 'arraybuffer';
+    link.kind = 'websocket';
+    link.send = (b) => ws.readyState === 1 && (ws.send(b), true);
+    link.close = () => ws.close();
+    ws.onopen = () => link.onopen();
+    ws.onclose = () => link.onclose();
+    ws.onmessage = (ev) => link.ondata(new Uint8Array(ev.data));
+  };
+  if (!wt || typeof WebTransport === 'undefined') {
+    websocket();
+    return link;
+  }
+  (async () => {
+    let t;
+    try {
+      t = new WebTransport(wt.url, {serverCertificateHashes: [{algorithm: 'sha-256', value: new Uint8Array(wt.hash)}]});
+      await Promise.race([t.ready, new Promise((_, no) => setTimeout(() => no(new Error('timeout')), 3000))]);
+    } catch {
+      try {
+        t?.close();
+      } catch {}
+      return websocket();
+    }
+    link.kind = 'webtransport';
+    const control = await t.createBidirectionalStream();
+    const writer = control.writable.getWriter();
+    link.send = (b) => (writer.write(b).catch(() => {}), true);
+    link.close = () => t.close();
+    t.closed.then(() => link.onclose(), () => link.onclose());
+    // Control messages: a byte stream, cut into whole frames.
+    (async () => {
+      const reader = control.readable.getReader();
+      let buf = new Uint8Array(0);
+      for (;;) {
+        const {value, done} = await reader.read().catch(() => ({done: true}));
+        if (done) return;
+        const joined = new Uint8Array(buf.length + value.length);
+        joined.set(buf);
+        joined.set(value, buf.length);
+        let at = 0;
+        while (at + 7 <= joined.length) {
+          const len = 7 + new DataView(joined.buffer, joined.byteOffset + at + 3, 4).getUint32(0, true);
+          if (at + len > joined.length) break;
+          link.ondata(joined.subarray(at, at + len));
+          at += len;
+        }
+        buf = joined.slice(at);
+      }
+    })();
+    // Video: one stream a frame, read whole.
+    (async () => {
+      const streams = t.incomingUnidirectionalStreams.getReader();
+      for (;;) {
+        const {value: stream, done} = await streams.read().catch(() => ({done: true}));
+        if (done) return;
+        new Response(stream).arrayBuffer().then((b) => link.ondata(new Uint8Array(b)), () => {});
+      }
+    })();
+    link.onopen();
+  })();
+  return link;
+}
+
 // ---- the session ----
 
 /**
@@ -80,12 +155,11 @@ export function connect(url, canvas, opts = {}) {
   // to-glass latency when the server shares this device's clock (rein-remote serve --test-pattern).
   const measure = opts.measure ?? (typeof location !== 'undefined' && new URLSearchParams(location.search).has('measure'));
   const ctx = canvas.getContext('2d', measure ? {willReadFrequently: true} : undefined);
-  const ws = new WebSocket(url);
-  ws.binaryType = 'arraybuffer';
+  const link = openLink(url, opts.webtransport);
   const stats = {frames: 0, keyframes: 0, bytes: 0, decoder: '', rttMs: 0, state: 'connecting', error: '', glassMs: []};
   let config, decoder, waitKey = true, lost = 0, codec;
   const sent = new Map(); // frame number → received time (µs, client clock)
-  const send = (bytes) => ws.readyState === 1 && ws.send(bytes);
+  const send = (bytes) => link.send(bytes);
 
   const helloFrame = async () => {
     const w = new W();
@@ -167,8 +241,9 @@ export function connect(url, canvas, opts = {}) {
   };
 
   let pingTimer = 0, pingId = 0;
-  ws.onopen = async () => {
+  link.onopen = async () => {
     stats.state = 'handshake';
+    stats.transport = link.kind;
     send(await helloFrame());
     // Our own round trip, each second (the server measures its own the same way).
     pingTimer = setInterval(() => {
@@ -177,9 +252,9 @@ export function connect(url, canvas, opts = {}) {
       send(w.frame(K.PING));
     }, 1000);
   };
-  ws.onclose = () => ((stats.state = 'closed'), clearInterval(pingTimer));
-  ws.onmessage = (ev) => {
-    for (const f of frames(new Uint8Array(ev.data))) {
+  link.onclose = () => ((stats.state = 'closed'), clearInterval(pingTimer));
+  link.ondata = (bytes) => {
+    for (const f of frames(bytes)) {
       const r = new R(f.body);
       try {
         if (f.kind === K.CONFIG) {
@@ -438,7 +513,7 @@ export function connect(url, canvas, opts = {}) {
     stats,
     /** Show the device's on-screen keyboard (call it from a tap: browsers allow it only then). */
     keyboard: () => keys.focus({preventScroll: true}),
-    close: () => (ws.close(), decoder?.close?.(), keys.remove(), pointer.remove()),
+    close: () => (link.close(), decoder?.close?.(), keys.remove(), pointer.remove()),
   };
 }
 

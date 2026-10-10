@@ -15,6 +15,7 @@ mod capture;
 mod encode;
 #[cfg(target_os = "macos")]
 mod encode_vt;
+mod link;
 mod serve;
 mod yuv;
 
@@ -22,7 +23,7 @@ use capture::{Source, TestPattern};
 
 fn usage() -> ! {
     eprintln!(
-        "rein-remote {}\n\nusage:\n  rein-remote serve [--display :N | --window APP|TITLE|ID | --test-pattern [WxH]] [--listen ADDR] [--fps N] [--bitrate KBPS] [--token T]\n  rein-remote windows [--json]\n  rein-remote selftest [--window Q | --display :N | --test-pattern] [--type TEXT]\n  rein-remote --version",
+        "rein-remote {}\n\nusage:\n  rein-remote serve [--display :N | --window APP|TITLE|ID | --test-pattern [WxH]] [--listen ADDR] [--fps N] [--bitrate KBPS] [--token T] [--webtransport on|off]\n  rein-remote windows [--json]\n  rein-remote selftest [--window Q | --display :N | --test-pattern] [--type TEXT]\n  rein-remote --version",
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(2);
@@ -62,6 +63,7 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
         fps: 60,
         bitrate_kbps: 8000,
         token: std::env::var("REIN_REMOTE_TOKEN").ok().filter(|t| !t.is_empty()),
+        webtransport: true,
     };
     let mut display: Option<String> = None;
     let mut window: Option<String> = None;
@@ -76,6 +78,7 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
             "--display" => display = Some(val()?),
             "--window" => window = Some(val()?),
             "--token" => opts.token = Some(val()?),
+            "--webtransport" => opts.webtransport = !matches!(val()?.as_str(), "off" | "false" | "no"),
             "--test-pattern" => {
                 pattern = Some((1280, 720));
                 if let Some(size) = it.clone().next().filter(|s| s.contains('x')) {

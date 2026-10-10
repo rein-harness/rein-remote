@@ -24,14 +24,17 @@
   <script type="module">
     import {connect} from './rein-remote.js';
     const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/stream`;
-    const s = connect(url, document.getElementById('c'));
+    // WebTransport (QUIC) when the server offers it and the browser has it; else the WebSocket.
+    const info = await fetch('/info').then((r) => r.json(), () => ({}));
+    const wt = info.webtransport && {url: `https://${location.hostname}:${info.webtransport.port}/stream${location.search}`, hash: info.webtransport.hash};
+    const s = connect(url, document.getElementById('c'), {webtransport: wt || undefined});
     window.reinRemote = s;
     document.getElementById('kb').onclick = () => s.keyboard();
     setInterval(() => {
       const t = s.stats;
       const g = [...t.glassMs].sort((a, b) => a - b);
       const glass = g.length ? ` · glass to glass ${g[g.length >> 1]} ms (p95 ${g[Math.floor(g.length * 0.95)]})` : '';
-      document.getElementById('stats').textContent = `${t.state} · ${t.decoder || '…'} · ${t.frames} frames · ${(t.bytes / 1e6).toFixed(1)} MB · rtt ${t.rttMs.toFixed(0)} ms${glass}${t.error ? ' · ' + t.error : ''}`;
+      document.getElementById('stats').textContent = `${t.state} · ${t.transport || '…'} · ${t.decoder || '…'} · ${t.frames} frames · ${(t.bytes / 1e6).toFixed(1)} MB · rtt ${t.rttMs.toFixed(0)} ms${glass}${t.error ? ' · ' + t.error : ''}`;
     }, 500);
   </script>
 </body>

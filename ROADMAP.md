@@ -78,6 +78,15 @@ has been verified.
 ## Phase 4 — fast transport and adaptation
 
 - QUIC (native) and WebTransport (browsers), datagrams for video.
+  - **Status:** WebTransport is in: on the same port number over UDP, with a 14-day self-signed
+    certificate the page is given by hash (`/info`), the same token as the WebSocket; each video frame
+    on a stream of its own, control and input on one stream; the page uses it when the browser has
+    it and falls back to the WebSocket when it doesn't open (verified: blocked UDP falls back by
+    itself). Measured in a Linux container (Chrome there, netem on the loopback, a log-scrolling
+    terminal): 2% loss, 30 ms RTT: p95 73 ms against 120 over the WebSocket (p50 alike, ~50 ms);
+    5% loss: p95 110 against 126. On a clean link the same as the WebSocket (14 ms glass to glass at
+    720p on a Mac). Rein's web UI keeps the WebSocket (through its own HTTPS proxy). Next: video as
+    datagrams with forward error correction, so a lost packet costs no retransmission.
 - LAN discovery (mDNS), pairing codes, mutual keys.
 - Rendezvous with NAT hole punching; the relay (self-hostable).
 - Delay-based bitrate controller; frame rate and resolution adaptation; intra refresh.
