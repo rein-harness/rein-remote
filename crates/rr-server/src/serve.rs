@@ -3,7 +3,7 @@
 //! skip when the connection backs up, and latency measured from the client's feedback.
 
 use crate::capture::Source;
-use crate::encode::H264;
+use crate::encode::Video as Encoder;
 use rr_proto::{Codec, CodecCap, Config, Cursor, Hello, Message, Video, INPUT_KEYBOARD, INPUT_POINTER, INPUT_TOUCH, VERSION_MAX, VERSION_MIN};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -187,7 +187,8 @@ fn session(mut ws: WebSocket<TcpStream>, source: Arc<Mutex<Box<dyn Source>>>, st
         return Err(format!("{}: no protocol version in common", client.name));
     }
     let codec = rr_proto::pick_codec(&hello, &client).ok_or_else(|| format!("{}: decodes none of this server's codecs", client.name))?;
-    let mut enc = H264::new(w, h, opts.fps as f32, opts.bitrate_kbps)?;
+    let mut enc = Encoder::new(w, h, opts.fps as f32, opts.bitrate_kbps)?;
+    eprintln!("rein-remote: encoding {}", enc.name());
     let (ew, eh) = enc.size();
     send(
         &mut ws,

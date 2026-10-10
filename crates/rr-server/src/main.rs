@@ -12,6 +12,8 @@
 
 mod capture;
 mod encode;
+#[cfg(target_os = "macos")]
+mod encode_vt;
 mod serve;
 mod yuv;
 
