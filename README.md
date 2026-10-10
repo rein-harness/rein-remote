@@ -40,6 +40,7 @@ Early: the design is done and being built one verified piece at a time
 ```sh
 rein-remote serve --window Simulator     # one app's window (macOS, Windows, Linux)
 rein-remote serve                        # this screen (Linux: $DISPLAY)
+rein-remote serve --vnc 127.0.0.1:5901   # a VNC display: a VM, an emulator (--vnc-password P)
 rein-remote serve --test-pattern         # a moving test pattern, any platform
 ```
 
