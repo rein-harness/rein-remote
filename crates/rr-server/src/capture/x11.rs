@@ -5,7 +5,7 @@
 //! with XFixes. One window can be streamed instead of the screen (XComposite: it's drawn off
 //! screen, so a window behind others shows as it is); a press raises it first, like Remote Desktop.
 
-use super::{Frame, Pointer, Source};
+use super::{keysym, Frame, Pointer, Source};
 use rr_proto::{Button, CursorShape, Input};
 use x11rb::connection::Connection;
 use x11rb::protocol::composite::{ConnectionExt as _, Redirect};
@@ -342,44 +342,6 @@ fn keymap(conn: &RustConnection) -> Result<std::collections::HashMap<u32, (u8, b
         }
     }
     Ok(map)
-}
-
-/// The X keysym for a key name ("a", "Enter", "ArrowLeft"…), as the client sends them.
-pub fn keysym(key: &str) -> Option<u32> {
-    let named = match key {
-        "Backspace" => 0xff08,
-        "Tab" => 0xff09,
-        "Enter" => 0xff0d,
-        "Escape" => 0xff1b,
-        "Delete" => 0xffff,
-        "Home" => 0xff50,
-        "ArrowLeft" => 0xff51,
-        "ArrowUp" => 0xff52,
-        "ArrowRight" => 0xff53,
-        "ArrowDown" => 0xff54,
-        "PageUp" => 0xff55,
-        "PageDown" => 0xff56,
-        "End" => 0xff57,
-        "Insert" => 0xff63,
-        "Shift" => 0xffe1,
-        "Control" => 0xffe3,
-        "Alt" => 0xffe9,
-        "Meta" => 0xffeb,
-        "CapsLock" => 0xffe5,
-        " " => 0x20,
-        _ => 0,
-    };
-    if named != 0 {
-        return Some(named);
-    }
-    if let Some(f) = key.strip_prefix('F').and_then(|n| n.parse::<u32>().ok()).filter(|n| (1..=24).contains(n)) {
-        return Some(0xffbd + f);
-    }
-    let mut chars = key.chars();
-    match (chars.next(), chars.next()) {
-        (Some(c), None) => Some(if (c as u32) < 0x100 { c as u32 } else { 0x0100_0000 + c as u32 }),
-        _ => None,
-    }
 }
 
 impl Source for X11 {

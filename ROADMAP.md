@@ -50,6 +50,9 @@ has been verified.
 - macOS: ScreenCaptureKit (window, app, display), VideoToolbox H.264/HEVC, CGEvent input.
 - Windows: Windows Graphics Capture, Media Foundation / NVENC / AMF / QSV, SendInput.
 - Hardware detection with the software fallback.
+- VNC as a source (any OS): a VM's or an emulator's screen as video. **Status:** in (RFB 3.3–3.8,
+  none or VNC's password, raw and copy-rect, BGRX so rows go in as they come); verified against
+  Xvnc with a password in a Linux container: an xterm streamed and a typed command ran.
 - Zero-copy on the GPU, capture to encoder: DXGI / Windows Graphics Capture textures into NVENC,
   AMF or QSV; ScreenCaptureKit IOSurfaces into VideoToolbox; on Linux, PipeWire or KMS DMA-BUF
   into VA-API or NVENC. The CPU never copies a frame.
