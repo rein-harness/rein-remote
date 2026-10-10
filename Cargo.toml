@@ -7,7 +7,7 @@ version = "0.0.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/rein-harness/rein-remote"
-rust-version = "1.80"
+rust-version = "1.82"
 
 [profile.release]
 lto = "thin"

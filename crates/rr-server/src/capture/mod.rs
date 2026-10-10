@@ -3,6 +3,8 @@
 //! client without a display). macOS (ScreenCaptureKit) and Windows (Windows Graphics Capture) come
 //! in phase 3 behind the same trait.
 
+#[cfg(target_os = "macos")]
+pub mod mac;
 #[cfg(target_os = "linux")]
 pub mod x11;
 

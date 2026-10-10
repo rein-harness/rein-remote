@@ -74,7 +74,7 @@ fn handle(mut stream: TcpStream, source: Arc<Mutex<Box<dyn Source>>>, stats: Arc
     let target = req.split_whitespace().nth(1).unwrap_or("/");
     let path = target.split(['?', '#']).next().unwrap_or("/").to_string();
     let upgrade = req.to_ascii_lowercase().contains("upgrade: websocket");
-    let token_ok = opts.token.as_deref().map_or(true, |t| {
+    let token_ok = opts.token.as_deref().is_none_or(|t| {
         let given = target
             .split_once('?')
             .map_or("", |(_, q)| q)
@@ -258,8 +258,8 @@ fn session(mut ws: WebSocket<TcpStream>, source: Arc<Mutex<Box<dyn Source>>>, st
         }
         let pointer = source.lock().unwrap().cursor();
         if let Some(p) = pointer {
-            let new_shape = cursor_sent.map_or(true, |(_, _, s)| s != p.serial);
-            if new_shape || cursor_sent.map_or(true, |(x, y, _)| (x, y) != (p.x, p.y)) {
+            let new_shape = cursor_sent.is_none_or(|(_, _, s)| s != p.serial);
+            if new_shape || cursor_sent.is_none_or(|(x, y, _)| (x, y) != (p.x, p.y)) {
                 cursor_sent = Some((p.x, p.y, p.serial));
                 let shape = new_shape.then_some(p.shape);
                 send(
