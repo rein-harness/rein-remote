@@ -27,7 +27,7 @@ use capture::{Source, TestPattern};
 
 fn usage() -> ! {
     eprintln!(
-        "rein-remote {}\n\nusage:\n  rein-remote serve [--display :N | --window APP|TITLE|ID | --vnc HOST:PORT [--vnc-password P] | --test-pattern [WxH]] [--listen ADDR] [--fps N] [--bitrate KBPS] [--token T] [--webtransport on|off] [--tls-cert PEM --tls-key PEM] [--tailscale-cert on|off] [--relay ws(s)://HOST:PORT [--room CODE] [--relay-secret S]]\n  rein-remote relay [--listen ADDR] [--secret S]\n  rein-remote windows [--json]\n  rein-remote selftest [--window Q | --display :N | --test-pattern] [--type TEXT]\n  rein-remote --version",
+        "rein-remote {}\n\nusage:\n  rein-remote serve [--display :N | --window APP|TITLE|ID | --vnc HOST:PORT [--vnc-password P] | --pipe WxH | --test-pattern [WxH]] [--listen ADDR] [--fps N] [--bitrate KBPS] [--token T] [--webtransport on|off] [--tls-cert PEM --tls-key PEM] [--tailscale-cert on|off] [--relay ws(s)://HOST:PORT [--room CODE] [--relay-secret S]]\n  rein-remote relay [--listen ADDR] [--secret S]\n  rein-remote windows [--json]\n  rein-remote selftest [--window Q | --display :N | --test-pattern] [--type TEXT]\n  rein-remote --version",
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(2);
@@ -98,6 +98,7 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
     let mut display: Option<String> = None;
     let mut window: Option<String> = None;
     let mut vnc: Option<String> = None;
+    let mut pipe: Option<(usize, usize)> = None;
     let mut vnc_password = std::env::var("REIN_REMOTE_VNC_PASSWORD").ok();
     let mut pattern: Option<(usize, usize)> = None;
     let mut it = args.iter();
@@ -110,6 +111,11 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
             "--display" => display = Some(val()?),
             "--window" => window = Some(val()?),
             "--vnc" => vnc = Some(val()?),
+            "--pipe" => {
+                let v = val()?;
+                let (w, h) = v.split_once('x').ok_or("--pipe WxH")?;
+                pipe = Some((w.parse().map_err(|_| "--pipe WxH")?, h.parse().map_err(|_| "--pipe WxH")?));
+            }
             "--vnc-password" => vnc_password = Some(val()?),
             "--token" => opts.token = Some(val()?),
             "--relay" => relay = Some(val()?),
@@ -158,6 +164,7 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
     }
     let source: Box<dyn Source> = match (pattern, window) {
         (Some((w, h)), _) => Box::new(TestPattern::new(w, h)),
+        (None, _) if pipe.is_some() => Box::new(capture::pipe::Pipe::open(pipe.unwrap().0, pipe.unwrap().1)),
         (None, _) if vnc.is_some() => Box::new(capture::vnc::Vnc::open(vnc.as_deref().unwrap(), vnc_password.as_deref())?),
         (None, Some(q)) => open_window(&q)?,
         (None, None) => open_display(display.as_deref())?,
