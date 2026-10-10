@@ -89,6 +89,12 @@ has been verified.
     datagrams with forward error correction, so a lost packet costs no retransmission.
 - LAN discovery (mDNS), pairing codes, mutual keys.
 - Rendezvous with NAT hole punching; the relay (self-hostable).
+  - **Status:** the relay is in: `rein-remote relay` (self-hosted, `--secret` for who may host) pairs
+    a machine that connected out (`serve --relay ws(s)://…`, a random 24-character room) with a
+    viewer who opens its page; the machine reconnects for the next viewer. Verified on one Mac:
+    14 ms glass to glass through it, two viewers one after the other, a host with the wrong secret
+    refused (403). Still to do: NAT hole punching (straight over QUIC when it works), end-to-end
+    encryption through the relay.
 - Delay-based bitrate controller; frame rate and resolution adaptation; intra refresh.
   - **Status:** a delay-based controller (each frame's round trip on the server's own clock, its
     rise over the lowest of the last 10 s is queuing; a backed-up socket counts too) cuts the

@@ -5,6 +5,7 @@
 
 use rr_proto::Message;
 use std::io::ErrorKind;
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
@@ -38,9 +39,31 @@ pub trait Link {
 
 // ---- WebSocket ----
 
-pub struct WsLink(pub WebSocket<TcpStream>);
+/// A socket a WebSocket runs on: plain TCP, or TLS over TCP (a relay at wss://). Waiting looks at
+/// the TCP socket underneath.
+pub trait Sock: Read + Write {
+    fn tcp(&self) -> &TcpStream;
+}
 
-impl Link for WsLink {
+impl Sock for TcpStream {
+    fn tcp(&self) -> &TcpStream {
+        self
+    }
+}
+
+impl Sock for tungstenite::stream::MaybeTlsStream<TcpStream> {
+    fn tcp(&self) -> &TcpStream {
+        match self {
+            tungstenite::stream::MaybeTlsStream::Rustls(t) => t.get_ref(),
+            tungstenite::stream::MaybeTlsStream::Plain(s) => s,
+            _ => unreachable!("only plain and rustls streams are made"),
+        }
+    }
+}
+
+pub struct WsLink<S: Sock>(pub WebSocket<S>);
+
+impl<S: Sock> Link for WsLink<S> {
     fn send(&mut self, m: &Message) -> Result<(), String> {
         match self.0.write(Ws::Binary(m.encode().into())) {
             Ok(()) => Ok(()),
@@ -58,7 +81,7 @@ impl Link for WsLink {
     }
 
     fn recv(&mut self) -> Result<Recv, String> {
-        let _ = self.0.get_mut().set_nonblocking(true);
+        let _ = self.0.get_ref().tcp().set_nonblocking(true);
         loop {
             return match self.0.read() {
                 Ok(Ws::Binary(b)) => Ok(Recv::Data(b.to_vec())),
@@ -76,7 +99,7 @@ impl Link for WsLink {
             return;
         }
         // Blocks until a byte comes or the time's up, without taking it.
-        let sock = self.0.get_mut();
+        let sock = self.0.get_ref().tcp();
         let _ = sock.set_nonblocking(false);
         let _ = sock.set_read_timeout(Some(d));
         let _ = sock.peek(&mut [0u8; 1]);

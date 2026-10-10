@@ -16,6 +16,7 @@ mod encode;
 #[cfg(target_os = "macos")]
 mod encode_vt;
 mod link;
+mod relay;
 mod serve;
 mod yuv;
 
@@ -23,7 +24,7 @@ use capture::{Source, TestPattern};
 
 fn usage() -> ! {
     eprintln!(
-        "rein-remote {}\n\nusage:\n  rein-remote serve [--display :N | --window APP|TITLE|ID | --test-pattern [WxH]] [--listen ADDR] [--fps N] [--bitrate KBPS] [--token T] [--webtransport on|off]\n  rein-remote windows [--json]\n  rein-remote selftest [--window Q | --display :N | --test-pattern] [--type TEXT]\n  rein-remote --version",
+        "rein-remote {}\n\nusage:\n  rein-remote serve [--display :N | --window APP|TITLE|ID | --test-pattern [WxH]] [--listen ADDR] [--fps N] [--bitrate KBPS] [--token T] [--webtransport on|off] [--relay ws(s)://HOST:PORT [--room CODE] [--relay-secret S]]\n  rein-remote relay [--listen ADDR] [--secret S]\n  rein-remote windows [--json]\n  rein-remote selftest [--window Q | --display :N | --test-pattern] [--type TEXT]\n  rein-remote --version",
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(2);
@@ -40,6 +41,21 @@ fn main() {
                 std::process::exit(1);
             }
         },
+        Some("relay") => {
+            let (mut listen, mut secret) = ("0.0.0.0:7990".to_string(), std::env::var("REIN_REMOTE_RELAY_SECRET").ok());
+            let mut it = args[1..].iter();
+            while let Some(a) = it.next() {
+                match (a.as_str(), it.next()) {
+                    ("--listen", Some(v)) => listen = v.clone(),
+                    ("--secret", Some(v)) => secret = Some(v.clone()),
+                    _ => usage(),
+                }
+            }
+            if let Err(e) = relay::run(&listen, secret) {
+                eprintln!("rein-remote: {e}");
+                std::process::exit(1);
+            }
+        }
         Some("selftest") => match selftest(&args[1..]) {
             Ok(msg) => println!("rein-remote selftest: {msg}"),
             Err(e) => {
@@ -64,7 +80,9 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
         bitrate_kbps: 8000,
         token: std::env::var("REIN_REMOTE_TOKEN").ok().filter(|t| !t.is_empty()),
         webtransport: true,
+        relay: None,
     };
+    let (mut relay, mut room, mut relay_secret) = (None, None, std::env::var("REIN_REMOTE_RELAY_SECRET").ok());
     let mut display: Option<String> = None;
     let mut window: Option<String> = None;
     let mut pattern: Option<(usize, usize)> = None;
@@ -78,6 +96,9 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
             "--display" => display = Some(val()?),
             "--window" => window = Some(val()?),
             "--token" => opts.token = Some(val()?),
+            "--relay" => relay = Some(val()?),
+            "--room" => room = Some(val()?),
+            "--relay-secret" => relay_secret = Some(val()?),
             "--webtransport" => opts.webtransport = !matches!(val()?.as_str(), "off" | "false" | "no"),
             "--test-pattern" => {
                 pattern = Some((1280, 720));
@@ -89,6 +110,19 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
             }
             _ => usage(),
         }
+    }
+    if let Some(r) = relay {
+        // A room code nobody can guess: 24 characters from the system's randomness.
+        let room = room.unwrap_or_else(|| {
+            let mut b = [0u8; 24];
+            let _ = getrandom::fill(&mut b);
+            const ALPHABET: &[u8] = b"abcdefghijkmnpqrstuvwxyz23456789";
+            b.iter().map(|x| ALPHABET[*x as usize % 32] as char).collect()
+        });
+        if room.len() < 16 {
+            return Err("--room needs 16 characters or more (or leave it out for a random one)".into());
+        }
+        opts.relay = Some((r, room, relay_secret));
     }
     let source: Box<dyn Source> = match (pattern, window) {
         (Some((w, h)), _) => Box::new(TestPattern::new(w, h)),

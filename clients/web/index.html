@@ -23,7 +23,7 @@
   </main>
   <script type="module">
     import {connect} from './rein-remote.js';
-    const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/stream`;
+    const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/stream${location.search}`;
     // WebTransport (QUIC) when the server offers it and the browser has it; else the WebSocket.
     const info = await fetch('/info').then((r) => r.json(), () => ({}));
     const wt = info.webtransport && {url: `https://${location.hostname}:${info.webtransport.port}/stream${location.search}`, hash: info.webtransport.hash};

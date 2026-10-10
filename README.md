@@ -31,7 +31,7 @@ Early: the design is done and being built one verified piece at a time
 | Client: iOS / iPadOS / Android | todo (phase 5) |
 | Transport: WebSocket | working, with keyframe-and-skip when the link backs up (phase 1) |
 | Transport: WebTransport (QUIC) | working: a stream per frame, self-signed certificate by hash, falls back to the WebSocket by itself (phase 4) |
-| Transport: relay (NAT traversal) | todo (phase 4) |
+| Transport: relay (behind NAT, no open ports) | working: `rein-remote relay` (self-hosted), `serve --relay`; NAT hole punching todo (phase 4) |
 | Adaptive bitrate, audio | todo (phase 4) |
 | Pairing, enterprise sign-in and policy | todo (phases 4, 6) |
 
@@ -61,6 +61,16 @@ Measured (phase 1, software H.264, decoded in Chrome in software):
 
 A still screen is neither read nor encoded (XDamage): one refresh a second. Hardware encoders are
 what come next (see the roadmap).
+
+### From anywhere, through a relay
+
+```sh
+rein-remote relay --listen 0.0.0.0:7990 --secret S        # on a machine both can reach (put HTTPS in front for wss://)
+rein-remote serve --relay wss://relay.example --relay-secret S   # on the machine to show: prints the viewer's link
+```
+
+The relay passes the stream along; it can see it (TLS protects it on the way). End-to-end encryption
+is on the roadmap.
 
 ## How it works
 
