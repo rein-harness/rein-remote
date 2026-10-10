@@ -58,6 +58,10 @@ has been verified.
 - Near-zero cost: a still screen sends and encodes nothing (no periodic refresh while nothing
   changes); under motion a few percent of one core with a hardware encoder. Software encoding
   stays the fallback, at the frame rate the CPU can hold.
+- **Status:** macOS windows stream and take input on a real Mac (Calculator: clicks computed
+  7 + 2 = 9 with the app starting behind Terminal; keys typed into it in the background).
+  `rein-remote windows` lists them. Next: Windows, Linux windows, the pointer's shape on macOS,
+  VideoToolbox.
 - **Verified:** a window on each streams with input (macOS on a real Mac; Windows on CI runners and a
   real machine), hardware and software paths both; 200 fps measured glass to glass on a machine
   with a hardware encoder, with the server's CPU use written down (idle and under motion).

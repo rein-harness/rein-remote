@@ -24,7 +24,7 @@ Early: the design is done and being built one verified piece at a time
 |---|---|
 | Protocol (`rr-proto`), versioned per message | done (phase 0: CI on Linux, macOS, Windows, WebAssembly) |
 | Server: Linux (X11, a real or virtual display) | working: capture, software H.264, the pointer sent apart, mouse, wheel and keyboard input (phase 1) |
-| Server: macOS | todo (phase 3) |
+| Server: macOS (any app's window, ScreenCaptureKit) | working: capture only when it changes, mouse (raises the window, like Remote Desktop), keys and text even while it's behind others (phase 3) |
 | Server: Windows | todo (phase 3) |
 | Client: web (WebCodecs, embeddable `<rein-remote>`) | working: decode (hardware when there is), mouse, wheel, keyboard, touch gestures and the device's on-screen keyboard (phase 1) |
 | Client: Windows / macOS / Linux | todo (phase 5) |

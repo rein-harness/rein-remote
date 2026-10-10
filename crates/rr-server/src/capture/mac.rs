@@ -29,7 +29,79 @@ use std::time::{Duration, Instant};
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
+    fn AXUIElementCreateApplication(pid: i32) -> *mut std::ffi::c_void;
+    fn AXUIElementSetAttributeValue(el: *mut std::ffi::c_void, attr: core_foundation::string::CFStringRef, value: core_foundation::base::CFTypeRef) -> i32;
+    fn AXUIElementCopyAttributeValue(
+        el: *mut std::ffi::c_void,
+        attr: core_foundation::string::CFStringRef,
+        value: *mut core_foundation::base::CFTypeRef,
+    ) -> i32;
+    fn AXUIElementPerformAction(el: *mut std::ffi::c_void, action: core_foundation::string::CFStringRef) -> i32;
+    /// The window id of an accessibility window element (private, but stable for years and what
+    /// window managers use; when it's missing the first window is raised).
+    fn _AXUIElementGetWindow(el: *mut std::ffi::c_void, id: *mut u32) -> i32;
     fn AXIsProcessTrustedWithOptions(options: core_foundation::dictionary::CFDictionaryRef) -> bool;
+}
+
+/// Whether the app is the one in front.
+fn frontmost(pid: i32) -> bool {
+    use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::string::CFString;
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return false;
+        }
+        let mut v: CFTypeRef = std::ptr::null();
+        let ok = AXUIElementCopyAttributeValue(app, CFString::new("AXFrontmost").as_concrete_TypeRef(), &mut v) == 0 && !v.is_null();
+        let front = ok && CFBoolean::wrap_under_create_rule(v as _) == CFBoolean::true_value();
+        CFRelease(app as CFTypeRef);
+        front
+    }
+}
+
+/// Bring the app to the front and its window above the others, as a click on it would locally: the
+/// pointer's events then reach it (a click goes to the window on top where it lands). It happens
+/// asynchronously, so this waits (up to half a second) for the app to be in front.
+fn raise(pid: i32, window_id: u32) {
+    raise_now(pid, window_id);
+    let start = Instant::now();
+    while !frontmost(pid) && start.elapsed() < Duration::from_millis(500) {
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    // The window server puts it on top a moment after the app becomes active.
+    std::thread::sleep(Duration::from_millis(40));
+}
+
+fn raise_now(pid: i32, window_id: u32) {
+    use core_foundation::array::{CFArray, CFArrayRef};
+    use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::string::CFString;
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return;
+        }
+        AXUIElementSetAttributeValue(app, CFString::new("AXFrontmost").as_concrete_TypeRef(), CFBoolean::true_value().as_CFTypeRef());
+        let mut list: CFTypeRef = std::ptr::null();
+        if AXUIElementCopyAttributeValue(app, CFString::new("AXWindows").as_concrete_TypeRef(), &mut list) == 0 && !list.is_null() {
+            let windows: CFArray<*const std::ffi::c_void> = CFArray::wrap_under_create_rule(list as CFArrayRef);
+            let mut target = None;
+            for w in windows.iter() {
+                let mut id = 0u32;
+                if _AXUIElementGetWindow(*w as *mut _, &mut id) == 0 && id == window_id {
+                    target = Some(*w);
+                    break;
+                }
+            }
+            if let Some(w) = target.or_else(|| windows.iter().next().map(|w| *w)) {
+                AXUIElementPerformAction(w as *mut _, CFString::new("AXRaise").as_concrete_TypeRef());
+            }
+        }
+        CFRelease(app as CFTypeRef);
+    }
 }
 
 /// Whether this app may send input, asking macOS to prompt for it when it may not: the system
@@ -290,9 +362,20 @@ impl MacWindow {
         CGPoint::new(self.origin.0 + x as f64 / self.scale, self.origin.1 + y as f64 / self.scale)
     }
 
-    fn post(&self, ev: Result<CGEvent, ()>) {
+    /// Keys go straight to the window's app: they work while it's behind others, and your own
+    /// keyboard keeps typing where you are.
+    fn post_key(&self, ev: Result<CGEvent, ()>) {
         if let Ok(e) = ev {
             e.post_to_pid(self.pid);
+        }
+    }
+
+    fn post(&self, ev: Result<CGEvent, ()>) {
+        if let Ok(e) = ev {
+            // The pointer works as on the machine itself, like Remote Desktop: it moves, and a press
+            // brings the window to the front first (raise), since a click goes to the window on top
+            // where it lands. AppKit ignores mouse events sent to a process that isn't in front.
+            e.post(core_graphics::event::CGEventTapLocation::HID);
         }
     }
 }
@@ -402,9 +485,17 @@ impl Source for MacWindow {
                     _ => return Ok(()),
                 };
                 self.buttons[i] = *down;
+                if *down && !frontmost(self.pid) {
+                    raise(self.pid, self.window_id);
+                }
                 let here = self.pointer;
                 if let Some(src) = source() {
-                    self.post(CGEvent::new_mouse_event(src, if *down { d } else { u }, here, b));
+                    // A click count of 1: AppKit's controls ignore a press without one.
+                    let ev = CGEvent::new_mouse_event(src, if *down { d } else { u }, here, b);
+                    if let Ok(e) = &ev {
+                        e.set_integer_value_field(core_graphics::event::EventField::MOUSE_EVENT_CLICK_STATE, 1);
+                    }
+                    self.post(ev);
                 }
             }
             Input::Wheel { dx, dy } => {
@@ -416,7 +507,7 @@ impl Source for MacWindow {
             Input::Key { key, down, .. } => {
                 if let Some(code) = keycode(key) {
                     if let Some(src) = source() {
-                        self.post(CGEvent::new_keyboard_event(src, code, *down));
+                        self.post_key(CGEvent::new_keyboard_event(src, code, *down));
                     }
                 } else if *down && key.chars().count() == 1 {
                     type_text(self.pid, key);
