@@ -62,8 +62,15 @@ has been verified.
   7 + 2 = 9 with the app starting behind Terminal; keys typed into it in the background).
   `rein-remote windows` lists them. Linux windows too (XComposite, so a covered window streams as
   it is; a press raises and focuses it): verified with one xterm covered by another, its own
-  contents streamed and a command typed into it ran. Next: Windows, the pointer's shape on macOS,
-  hardware encoders.
+  contents streamed and a command typed into it ran. Windows windows (Graphics Capture + SendInput):
+  CI's selftest on Notepad shows typing change it. Hardware encoding on macOS (VideoToolbox, the
+  default there; RR_ENCODER=software for openh264): on an Intel Mac at 1080p with full motion,
+  12.6 ms of CPU a frame against 19.8 ms in software; glass to glass 14 ms median at 720p (10 ms in
+  software on the same Mac). Zero copy on macOS: ScreenCaptureKit's frames go into VideoToolbox
+  where they are (GPU memory, no copy); streaming a terminal window changing ~15 times a second
+  costs rein-remote 1.5% of one core (4.8% in software). The pointer's real shape on macOS too
+  (the system's arrow, I-beam…), sent apart and hidden off the window. Next: Media
+  Foundation/NVENC on Windows and VA-API on Linux.
 - **Verified:** a window on each streams with input (macOS on a real Mac; Windows on CI runners and a
   real machine), hardware and software paths both; 200 fps measured glass to glass on a machine
   with a hardware encoder, with the server's CPU use written down (idle and under motion).

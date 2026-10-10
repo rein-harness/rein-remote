@@ -6,7 +6,7 @@
 //! Permissions (System Settings → Privacy & Security): Screen Recording to see the window, and
 //! Accessibility to control it, both for the app that runs rein-remote (your terminal, or Rein).
 
-use super::{Frame, Source};
+use super::{Frame, Pointer, Source};
 use block2::RcBlock;
 use core_graphics::display::CGDisplay;
 use core_graphics::event::{CGEvent, CGEventType, CGKeyCode, CGMouseButton, ScrollEventUnit};
@@ -23,7 +23,7 @@ use objc2_core_video::{
 };
 use objc2_foundation::{NSError, NSObject, NSObjectProtocol};
 use objc2_screen_capture_kit::{SCContentFilter, SCShareableContent, SCStream, SCStreamConfiguration, SCStreamOutput, SCStreamOutputType, SCWindow};
-use rr_proto::{Button, Input};
+use rr_proto::{Button, CursorShape, Input};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -41,6 +41,75 @@ extern "C" {
     /// window managers use; when it's missing the first window is raised).
     fn _AXUIElementGetWindow(el: *mut std::ffi::c_void, id: *mut u32) -> i32;
     fn AXIsProcessTrustedWithOptions(options: core_foundation::dictionary::CFDictionaryRef) -> bool;
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGColorSpaceCreateDeviceRGB() -> *mut std::ffi::c_void;
+    fn CGColorSpaceRelease(cs: *mut std::ffi::c_void);
+    fn CGBitmapContextCreate(
+        data: *mut std::ffi::c_void,
+        w: usize,
+        h: usize,
+        bits: usize,
+        row: usize,
+        cs: *mut std::ffi::c_void,
+        info: u32,
+    ) -> *mut std::ffi::c_void;
+    fn CGContextDrawImage(ctx: *mut std::ffi::c_void, rect: core_graphics::geometry::CGRect, image: *const std::ffi::c_void);
+    fn CGContextRelease(ctx: *mut std::ffi::c_void);
+}
+
+/// The system's pointer as it looks now (an arrow, an I-beam, a resize arrow…), drawn at `scale`
+/// pixels a point: RGBA (straight alpha) and the hotspot.
+fn system_cursor(scale: f64) -> Option<CursorShape> {
+    // Deprecated, but the only way to have the pointer apart from the video (Apple's alternative draws
+    // it into the frames, which costs video every time it moves and can't be drawn locally).
+    #[allow(deprecated)]
+    let cursor = objc2_app_kit::NSCursor::currentSystemCursor()?;
+    let image = cursor.image();
+    let (size, hot) = (image.size(), cursor.hotSpot());
+    let cg = unsafe { image.CGImageForProposedRect_context_hints(std::ptr::null_mut(), None, None) }?;
+    let (w, h) = (
+        ((size.width * scale).round() as usize).clamp(1, 256),
+        ((size.height * scale).round() as usize).clamp(1, 256),
+    );
+    let mut rgba = vec![0u8; w * h * 4];
+    unsafe {
+        let cs = CGColorSpaceCreateDeviceRGB();
+        // Premultiplied RGBA, the only kind of 8-bit RGBA context there is.
+        let ctx = CGBitmapContextCreate(
+            rgba.as_mut_ptr().cast(),
+            w,
+            h,
+            8,
+            w * 4,
+            cs,
+            1 /* PremultipliedLast */ | (4 << 12), /* 32Big */
+        );
+        CGColorSpaceRelease(cs);
+        if ctx.is_null() {
+            return None;
+        }
+        let rect = core_graphics::geometry::CGRect::new(&CGPoint::new(0.0, 0.0), &core_graphics::geometry::CGSize::new(w as f64, h as f64));
+        CGContextDrawImage(ctx, rect, objc2::rc::Retained::as_ptr(&cg).cast());
+        CGContextRelease(ctx);
+    }
+    for px in rgba.chunks_exact_mut(4) {
+        let a = px[3] as u32;
+        if a > 0 && a < 255 {
+            for c in &mut px[..3] {
+                *c = ((*c as u32 * 255 + a / 2) / a).min(255) as u8;
+            }
+        }
+    }
+    Some(CursorShape {
+        w: w as u16,
+        h: h as u16,
+        hx: (hot.x * scale).round() as u16,
+        hy: (hot.y * scale).round() as u16,
+        rgba,
+    })
 }
 
 /// Whether the app is the one in front.
@@ -192,9 +261,8 @@ pub fn windows() -> Result<Vec<WindowInfo>, String> {
 /// The latest frame ScreenCaptureKit delivered, and how many it has.
 #[derive(Default)]
 struct Latest {
-    bgra: Vec<u8>,
-    stride: usize,
-    rows: usize,
+    /// The latest image as ScreenCaptureKit gave it (in GPU memory): read only when needed.
+    image: Option<Sendable<objc2_core_foundation::CFRetained<objc2_core_video::CVBuffer>>>,
     count: u64,
 }
 
@@ -213,21 +281,12 @@ define_class!(
             if kind != SCStreamOutputType::Screen {
                 return;
             }
-            // An idle frame (nothing changed) has no image.
+            // An idle frame (nothing changed) has no image. The image is kept, not copied: the
+            // hardware encoder reads it where it is.
             let Some(pb) = (unsafe { sample.image_buffer() }) else { return };
-            unsafe { CVPixelBufferLockBaseAddress(&pb, CVPixelBufferLockFlags::ReadOnly) };
-            let base = CVPixelBufferGetBaseAddress(&pb) as *const u8;
-            let (stride, rows) = (CVPixelBufferGetBytesPerRow(&pb), CVPixelBufferGetHeight(&pb));
-            if !base.is_null() {
-                let bytes = unsafe { std::slice::from_raw_parts(base, stride * rows) };
-                let mut l = self.ivars().lock().unwrap();
-                l.bgra.clear();
-                l.bgra.extend_from_slice(bytes);
-                l.stride = stride;
-                l.rows = rows;
-                l.count += 1;
-            }
-            unsafe { CVPixelBufferUnlockBaseAddress(&pb, CVPixelBufferLockFlags::ReadOnly) };
+            let mut l = self.ivars().lock().unwrap();
+            l.image = Some(Sendable(pb));
+            l.count += 1;
         }
     }
 );
@@ -259,6 +318,9 @@ pub struct MacWindow {
     pid: i32,
     /// Where the remote pointer is, on screen (events carry it; the real pointer doesn't move).
     pointer: CGPoint,
+    /// The pointer's look as last read, its serial (a hash of the pixels), and when it was read.
+    shape: Option<(CursorShape, u32)>,
+    shape_at: Instant,
 }
 
 // The stream is only touched by whoever holds the source (behind a lock).
@@ -339,6 +401,8 @@ impl MacWindow {
             buttons: [false; 3],
             pid: unsafe { window.owningApplication() }.map_or(0, |a| unsafe { a.processID() }),
             pointer: CGPoint::new(frame.origin.x, frame.origin.y),
+            shape: None,
+            shape_at: Instant::now() - Duration::from_secs(1),
         })
     }
 
@@ -446,14 +510,56 @@ impl Source for MacWindow {
         Some(self.latest.lock().unwrap().count)
     }
 
-    fn grab(&mut self) -> Result<Frame<'_>, String> {
-        let l = self.latest.lock().unwrap();
-        if l.count > 0 && l.rows >= self.h && l.stride >= self.w * 4 {
-            self.frame.clear();
-            self.frame.extend_from_slice(&l.bgra[..l.stride * self.h]);
-            self.stride = l.stride;
+    fn cursor(&mut self) -> Option<Pointer> {
+        // The look at most ten times a second (drawing it costs a little); where it is, every frame.
+        if self.shape_at.elapsed() > Duration::from_millis(100) {
+            self.shape_at = Instant::now();
+            if let Some(s) = system_cursor(self.scale) {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                (s.w, s.h, s.hx, s.hy, &s.rgba).hash(&mut h);
+                self.shape = Some((s, h.finish() as u32));
+            }
         }
-        drop(l);
+        let (shape, serial) = self.shape.clone()?;
+        let at = CGEvent::new(source()?).ok()?.location();
+        self.refresh_origin();
+        let (x, y) = ((at.x - self.origin.0) * self.scale, (at.y - self.origin.1) * self.scale);
+        Some(Pointer {
+            visible: x >= 0.0 && y >= 0.0 && (x as usize) < self.w && (y as usize) < self.h,
+            x: x.max(0.0) as u16,
+            y: y.max(0.0) as u16,
+            serial,
+            shape,
+        })
+    }
+
+    fn surface(&mut self) -> Option<super::Surface> {
+        let l = self.latest.lock().unwrap();
+        let pb = l.image.as_ref()?;
+        // Retained for the encoder; released when it drops the Surface.
+        let ptr = objc2_core_foundation::CFRetained::as_ptr(&pb.0).as_ptr() as *mut std::ffi::c_void;
+        extern "C" {
+            fn CFRetain(p: *const std::ffi::c_void) -> *const std::ffi::c_void;
+        }
+        unsafe { CFRetain(ptr) };
+        Some(super::Surface(ptr))
+    }
+
+    fn grab(&mut self) -> Result<Frame<'_>, String> {
+        // The software encoder's way: the image read into memory.
+        let image = self.latest.lock().unwrap().image.as_ref().map(|i| Sendable(i.0.clone()));
+        if let Some(Sendable(pb)) = image {
+            unsafe { CVPixelBufferLockBaseAddress(&pb, CVPixelBufferLockFlags::ReadOnly) };
+            let base = CVPixelBufferGetBaseAddress(&pb) as *const u8;
+            let (stride, rows) = (CVPixelBufferGetBytesPerRow(&pb), CVPixelBufferGetHeight(&pb));
+            if !base.is_null() && rows >= self.h && stride >= self.w * 4 {
+                self.frame.clear();
+                self.frame.extend_from_slice(unsafe { std::slice::from_raw_parts(base, stride * self.h) });
+                self.stride = stride;
+            }
+            unsafe { CVPixelBufferUnlockBaseAddress(&pb, CVPixelBufferLockFlags::ReadOnly) };
+        }
         Ok(Frame {
             bgra: &self.frame,
             stride: self.stride,

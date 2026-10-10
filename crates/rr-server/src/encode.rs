@@ -76,6 +76,81 @@ impl H264 {
     }
 }
 
+/// The encoder a stream uses: the machine's hardware one where there is one (VideoToolbox on macOS),
+/// else software. `RR_ENCODER=software` picks software anyway.
+pub enum Video {
+    Software(Box<H264>),
+    #[cfg(target_os = "macos")]
+    Hardware(crate::encode_vt::VideoToolbox),
+}
+
+impl Video {
+    pub fn new(width: usize, height: usize, fps: f32, bitrate_kbps: u32) -> Result<Self, String> {
+        #[cfg(target_os = "macos")]
+        if std::env::var("RR_ENCODER").as_deref() != Ok("software") {
+            match crate::encode_vt::VideoToolbox::new(width, height, fps, bitrate_kbps) {
+                Ok(v) => return Ok(Self::Hardware(v)),
+                Err(e) => eprintln!("rein-remote: {e}; encoding in software"),
+            }
+        }
+        Ok(Self::Software(Box::new(H264::new(width, height, fps, bitrate_kbps)?)))
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Software(_) => "H.264 in software (openh264)",
+            #[cfg(target_os = "macos")]
+            Self::Hardware(_) => "H.264 in hardware (VideoToolbox)",
+        }
+    }
+
+    pub fn size(&self) -> (usize, usize) {
+        match self {
+            Self::Software(e) => e.size(),
+            #[cfg(target_os = "macos")]
+            Self::Hardware(e) => e.size(),
+        }
+    }
+
+    pub fn keyframe(&mut self) {
+        match self {
+            Self::Software(e) => e.keyframe(),
+            #[cfg(target_os = "macos")]
+            Self::Hardware(e) => e.keyframe(),
+        }
+    }
+
+    pub fn wants_keyframe(&self) -> bool {
+        match self {
+            Self::Software(e) => e.wants_keyframe(),
+            #[cfg(target_os = "macos")]
+            Self::Hardware(e) => e.wants_keyframe(),
+        }
+    }
+
+    pub fn encode(&mut self, bgra: &[u8], stride: usize) -> Result<Option<Encoded>, String> {
+        match self {
+            Self::Software(e) => e.encode(bgra, stride),
+            #[cfg(target_os = "macos")]
+            Self::Hardware(e) => e.encode(bgra, stride),
+        }
+    }
+
+    /// Whether this encoder reads the system's own frames in place (zero copy).
+    pub fn takes_surfaces(&self) -> bool {
+        !matches!(self, Self::Software(_))
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+    pub fn encode_surface(&mut self, surface: &crate::capture::Surface) -> Result<Option<Encoded>, String> {
+        match self {
+            Self::Software(_) => Err("the software encoder reads frames from memory".into()),
+            #[cfg(target_os = "macos")]
+            Self::Hardware(e) => e.encode_surface(surface),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,5 +211,47 @@ mod bench {
             enc.encode(&frame, w * 4).unwrap();
         }
         println!("encode (incl. conversion): {:.1} ms", t.elapsed().as_secs_f64() * 1000.0 / 60.0);
+    }
+
+    /// 1920×1080 with real motion (every row shifts each frame), software against the hardware encoder.
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn bench_1080p_software_and_hardware() {
+        let (w, h) = (1920, 1080);
+        let frames: Vec<Vec<u8>> = (0..30)
+            .map(|n| {
+                let mut f = vec![0u8; w * h * 4];
+                for (i, px) in f.chunks_mut(4).enumerate() {
+                    let (x, y) = (i % w, i / w);
+                    px.copy_from_slice(&[((x + n * 8) % 256) as u8, ((y * 3 + n * 5) % 256) as u8, ((x ^ y) % 256) as u8, 255]);
+                }
+                f
+            })
+            .collect();
+        std::env::set_var("RR_ENCODER", "software");
+        let mut soft = Video::new(w, h, 60.0, 8000).unwrap();
+        std::env::remove_var("RR_ENCODER");
+        let mut hard = Video::new(w, h, 60.0, 8000).unwrap();
+        // This process's CPU time (user + system), to see what each costs the machine.
+        let cpu = || {
+            let mut u: libc::rusage = unsafe { std::mem::zeroed() };
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) };
+            let t = |v: libc::timeval| v.tv_sec as f64 * 1000.0 + v.tv_usec as f64 / 1000.0;
+            t(u.ru_utime) + t(u.ru_stime)
+        };
+        for enc in [&mut soft, &mut hard] {
+            let (t, c) = (Instant::now(), cpu());
+            for f in &frames {
+                enc.encode(f, w * 4).unwrap();
+            }
+            let n = frames.len() as f64;
+            println!(
+                "{}: {:.1} ms a frame, {:.1} ms of CPU a frame",
+                enc.name(),
+                t.elapsed().as_secs_f64() * 1000.0 / n,
+                (cpu() - c) / n
+            );
+        }
     }
 }

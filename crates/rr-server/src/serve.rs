@@ -3,7 +3,7 @@
 //! skip when the connection backs up, and latency measured from the client's feedback.
 
 use crate::capture::Source;
-use crate::encode::H264;
+use crate::encode::Video as Encoder;
 use rr_proto::{Codec, CodecCap, Config, Cursor, Hello, Message, Video, INPUT_KEYBOARD, INPUT_POINTER, INPUT_TOUCH, VERSION_MAX, VERSION_MIN};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -187,7 +187,8 @@ fn session(mut ws: WebSocket<TcpStream>, source: Arc<Mutex<Box<dyn Source>>>, st
         return Err(format!("{}: no protocol version in common", client.name));
     }
     let codec = rr_proto::pick_codec(&hello, &client).ok_or_else(|| format!("{}: decodes none of this server's codecs", client.name))?;
-    let mut enc = H264::new(w, h, opts.fps as f32, opts.bitrate_kbps)?;
+    let mut enc = Encoder::new(w, h, opts.fps as f32, opts.bitrate_kbps)?;
+    eprintln!("rein-remote: encoding {}", enc.name());
     let (ew, eh) = enc.size();
     send(
         &mut ws,
@@ -303,9 +304,16 @@ fn session(mut ws: WebSocket<TcpStream>, source: Arc<Mutex<Box<dyn Source>>>, st
                 let captured_at = now_us();
                 let (encoded, grab_ms) = {
                     let mut src = source.lock().unwrap();
-                    let frame = src.grab()?;
-                    let grab_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                    (enc.encode(frame.bgra, frame.stride)?, grab_ms)
+                    // Zero copy where both ends can: the system's own frame straight into the hardware encoder.
+                    let surface = if enc.takes_surfaces() { src.surface() } else { None };
+                    if let Some(surface) = surface {
+                        let grab_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                        (enc.encode_surface(&surface)?, grab_ms)
+                    } else {
+                        let frame = src.grab()?;
+                        let grab_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                        (enc.encode(frame.bgra, frame.stride)?, grab_ms)
+                    }
                 };
                 let encode_ms = t0.elapsed().as_secs_f64() * 1000.0 - grab_ms;
                 if let Some(e) = encoded {
