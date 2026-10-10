@@ -68,8 +68,9 @@ has been verified.
   12.6 ms of CPU a frame against 19.8 ms in software; glass to glass 14 ms median at 720p (10 ms in
   software on the same Mac). Zero copy on macOS: ScreenCaptureKit's frames go into VideoToolbox
   where they are (GPU memory, no copy); streaming a terminal window changing ~15 times a second
-  costs rein-remote 1.5% of one core (4.8% in software). Next: Media Foundation/NVENC on Windows
-  and VA-API on Linux, and the pointer's shape on macOS.
+  costs rein-remote 1.5% of one core (4.8% in software). The pointer's real shape on macOS too
+  (the system's arrow, I-beam…), sent apart and hidden off the window. Next: Media
+  Foundation/NVENC on Windows and VA-API on Linux.
 - **Verified:** a window on each streams with input (macOS on a real Mac; Windows on CI runners and a
   real machine), hardware and software paths both; 200 fps measured glass to glass on a machine
   with a hardware encoder, with the server's CPU use written down (idle and under motion).
