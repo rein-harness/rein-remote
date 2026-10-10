@@ -173,7 +173,13 @@ impl Link for WtLink {
 /// A WebTransport endpoint on `addr` (UDP), with a certificate made for it (valid 14 days, as browsers
 /// require for a certificate they're given by hash). Each session runs `session` on a thread of its
 /// own; returns the certificate's SHA-256 for the page.
-pub fn webtransport<F>(addr: std::net::SocketAddr, token: Option<String>, session: F) -> Result<[u8; 32], String>
+/// With `tls` (a real certificate), the browser checks it as for any site and there's no hash.
+pub fn webtransport<F>(
+    addr: std::net::SocketAddr,
+    token: Option<String>,
+    tls: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    session: F,
+) -> Result<Option<[u8; 32]>, String>
 where
     F: Fn(Box<dyn Link + Send>) + Send + Sync + 'static,
 {
@@ -182,18 +188,28 @@ where
     if let Ok(h) = std::env::var("HOSTNAME") {
         names.push(h);
     }
-    let identity = Identity::self_signed(names).map_err(|e| format!("a certificate for WebTransport: {e}"))?;
-    let hash = *identity.certificate_chain().as_slice()[0].hash().as_ref();
-    let config = ServerConfig::builder()
-        .with_bind_address(addr)
-        .with_identity(identity)
-        .keep_alive_interval(Some(Duration::from_secs(3)))
-        .build();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
+    let (identity, hash) = match tls {
+        Some((cert, key)) => (
+            rt.block_on(Identity::load_pemfiles(cert, key))
+                .map_err(|e| format!("the certificate for WebTransport: {e}"))?,
+            None,
+        ),
+        None => {
+            let id = Identity::self_signed(names).map_err(|e| format!("a certificate for WebTransport: {e}"))?;
+            let h = *id.certificate_chain().as_slice()[0].hash().as_ref();
+            (id, Some(h))
+        }
+    };
+    let config = ServerConfig::builder()
+        .with_bind_address(addr)
+        .with_identity(identity)
+        .keep_alive_interval(Some(Duration::from_secs(3)))
+        .build();
     let endpoint = rt
         .block_on(async { Endpoint::server(config) })
         .map_err(|e| format!("WebTransport on {addr}: {e}"))?;

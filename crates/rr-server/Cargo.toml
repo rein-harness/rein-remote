@@ -16,6 +16,9 @@ openh264-sys2 = "0.6.6"
 rr-proto = {path = "../rr-proto"}
 aes-gcm = "0.10.3"
 getrandom = "0.3"
+if-addrs = "0.15.0"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2.2.0"
 hkdf = "0.12.4"
 sha2 = "0.10.9"
 socket2 = "0.6.1"

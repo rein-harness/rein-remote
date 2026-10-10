@@ -12,11 +12,13 @@
 
 mod adapt;
 mod capture;
+mod conn;
 mod e2e;
 mod encode;
 #[cfg(target_os = "macos")]
 mod encode_vt;
 mod link;
+mod links;
 mod relay;
 mod serve;
 mod yuv;
@@ -25,7 +27,7 @@ use capture::{Source, TestPattern};
 
 fn usage() -> ! {
     eprintln!(
-        "rein-remote {}\n\nusage:\n  rein-remote serve [--display :N | --window APP|TITLE|ID | --test-pattern [WxH]] [--listen ADDR] [--fps N] [--bitrate KBPS] [--token T] [--webtransport on|off] [--relay ws(s)://HOST:PORT [--room CODE] [--relay-secret S]]\n  rein-remote relay [--listen ADDR] [--secret S]\n  rein-remote windows [--json]\n  rein-remote selftest [--window Q | --display :N | --test-pattern] [--type TEXT]\n  rein-remote --version",
+        "rein-remote {}\n\nusage:\n  rein-remote serve [--display :N | --window APP|TITLE|ID | --test-pattern [WxH]] [--listen ADDR] [--fps N] [--bitrate KBPS] [--token T] [--webtransport on|off] [--tls-cert PEM --tls-key PEM] [--tailscale-cert on|off] [--relay ws(s)://HOST:PORT [--room CODE] [--relay-secret S]]\n  rein-remote relay [--listen ADDR] [--secret S]\n  rein-remote windows [--json]\n  rein-remote selftest [--window Q | --display :N | --test-pattern] [--type TEXT]\n  rein-remote --version",
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(2);
@@ -76,12 +78,15 @@ fn main() {
 
 fn serve_cmd(args: &[String]) -> Result<(), String> {
     let mut opts = serve::Options {
-        listen: "127.0.0.1:7979".into(),
+        // Not given: every interface (your tailnet, this network), behind a token in the link.
+        listen: "auto".into(),
         fps: 60,
         bitrate_kbps: 8000,
         token: std::env::var("REIN_REMOTE_TOKEN").ok().filter(|t| !t.is_empty()),
         webtransport: true,
         relay: None,
+        tls: None,
+        tailscale_cert: true,
         e2e_key: {
             let mut k = [0u8; 32];
             let _ = getrandom::fill(&mut k);
@@ -89,6 +94,7 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
         },
     };
     let (mut relay, mut room, mut relay_secret) = (None, None, std::env::var("REIN_REMOTE_RELAY_SECRET").ok());
+    let (mut tls_cert, mut tls_key) = (None, None);
     let mut display: Option<String> = None;
     let mut window: Option<String> = None;
     let mut pattern: Option<(usize, usize)> = None;
@@ -103,6 +109,9 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
             "--window" => window = Some(val()?),
             "--token" => opts.token = Some(val()?),
             "--relay" => relay = Some(val()?),
+            "--tls-cert" => tls_cert = Some(std::path::PathBuf::from(val()?)),
+            "--tls-key" => tls_key = Some(std::path::PathBuf::from(val()?)),
+            "--tailscale-cert" => opts.tailscale_cert = !matches!(val()?.as_str(), "off" | "false" | "no"),
             "--room" => room = Some(val()?),
             "--relay-secret" => relay_secret = Some(val()?),
             "--webtransport" => opts.webtransport = !matches!(val()?.as_str(), "off" | "false" | "no"),
@@ -116,6 +125,19 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
             }
             _ => usage(),
         }
+    }
+    match (tls_cert, tls_key) {
+        (Some(c), Some(k)) => opts.tls = Some((c, k)),
+        (None, None) => {}
+        _ => return Err("--tls-cert and --tls-key go together".into()),
+    }
+    // Reachable from other machines: never without a token (the link carries it).
+    let loopback = opts.listen.starts_with("127.") || opts.listen.starts_with("localhost") || opts.listen.starts_with("[::1]");
+    if opts.token.is_none() && !loopback {
+        let mut b = [0u8; 24];
+        let _ = getrandom::fill(&mut b);
+        const ALPHABET: &[u8] = b"abcdefghijkmnpqrstuvwxyz23456789";
+        opts.token = Some(b.iter().map(|x| ALPHABET[*x as usize % 32] as char).collect());
     }
     if let Some(r) = relay {
         // A room code nobody can guess: 24 characters from the system's randomness.

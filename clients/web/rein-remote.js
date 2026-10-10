@@ -69,6 +69,153 @@ function avcCodec(data) {
   return 'avc1.42e01f';
 }
 
+// ---- video on plain HTTP: Media Source ----
+
+/*
+ * A browser gives its video decoder (WebCodecs) only to secure pages (HTTPS, localhost). On a plain
+ * http:// page (a local-network address), the same H.264 goes through Media Source instead: each frame
+ * wrapped as a fragment of MP4 for a <video> kept at the live edge, drawn onto the canvas as it plays.
+ * A little more delay than WebCodecs; the same everywhere else (input, the pointer, touch).
+ */
+const MS = typeof window !== 'undefined' ? window.ManagedMediaSource ?? window.MediaSource : undefined;
+
+const u32be = (v) => [(v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255, v & 255];
+const u16be = (v) => [(v >>> 8) & 255, v & 255];
+function box(type, ...parts) {
+  const body = parts.flatMap((p) => (p instanceof Uint8Array ? [...p] : p));
+  return [...u32be(8 + body.length), ...[...type].map((c) => c.charCodeAt(0)), ...body];
+}
+const full = (type, version, flags, ...parts) => box(type, [version, (flags >> 16) & 255, (flags >> 8) & 255, flags & 255], ...parts);
+
+/** Annex B (start codes) into NAL units. */
+function nalUnits(data) {
+  const out = [];
+  let i = 0, start = -1;
+  while (i + 3 <= data.length) {
+    const sc = data[i] === 0 && data[i + 1] === 0 && (data[i + 2] === 1 || (data[i + 2] === 0 && data[i + 3] === 1));
+    if (sc) {
+      if (start >= 0) out.push(data.subarray(start, i));
+      i += data[i + 2] === 1 ? 3 : 4;
+      start = i;
+    } else i++;
+  }
+  if (start >= 0) out.push(data.subarray(start));
+  return out;
+}
+
+function initSegment(sps, pps, width, height) {
+  const avcC = box('avcC', [1, sps[1], sps[2], sps[3], 0xff, 0xe1, ...u16be(sps.length), ...sps, 1, ...u16be(pps.length), ...pps]);
+  const avc1 = box('avc1', [0, 0, 0, 0, 0, 0, 0, 1, ...new Array(16).fill(0), ...u16be(width), ...u16be(height), 0, 0x48, 0, 0, 0, 0x48, 0, 0, 0, 0, 0, 0, 0, 1, ...new Array(32).fill(0), 0, 0x18, 0xff, 0xff], avcC);
+  const zero = (n) => new Array(n).fill(0);
+  const matrix = [0, 1, 0, 0, ...zero(12), 0, 1, 0, 0, ...zero(12), 0x40, 0, 0, 0];
+  return new Uint8Array([
+    ...box('ftyp', [...'isom'].map((c) => c.charCodeAt(0)), u32be(1), [...'isomiso5avc1'].map((c) => c.charCodeAt(0))),
+    ...box('moov',
+      full('mvhd', 0, 0, zero(8), u32be(90000), zero(4), u32be(0x00010000), u16be(0x0100), zero(10), matrix, zero(24), u32be(2)),
+      box('trak',
+        full('tkhd', 0, 3, zero(8), u32be(1), zero(4), zero(4), zero(8), zero(4), zero(4), matrix, u32be(width << 16), u32be(height << 16)),
+        box('mdia',
+          full('mdhd', 0, 0, zero(8), u32be(90000), zero(4), u16be(0x55c4), zero(2)),
+          full('hdlr', 0, 0, zero(4), [...'vide'].map((c) => c.charCodeAt(0)), zero(12), [...'video', '\0'].map((c) => c.charCodeAt(0))),
+          box('minf',
+            full('vmhd', 0, 1, zero(8)),
+            box('dinf', full('dref', 0, 0, u32be(1), full('url ', 0, 1))),
+            box('stbl', full('stsd', 0, 0, u32be(1), avc1), full('stts', 0, 0, zero(4)), full('stsc', 0, 0, zero(4)), full('stsz', 0, 0, zero(8)), full('stco', 0, 0, zero(4)))))),
+      box('mvex', full('trex', 0, 0, u32be(1), u32be(1), zero(4), zero(4), zero(4)))),
+  ]);
+}
+
+function fragment(seq, time90k, duration, key, sample) {
+  const trunLen = 12 + 4 + 4 + 4 + 4 + 4; // full header, count, data offset, duration, size, flags
+  const moofLen = 8 + 16 + (8 + 16 + 20 + trunLen);
+  const traf = box('traf',
+    full('tfhd', 0, 0x020000, u32be(1)),
+    full('tfdt', 1, 0, u32be(Math.floor(time90k / 2 ** 32)), u32be(time90k >>> 0)),
+    full('trun', 0, 0x000701, u32be(1), u32be(moofLen + 8), u32be(duration), u32be(sample.length), u32be(key ? 0x02000000 : 0x01010000)));
+  const moof = box('moof', full('mfhd', 0, 0, u32be(seq)), traf);
+  const out = new Uint8Array(moof.length + 8 + sample.length);
+  out.set(moof);
+  out.set(u32be(8 + sample.length), moof.length);
+  out.set([109, 100, 97, 116], moof.length + 4); // mdat
+  out.set(sample, moof.length + 8);
+  return out;
+}
+
+/** The VideoDecoder interface this client uses, over Media Source (for plain http:// pages). */
+class MseDecoder {
+  constructor({output, error}) {
+    Object.assign(this, {output, error, state: 'unconfigured', queue: [], seq: 0, times: new Map()});
+  }
+  configure({codec, width, height}) {
+    this.size = [width, height];
+    this.video = Object.assign(document.createElement('video'), {muted: true, playsInline: true, autoplay: true, disableRemotePlayback: true});
+    this.ms = new MS();
+    this.video.src = URL.createObjectURL(this.ms);
+    this.ms.addEventListener('sourceopen', () => {
+      this.sb = this.ms.addSourceBuffer(`video/mp4; codecs="${codec}"`);
+      this.sb.addEventListener('updateend', () => this.pump());
+      this.pump();
+    });
+    this.t0 = performance.now();
+    this.state = 'configured';
+    const draw = (_, meta) => {
+      if (this.state === 'closed') return;
+      // The frame now on screen: the nearest one appended by its time.
+      let n = 0, best = Infinity;
+      for (const [t, k] of this.times) if (Math.abs(t - meta.mediaTime) < best) ((best = Math.abs(t - meta.mediaTime)), (n = k));
+      for (const t of this.times.keys()) if (t < meta.mediaTime - 1) this.times.delete(t);
+      this.output({image: this.video, displayWidth: this.video.videoWidth, displayHeight: this.video.videoHeight, timestamp: n, close() {}});
+      this.video.requestVideoFrameCallback(draw);
+    };
+    this.video.requestVideoFrameCallback(draw);
+    this.video.play().catch(() => {});
+  }
+  decode({type, timestamp, data}) {
+    const nals = nalUnits(data);
+    const sps = nals.find((u) => (u[0] & 31) === 7), pps = nals.find((u) => (u[0] & 31) === 8);
+    if (sps && pps && !this.inited) {
+      this.queue.push(initSegment(sps, pps, ...this.size));
+      this.inited = true;
+    }
+    if (!this.inited) return;
+    // The frame's slices in MP4's form: each NAL unit after its length.
+    const units = nals.filter((u) => ![7, 8, 9].includes(u[0] & 31));
+    const sample = new Uint8Array(units.reduce((a, u) => a + 4 + u.length, 0));
+    let at = 0;
+    for (const u of units) (sample.set(u32be(u.length), at), sample.set(u, at + 4), (at += 4 + u.length));
+    // A timeline with no holes (a hole stalls the video): each frame starts where the last ended and
+    // lasts as long as the wait before it, so it plays at the pace frames come.
+    const now = performance.now();
+    const d = this.last === undefined ? 1500 : Math.max(90, Math.round((now - this.last) * 90));
+    this.last = now;
+    const t = this.next ?? 0;
+    this.next = t + d;
+    this.times.set(t / 90000, timestamp);
+    this.queue.push(fragment(++this.seq, t, d, type === 'key', sample));
+    this.pump();
+  }
+  pump() {
+    if (!this.sb || this.sb.updating || !this.queue.length) return;
+    try {
+      this.sb.appendBuffer(this.queue.shift());
+    } catch (e) {
+      return this.error(e);
+    }
+    // Live: stay at the newest frame (a little behind it, for the decoder).
+    const b = this.video.buffered;
+    if (b.length && b.end(b.length - 1) - this.video.currentTime > 0.12) this.video.currentTime = b.end(b.length - 1) - 0.02;
+  }
+  close() {
+    this.state = 'closed';
+    try {
+      this.ms?.endOfStream();
+    } catch {}
+    this.video?.removeAttribute('src');
+  }
+}
+
+const webcodecs = typeof VideoDecoder !== 'undefined';
+
 // ---- the connection ----
 
 /**
@@ -96,7 +243,8 @@ function openLink(url, wt) {
   (async () => {
     let t;
     try {
-      t = new WebTransport(wt.url, {serverCertificateHashes: [{algorithm: 'sha-256', value: new Uint8Array(wt.hash)}]});
+      // A self-signed certificate is accepted by its hash; a real one is checked as for any site.
+      t = new WebTransport(wt.url, wt.hash ? {serverCertificateHashes: [{algorithm: 'sha-256', value: new Uint8Array(wt.hash)}]} : {});
       await Promise.race([t.ready, new Promise((_, no) => setTimeout(() => no(new Error('timeout')), 3000))]);
     } catch {
       try {
@@ -237,7 +385,8 @@ export function connect(url, canvas, opts = {}) {
     w.str(opts.name ?? (navigator.userAgentData?.platform || navigator.platform || 'browser'));
     // What this browser decodes (hardware first is the server's preference to honor).
     const caps = [];
-    for (const [id, c] of [[1, 'avc1.42e01f'], [4, 'vp09.00.10.08'], [3, 'av01.0.04M.08']]) {
+    if (!webcodecs && MS?.isTypeSupported('video/mp4; codecs="avc1.42e01f"')) caps.push([1, 0]); // H.264 through Media Source
+    for (const [id, c] of webcodecs ? [[1, 'avc1.42e01f'], [4, 'vp09.00.10.08'], [3, 'av01.0.04M.08']] : []) {
       try {
         const hw = await VideoDecoder.isConfigSupported({codec: c, hardwareAcceleration: 'prefer-hardware'});
         const sw = hw.supported ? hw : await VideoDecoder.isConfigSupported({codec: c});
@@ -256,13 +405,13 @@ export function connect(url, canvas, opts = {}) {
     try {
       if (decoder && decoder.state !== 'closed') decoder.close();
     } catch {}
-    decoder = new VideoDecoder({
+    decoder = new (webcodecs ? VideoDecoder : MseDecoder)({
       output: (frame) => {
         if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
           canvas.width = frame.displayWidth;
           canvas.height = frame.displayHeight;
         }
-        ctx.drawImage(frame, 0, 0);
+        ctx.drawImage(frame.image ?? frame, 0, 0);
         if (measure && canvas.height >= 24 && canvas.width >= 34 * 24) {
           const row = ctx.getImageData(0, canvas.height - 12, 34 * 24, 1).data;
           const bit = (k) => row[(k * 24 + 12) * 4 + 1] > 128;
@@ -302,7 +451,8 @@ export function connect(url, canvas, opts = {}) {
     if (key) stats.keyframes++;
     sent.set(n, nowUs());
     try {
-      decoder.decode(new EncodedVideoChunk({type: key ? 'key' : 'delta', timestamp: n, data}));
+      const chunk = {type: key ? 'key' : 'delta', timestamp: n, data};
+      decoder.decode(webcodecs ? new EncodedVideoChunk(chunk) : chunk);
     } catch (err) {
       stats.error = String(err.message ?? err);
       waitKey = true;
@@ -351,8 +501,14 @@ export function connect(url, canvas, opts = {}) {
           }
           if (!codec) {
             // Hardware decoding where the device has it, else whatever this browser decodes with.
-            codec = {codec: config?.codec === 'h264' ? avcCodec(data) : 'vp09.00.10.08', optimizeForLatency: true};
+            codec = {codec: config?.codec === 'h264' ? avcCodec(data) : 'vp09.00.10.08', optimizeForLatency: true, width: config?.width, height: config?.height};
             pending.push({key, n, data});
+            if (!webcodecs) {
+              decoder.configure(codec);
+              stats.decoder = `${codec.codec} (Media Source: this page isn't HTTPS)`;
+              for (const p of pending.splice(0)) decodeOne(p);
+              continue;
+            }
             VideoDecoder.isConfigSupported({...codec, hardwareAcceleration: 'prefer-hardware'}).then(
               (r) => {
                 if (r.supported) codec.hardwareAcceleration = 'prefer-hardware';
