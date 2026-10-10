@@ -5,6 +5,8 @@
 
 #[cfg(target_os = "macos")]
 pub mod mac;
+#[cfg(windows)]
+pub mod win;
 #[cfg(target_os = "linux")]
 pub mod x11;
 

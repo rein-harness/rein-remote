@@ -5,6 +5,7 @@
 //!   rein-remote serve --test-pattern       # a moving pattern, no display needed
 //!   rein-remote serve --window Simulator   # one app's window (macOS), by app name, title or id
 //!   rein-remote windows [--json]           # the windows it can show
+//!   rein-remote selftest --window Notepad --type hi   # capture works, and typing changes what's seen
 //!   rein-remote serve --listen 0.0.0.0:7979 --fps 60 --bitrate 8000
 //!   rein-remote serve --listen 127.0.0.1:0 --token T   # a free port (printed), the stream needs ?token=T
 //!                                                      # (or REIN_REMOTE_TOKEN; kept out of `ps`)
@@ -18,7 +19,7 @@ use capture::{Source, TestPattern};
 
 fn usage() -> ! {
     eprintln!(
-        "rein-remote {}\n\nusage:\n  rein-remote serve [--display :N | --window APP|TITLE|ID | --test-pattern [WxH]] [--listen ADDR] [--fps N] [--bitrate KBPS] [--token T]\n  rein-remote windows [--json]\n  rein-remote --version",
+        "rein-remote {}\n\nusage:\n  rein-remote serve [--display :N | --window APP|TITLE|ID | --test-pattern [WxH]] [--listen ADDR] [--fps N] [--bitrate KBPS] [--token T]\n  rein-remote windows [--json]\n  rein-remote selftest [--window Q | --display :N | --test-pattern] [--type TEXT]\n  rein-remote --version",
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(2);
@@ -32,6 +33,13 @@ fn main() {
             Ok(()) => {}
             Err(e) => {
                 eprintln!("rein-remote: {e}");
+                std::process::exit(1);
+            }
+        },
+        Some("selftest") => match selftest(&args[1..]) {
+            Ok(msg) => println!("rein-remote selftest: {msg}"),
+            Err(e) => {
+                eprintln!("rein-remote selftest: {e}");
                 std::process::exit(1);
             }
         },
@@ -94,9 +102,9 @@ fn open_window(query: &str) -> Result<Box<dyn Source>, String> {
     Ok(Box::new(capture::x11::X11::open_window(None, query)?))
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn open_window(_query: &str) -> Result<Box<dyn Source>, String> {
-    Err("window capture on this platform is coming (see ROADMAP.md, phase 3)".into())
+#[cfg(windows)]
+fn open_window(query: &str) -> Result<Box<dyn Source>, String> {
+    Ok(Box::new(capture::win::WinWindow::open(query)?))
 }
 
 #[cfg(target_os = "macos")]
@@ -152,13 +160,33 @@ fn list_windows(json: bool) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn list_windows(_json: bool) -> Result<(), String> {
-    Err("listing windows on this platform is coming (see ROADMAP.md, phase 3)".into())
+#[cfg(windows)]
+fn list_windows(json: bool) -> Result<(), String> {
+    let list = capture::win::windows()?;
+    if json {
+        let rows: Vec<String> = list
+            .iter()
+            .map(|w| {
+                format!(
+                    r#"{{"id":{},"app":"{}","title":"{}","width":{},"height":{}}}"#,
+                    w.id,
+                    esc(&w.app),
+                    esc(&w.title),
+                    w.width,
+                    w.height
+                )
+            })
+            .collect();
+        println!("[{}]", rows.join(","));
+    } else {
+        for w in list {
+            println!("{:>10}  {}  {}  ({}×{})", w.id, w.app, w.title, w.width, w.height);
+        }
+    }
+    Ok(())
 }
 
 /// A string for JSON: quotes and backslashes escaped, control characters left out.
-#[allow(dead_code)] // not on Windows yet
 fn esc(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"").chars().filter(|c| !c.is_control()).collect()
 }
@@ -171,4 +199,75 @@ fn open_display(display: Option<&str>) -> Result<Box<dyn Source>, String> {
 #[cfg(not(target_os = "linux"))]
 fn open_display(_display: Option<&str>) -> Result<Box<dyn Source>, String> {
     Err("screen capture on this platform comes in phase 3 (see ROADMAP.md); use --test-pattern to try the stream".into())
+}
+
+/// Capture without a client (for CI and for checking a machine): the source gives a frame, and with
+/// `--type`, typing into it (then Enter) changes what it shows.
+fn selftest(args: &[String]) -> Result<String, String> {
+    use std::time::{Duration, Instant};
+    let mut it = args.iter();
+    let (mut window, mut display, mut pattern, mut text) = (None, None, false, None);
+    while let Some(a) = it.next() {
+        let mut val = || it.next().cloned().ok_or_else(|| format!("{a} needs a value"));
+        match a.as_str() {
+            "--window" => window = Some(val()?),
+            "--display" => display = Some(val()?),
+            "--test-pattern" => pattern = true,
+            "--type" => text = Some(val()?),
+            _ => usage(),
+        }
+    }
+    let mut src: Box<dyn Source> = match (pattern, window) {
+        (true, _) => Box::new(TestPattern::new(320, 240)),
+        (false, Some(q)) => open_window(&q)?,
+        (false, None) => open_display(display.as_deref())?,
+    };
+    let (w, h) = src.size();
+    let digest = |src: &mut Box<dyn Source>| -> Result<u64, String> {
+        use std::hash::{Hash, Hasher};
+        let f = src.grab()?;
+        let mut hsh = std::collections::hash_map::DefaultHasher::new();
+        for row in 0..h {
+            f.bgra[row * f.stride..row * f.stride + w * 4]
+                .iter()
+                .step_by(4)
+                .collect::<Vec<_>>()
+                .hash(&mut hsh);
+        }
+        Ok(hsh.finish())
+    };
+    // The first frame (a source that pushes frames needs a moment).
+    let start = Instant::now();
+    while src.generation().is_some_and(|g| g == 0) && start.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if src.generation() == Some(0) {
+        return Err("no frame came in 5 seconds".into());
+    }
+    let before = digest(&mut src)?;
+    let Some(text) = text else { return Ok(format!("{w}×{h}, frames come")) };
+    // Clicking first gives the window the keyboard (as a person would).
+    src.input(&rr_proto::Input::PointerMove {
+        x: (w / 2) as u16,
+        y: (h / 2) as u16,
+    })?;
+    src.input(&rr_proto::Input::Button {
+        button: rr_proto::Button::Left,
+        down: true,
+    })?;
+    src.input(&rr_proto::Input::Button {
+        button: rr_proto::Button::Left,
+        down: false,
+    })?;
+    std::thread::sleep(Duration::from_millis(300));
+    src.input(&rr_proto::Input::Text { text })?;
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(100));
+        src.generation();
+        if digest(&mut src)? != before {
+            return Ok(format!("{w}×{h}, frames come, and typing changed the window"));
+        }
+    }
+    Err("typing didn't change what the window shows".into())
 }

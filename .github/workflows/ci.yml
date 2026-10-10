@@ -22,6 +22,29 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      # Capture and input on a real desktop: a window streams, and typing into it changes it.
+      - name: Selftest (Windows, Notepad)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --release -p rr-server
+          Start-Process notepad
+          Start-Sleep -Seconds 3
+          ./target/release/rein-remote.exe windows
+          ./target/release/rein-remote.exe selftest --window Notepad --type "rein remote was here"
+      - name: Selftest (Linux, an xterm on Xvfb)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb xterm > /dev/null
+          cargo build --release -p rr-server
+          Xvfb :20 -screen 0 1280x720x24 & sleep 2
+          DISPLAY=:20 xterm -T selftest -e bash --norc & sleep 2
+          DISPLAY=:20 ./target/release/rein-remote windows
+          DISPLAY=:20 ./target/release/rein-remote selftest --window selftest --type "echo rein remote was here"
+          DISPLAY=:20 ./target/release/rein-remote selftest --display :20
+      - name: Selftest (macOS, test pattern; screen capture needs a permission runners can't give)
+        if: runner.os == 'macOS'
+        run: cargo run --release -p rr-server -- selftest --test-pattern
   wasm:
     runs-on: ubuntu-latest
     steps:

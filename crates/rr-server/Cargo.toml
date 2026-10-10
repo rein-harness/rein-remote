@@ -30,3 +30,7 @@ objc2-core-media = { version = "0.3.2", features = ["CMSampleBuffer", "objc2-cor
 objc2-core-video = { version = "0.3.2", features = ["CVPixelBuffer", "CVImageBuffer", "CVBuffer", "CVReturn"] }
 objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSError", "NSString"] }
 objc2-screen-capture-kit = "0.3.2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+windows-capture = "2.0.1"
