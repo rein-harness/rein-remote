@@ -76,7 +76,10 @@ Measured (phase 1, software H.264, decoded in Chrome in software):
 A still screen is neither read nor encoded (XDamage): one refresh a second. Hardware encoders are
 what come next (see the roadmap).
 
-### From anywhere, through a relay
+### Optional: a relay, for a machine on no network you share
+
+On a tailnet or a local network you need nothing more (above). Only to reach a machine you share no
+network with, run a relay of your own somewhere both can reach:
 
 ```sh
 rein-remote relay --listen 0.0.0.0:7990 --secret S        # on a machine both can reach (put HTTPS in front for wss://)
