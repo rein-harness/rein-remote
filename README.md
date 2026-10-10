@@ -22,7 +22,7 @@ Early: the design is done and being built one verified piece at a time
 
 | Piece | Status |
 |---|---|
-| Protocol (`rr-proto`) | in progress (phase 0) |
+| Protocol (`rr-proto`), versioned per message | done (phase 0: CI on Linux, macOS, Windows, WebAssembly) |
 | Server: Linux | todo (phase 1) |
 | Server: macOS | todo (phase 3) |
 | Server: Windows | todo (phase 3) |
