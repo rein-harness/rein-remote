@@ -22,16 +22,26 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
-      # Capture and input on a real desktop: a window streams, and typing into it changes it.
-      - name: Selftest (Windows, Notepad)
+      # Which Media Foundation H.264 encoder the runner has (no GPU: Microsoft's software one), and
+      # what the encoder tests saw with it.
+      - name: Media Foundation encoder (Windows)
+        if: runner.os == 'Windows'
+        run: cargo test -p rr-server encode_mf -- --nocapture --test-threads=1
+      # Capture and input on a real desktop: a window streams, and typing into it changes it; each
+      # through the default encoder and through Media Foundation's; then the whole display.
+      - name: Selftest (Windows, Notepad and the display)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
           cargo build --release -p rr-server
-          Start-Process notepad
+          Start-Process notepad -WindowStyle Maximized
           Start-Sleep -Seconds 3
           ./target/release/rein-remote.exe windows
           ./target/release/rein-remote.exe selftest --window Notepad --type "rein remote was here"
+          $env:RR_ENCODER = "mediafoundation"
+          ./target/release/rein-remote.exe selftest --window Notepad --type " through media foundation"
+          ./target/release/rein-remote.exe selftest --type " and on the whole display"
       - name: Selftest (Linux, an xterm on Xvfb)
         if: runner.os == 'Linux'
         run: |
