@@ -6,7 +6,7 @@
 //!   rein-remote serve --window Simulator   # one app's window (macOS), by app name, title or id
 //!   rein-remote windows [--json]           # the windows it can show
 //!   rein-remote selftest --window Notepad --type hi   # capture works, and typing changes what's seen
-//!   rein-remote serve --listen 0.0.0.0:7979 --fps 60 --bitrate 8000
+//!   rein-remote serve --listen 0.0.0.0:7979 --fps 60 --bitrate 8000   # --fps auto (the default): the viewer's display rate
 //!   rein-remote serve --listen 127.0.0.1:0 --token T   # a free port (printed), the stream needs ?token=T
 //!                                                      # (or REIN_REMOTE_TOKEN; kept out of `ps`)
 
@@ -27,7 +27,7 @@ use capture::{Source, TestPattern};
 
 fn usage() -> ! {
     eprintln!(
-        "rein-remote {}\n\nusage:\n  rein-remote serve [--display :N | --window APP|TITLE|ID | --vnc HOST:PORT [--vnc-password P] | --pipe WxH | --test-pattern [WxH]] [--listen ADDR] [--fps N] [--bitrate KBPS] [--token T] [--webtransport on|off] [--tls-cert PEM --tls-key PEM] [--tailscale-cert on|off] [--relay ws(s)://HOST:PORT [--room CODE] [--relay-secret S]]\n  rein-remote relay [--listen ADDR] [--secret S]\n  rein-remote windows [--json]\n  rein-remote selftest [--window Q | --display :N | --test-pattern] [--type TEXT]\n  rein-remote --version",
+        "rein-remote {}\n\nusage:\n  rein-remote serve [--display :N | --window APP|TITLE|ID | --vnc HOST:PORT [--vnc-password P] | --pipe WxH | --test-pattern [WxH]] [--listen ADDR] [--fps auto|N] [--codec h264|h265|auto] [--bitrate KBPS] [--token T] [--webtransport on|off] [--tls-cert PEM --tls-key PEM] [--tailscale-cert on|off] [--relay ws(s)://HOST:PORT [--room CODE] [--relay-secret S]]\n  rein-remote relay [--listen ADDR] [--secret S]\n  rein-remote windows [--json]\n  rein-remote selftest [--window Q | --display :N | --test-pattern] [--type TEXT]\n  rein-remote --version",
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(2);
@@ -80,7 +80,8 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
     let mut opts = serve::Options {
         // Not given: every interface (your tailnet, this network), behind a token in the link.
         listen: "auto".into(),
-        fps: 60,
+        fps: 0,
+        codec: Some(rr_proto::Codec::H264),
         bitrate_kbps: 8000,
         token: std::env::var("REIN_REMOTE_TOKEN").ok().filter(|t| !t.is_empty()),
         webtransport: true,
@@ -106,7 +107,22 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
         let mut val = || it.next().cloned().ok_or_else(|| format!("{a} needs a value"));
         match a.as_str() {
             "--listen" => opts.listen = val()?,
-            "--fps" => opts.fps = val()?.parse().map_err(|_| "--fps is a number")?,
+            "--fps" => {
+                let v = val()?;
+                opts.fps = if v == "auto" {
+                    0
+                } else {
+                    v.parse().ok().filter(|n| (1..=240).contains(n)).ok_or("--fps is auto or 1 to 240")?
+                };
+            }
+            "--codec" => {
+                opts.codec = match val()?.as_str() {
+                    "h264" => Some(rr_proto::Codec::H264),
+                    "h265" | "hevc" => Some(rr_proto::Codec::H265),
+                    "auto" => None,
+                    _ => return Err("--codec is h264, h265 or auto".into()),
+                }
+            }
             "--bitrate" => opts.bitrate_kbps = val()?.parse().map_err(|_| "--bitrate is kbit/s")?,
             "--display" => display = Some(val()?),
             "--window" => window = Some(val()?),

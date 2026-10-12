@@ -1,8 +1,9 @@
-//! Video encoding. Phase 1: software H.264 (openh264, BSD-licensed), tuned for screens in real time:
-//! no B-frames, bitrate rate control, a keyframe on request. Hardware encoders come per platform in
-//! later phases behind the same `encode` call.
+//! Video encoding: software H.264 (openh264, BSD-licensed), tuned for screens in real time (no
+//! B-frames, bitrate rate control, a keyframe on request), and each platform's hardware encoders
+//! behind the same `VideoEncoder` trait, found at run time with software as the fallback.
 
 use openh264_sys2::*;
+use rr_proto::{Codec, CodecCap};
 use std::ptr::null_mut;
 
 /// H.264 in software: openh264's own interface, so its bitrate changes live (no keyframe) and a
@@ -25,6 +26,9 @@ unsafe impl Send for H264 {}
 pub struct Encoded {
     pub data: Vec<u8>,
     pub keyframe: bool,
+    /// What the caller tagged the frame with when it went in (its capture time): a pipelined
+    /// encoder gives frames back later than they went in.
+    pub tag: u64,
 }
 
 impl H264 {
@@ -157,6 +161,7 @@ impl H264 {
             data.extend_from_slice(unsafe { std::slice::from_raw_parts(layer.pBsBuf, size) });
         }
         Ok(Some(Encoded {
+            tag: 0,
             data,
             keyframe: bs.eFrameType == videoFrameTypeIDR || bs.eFrameType == videoFrameTypeI,
         }))
@@ -174,88 +179,125 @@ impl Drop for H264 {
     }
 }
 
-/// The encoder a stream uses: the machine's hardware one where there is one (VideoToolbox on macOS),
-/// else software. `RR_ENCODER=software` picks software anyway.
-pub enum Video {
-    Software(Box<H264>),
-    #[cfg(target_os = "macos")]
-    Hardware(crate::encode_vt::VideoToolbox),
+/// A video encoder: software (openh264) or one of the machine's hardware encoders.
+pub trait VideoEncoder: Send {
+    /// What it is, for the log ("H.264 in hardware (VideoToolbox)").
+    fn name(&self) -> String;
+    fn hardware(&self) -> bool;
+    /// The size it encodes (even: H.264 and HEVC need it).
+    fn size(&self) -> (usize, usize);
+    /// The next frame is a keyframe (a client joined, or lost a reference frame).
+    fn keyframe(&mut self);
+    fn wants_keyframe(&self) -> bool;
+    /// A new target bitrate, taken at once (no keyframe).
+    fn set_bitrate(&mut self, kbps: u32) -> Result<(), String>;
+    /// One frame of BGRA pixels (`stride` bytes a row), tagged (its capture time). Gives back the
+    /// frames done: this one (an encoder that works one frame at a time), or earlier ones (a
+    /// pipelined hardware encoder: see `poll`); none when it skipped the frame.
+    fn encode(&mut self, bgra: &[u8], stride: usize, tag: u64) -> Result<Vec<Encoded>, String>;
+    /// Whether it reads the system's own frames in place (zero copy): see `encode_surface`.
+    fn takes_surfaces(&self) -> bool {
+        false
+    }
+    /// A frame as the system's own image (`Source::surface`), read where it is.
+    fn encode_surface(&mut self, _surface: &crate::capture::Surface, _tag: u64) -> Result<Vec<Encoded>, String> {
+        Err("this encoder reads frames from memory".into())
+    }
+    /// Frames still being encoded (a pipelined encoder): `poll` gives them back once done.
+    fn in_flight(&self) -> usize {
+        0
+    }
+    /// The frames done since the last call (a pipelined encoder), without waiting.
+    fn poll(&mut self) -> Result<Vec<Encoded>, String> {
+        Ok(Vec::new())
+    }
 }
 
-impl Video {
-    pub fn new(width: usize, height: usize, fps: f32, bitrate_kbps: u32) -> Result<Self, String> {
-        #[cfg(target_os = "macos")]
-        if std::env::var("RR_ENCODER").as_deref() != Ok("software") {
-            match crate::encode_vt::VideoToolbox::new(width, height, fps, bitrate_kbps) {
-                Ok(v) => return Ok(Self::Hardware(v)),
-                Err(e) => eprintln!("rein-remote: {e}; encoding in software"),
+impl VideoEncoder for H264 {
+    fn name(&self) -> String {
+        "H.264 in software (openh264)".into()
+    }
+    fn hardware(&self) -> bool {
+        false
+    }
+    fn size(&self) -> (usize, usize) {
+        H264::size(self)
+    }
+    fn keyframe(&mut self) {
+        H264::keyframe(self)
+    }
+    fn wants_keyframe(&self) -> bool {
+        H264::wants_keyframe(self)
+    }
+    fn set_bitrate(&mut self, kbps: u32) -> Result<(), String> {
+        H264::set_bitrate(self, kbps)
+    }
+    fn encode(&mut self, bgra: &[u8], stride: usize, tag: u64) -> Result<Vec<Encoded>, String> {
+        Ok(H264::encode(self, bgra, stride)?.map(|e| Encoded { tag, ..e }).into_iter().collect())
+    }
+}
+
+/// Which encoders to use: `RR_ENCODER` = `auto` (the default: hardware where it works, else
+/// software), `software`, `hardware` (no fallback), or one backend by name (`videotoolbox`,
+/// `mediafoundation`, `vaapi`).
+fn choice() -> String {
+    std::env::var("RR_ENCODER").unwrap_or_default().to_ascii_lowercase()
+}
+
+/// The machine's hardware encoders for `codec`, best first: each is tried in turn when a stream starts.
+#[allow(unused_variables, unused_mut)]
+fn hardware(codec: Codec, width: usize, height: usize, fps: f32, kbps: u32) -> Vec<Result<Box<dyn VideoEncoder>, String>> {
+    let want = choice();
+    let named = |n: &str| matches!(want.as_str(), "" | "auto" | "hardware") || want == n;
+    let mut out: Vec<Result<Box<dyn VideoEncoder>, String>> = Vec::new();
+    #[cfg(target_os = "macos")]
+    if named("videotoolbox") {
+        out.push(crate::encode_vt::VideoToolbox::new(codec, width, height, fps, kbps).map(|e| Box::new(e) as Box<dyn VideoEncoder>));
+    }
+    out
+}
+
+/// An encoder for a stream: the machine's hardware one where it works, else software (H.264 only).
+pub fn open(codec: Codec, width: usize, height: usize, fps: f32, kbps: u32) -> Result<Box<dyn VideoEncoder>, String> {
+    let want = choice();
+    let mut why = Vec::new();
+    if want != "software" {
+        for e in hardware(codec, width, height, fps, kbps) {
+            match e {
+                Ok(e) => return Ok(e),
+                Err(e) => why.push(e),
             }
         }
-        Ok(Self::Software(Box::new(H264::new(width, height, fps, bitrate_kbps)?)))
     }
-
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::Software(_) => "H.264 in software (openh264)",
-            #[cfg(target_os = "macos")]
-            Self::Hardware(_) => "H.264 in hardware (VideoToolbox)",
+    let soft = !matches!(want.as_str(), "hardware" | "videotoolbox" | "mediafoundation" | "vaapi");
+    if soft && codec == Codec::H264 {
+        if !why.is_empty() {
+            eprintln!("rein-remote: no hardware encoder ({}): encoding in software", why.join("; "));
         }
+        return Ok(Box::new(H264::new(width, height, fps, kbps)?));
     }
+    Err(if why.is_empty() {
+        format!("no encoder for {codec:?} (RR_ENCODER={want})")
+    } else {
+        why.join("; ")
+    })
+}
 
-    pub fn size(&self) -> (usize, usize) {
-        match self {
-            Self::Software(e) => e.size(),
-            #[cfg(target_os = "macos")]
-            Self::Hardware(e) => e.size(),
+/// What this machine encodes, each codec once, hardware first (for the server's Hello): found by
+/// opening each encoder once, small, the first time it's asked.
+pub fn capabilities() -> &'static [CodecCap] {
+    static CAPS: std::sync::OnceLock<Vec<CodecCap>> = std::sync::OnceLock::new();
+    CAPS.get_or_init(|| {
+        let mut caps = Vec::new();
+        for codec in [Codec::H264, Codec::H265] {
+            if choice() != "software" && hardware(codec, 256, 144, 30.0, 500).into_iter().any(|e| e.is_ok()) {
+                caps.push(CodecCap { codec, hardware: true });
+            } else if codec == Codec::H264 && !matches!(choice().as_str(), "hardware" | "videotoolbox" | "mediafoundation" | "vaapi") {
+                caps.push(CodecCap { codec, hardware: false });
+            }
         }
-    }
-
-    pub fn keyframe(&mut self) {
-        match self {
-            Self::Software(e) => e.keyframe(),
-            #[cfg(target_os = "macos")]
-            Self::Hardware(e) => e.keyframe(),
-        }
-    }
-
-    /// A new target bitrate, taken at once (no keyframe).
-    pub fn set_bitrate(&mut self, kbps: u32) -> Result<(), String> {
-        match self {
-            Self::Software(e) => e.set_bitrate(kbps),
-            #[cfg(target_os = "macos")]
-            Self::Hardware(e) => e.set_bitrate(kbps),
-        }
-    }
-
-    pub fn wants_keyframe(&self) -> bool {
-        match self {
-            Self::Software(e) => e.wants_keyframe(),
-            #[cfg(target_os = "macos")]
-            Self::Hardware(e) => e.wants_keyframe(),
-        }
-    }
-
-    pub fn encode(&mut self, bgra: &[u8], stride: usize) -> Result<Option<Encoded>, String> {
-        match self {
-            Self::Software(e) => e.encode(bgra, stride),
-            #[cfg(target_os = "macos")]
-            Self::Hardware(e) => e.encode(bgra, stride),
-        }
-    }
-
-    /// Whether this encoder reads the system's own frames in place (zero copy).
-    pub fn takes_surfaces(&self) -> bool {
-        !matches!(self, Self::Software(_))
-    }
-
-    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
-    pub fn encode_surface(&mut self, surface: &crate::capture::Surface) -> Result<Option<Encoded>, String> {
-        match self {
-            Self::Software(_) => Err("the software encoder reads frames from memory".into()),
-            #[cfg(target_os = "macos")]
-            Self::Hardware(e) => e.encode_surface(surface),
-        }
-    }
+        caps
+    })
 }
 
 #[cfg(test)]
@@ -331,9 +373,9 @@ mod bench {
             })
             .collect();
         std::env::set_var("RR_ENCODER", "software");
-        let mut soft = Video::new(w, h, 60.0, 8000).unwrap();
+        let mut soft = open(Codec::H264, w, h, 60.0, 8000).unwrap();
         std::env::remove_var("RR_ENCODER");
-        let mut hard = Video::new(w, h, 60.0, 8000).unwrap();
+        let mut hard = open(Codec::H264, w, h, 60.0, 8000).unwrap();
         // This process's CPU time (user + system), to see what each costs the machine.
         let cpu = || {
             let mut u: libc::rusage = unsafe { std::mem::zeroed() };
@@ -344,7 +386,10 @@ mod bench {
         for enc in [&mut soft, &mut hard] {
             let (t, c) = (Instant::now(), cpu());
             for f in &frames {
-                enc.encode(f, w * 4).unwrap();
+                enc.encode(f, w * 4, 0).unwrap();
+            }
+            while enc.in_flight() > 0 {
+                enc.poll().unwrap();
             }
             let n = frames.len() as f64;
             println!(

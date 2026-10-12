@@ -70,7 +70,9 @@ pub struct Pointer {
     pub visible: bool,
 }
 
-/// A moving pattern with a frame counter: something to stream without a display.
+/// A moving pattern with a frame counter: something to stream without a display. Only what moves
+/// is drawn each frame (the block, the barcode, the pointer's cross), so it costs next to nothing
+/// even at 240 frames a second.
 pub struct TestPattern {
     w: usize,
     h: usize,
@@ -78,6 +80,8 @@ pub struct TestPattern {
     buf: Vec<u8>,
     /// Where the last pointer event landed (drawn as a cross), so input can be seen working.
     pointer: Option<(usize, usize)>,
+    /// What was drawn over the background last frame, to put back: the block's left edge, the cross.
+    drawn: Option<(usize, Option<(usize, usize)>)>,
 }
 
 impl TestPattern {
@@ -88,6 +92,34 @@ impl TestPattern {
             n: 0,
             buf: vec![0; w * h * 4],
             pointer: None,
+            drawn: None,
+        }
+    }
+
+    fn background(&mut self, x0: usize, x1: usize, y0: usize, y1: usize) {
+        let (w, h) = (self.w, self.h);
+        for y in y0..y1.min(h) {
+            for x in x0..x1.min(w) {
+                let i = (y * w + x) * 4;
+                self.buf[i..i + 4].copy_from_slice(&[(x * 255 / w.max(1)) as u8, (y * 255 / h.max(1)) as u8, 64, 255]);
+            }
+        }
+    }
+
+    fn cross(&mut self, (px, py): (usize, usize), color: Option<[u8; 4]>) {
+        let (w, h) = (self.w, self.h);
+        for d in 0..20usize {
+            for (x, y) in [(px + d, py), (px.saturating_sub(d), py), (px, py + d), (px, py.saturating_sub(d))] {
+                if x < w && y < h {
+                    match color {
+                        Some(c) => {
+                            let i = (y * w + x) * 4;
+                            self.buf[i..i + 4].copy_from_slice(&c);
+                        }
+                        None => self.background(x, x + 1, y, y + 1),
+                    }
+                }
+            }
         }
     }
 }
@@ -99,13 +131,14 @@ impl Source for TestPattern {
     fn grab(&mut self) -> Result<Frame<'_>, String> {
         self.n += 1;
         let (w, h, n) = (self.w, self.h, self.n as usize);
-        for y in 0..h {
-            for x in 0..w {
-                let i = (y * w + x) * 4;
-                self.buf[i] = (x * 255 / w.max(1)) as u8;
-                self.buf[i + 1] = (y * 255 / h.max(1)) as u8;
-                self.buf[i + 2] = 64;
-                self.buf[i + 3] = 255;
+        // The background once; after that, only what was drawn over it goes back.
+        match self.drawn.take() {
+            None => self.background(0, w, 0, h),
+            Some((bx, cross)) => {
+                self.background(bx, bx + w / 12, h / 3, h / 3 + h / 6);
+                if let Some(c) = cross {
+                    self.cross(c, None);
+                }
             }
         }
         // A white block moving left to right, one step a frame.
@@ -139,16 +172,10 @@ impl Source for TestPattern {
                 }
             }
         }
-        if let Some((px, py)) = self.pointer {
-            for d in 0..20usize {
-                for (x, y) in [(px + d, py), (px.saturating_sub(d), py), (px, py + d), (px, py.saturating_sub(d))] {
-                    if x < w && y < h {
-                        let i = (y * w + x) * 4;
-                        self.buf[i..i + 4].copy_from_slice(&[0, 0, 255, 255]);
-                    }
-                }
-            }
+        if let Some(p) = self.pointer {
+            self.cross(p, Some([0, 0, 255, 255]));
         }
+        self.drawn = Some((bx, self.pointer));
         Ok(Frame {
             bgra: &self.buf,
             stride: w * 4,
@@ -197,5 +224,30 @@ pub fn keysym(key: &str) -> Option<u32> {
     match (chars.next(), chars.next()) {
         (Some(c), None) => Some(if (c as u32) < 0x100 { c as u32 } else { 0x0100_0000 + c as u32 }),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_test_pattern_drawn_in_parts_is_the_same_as_drawn_whole() {
+        let (w, h) = (320, 240);
+        let mut p = TestPattern::new(w, h);
+        for n in 0..50 {
+            if n == 10 {
+                p.input(&Input::PointerMove { x: 100, y: 50 }).unwrap();
+            }
+            if n == 30 {
+                p.input(&Input::PointerMove { x: 5, y: 200 }).unwrap();
+            }
+            let got = p.grab().unwrap().bgra.to_vec();
+            // The same frame drawn from scratch.
+            let mut fresh = TestPattern::new(w, h);
+            fresh.n = p.n - 1;
+            fresh.pointer = p.pointer;
+            assert!(fresh.grab().unwrap().bgra == got.as_slice(), "frame {n}");
+        }
     }
 }

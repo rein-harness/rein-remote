@@ -18,6 +18,7 @@ fn hello(codecs: &[(Codec, bool)]) -> Hello {
         max_fps: 120,
         audio: true,
         input: INPUT_POINTER | INPUT_KEYBOARD | INPUT_TOUCH,
+        refresh_mhz: 120_000,
     }
 }
 
@@ -301,6 +302,16 @@ fn an_older_peers_messages_get_defaults_for_fields_added_since() {
     r.u32().unwrap();
     r.u64().unwrap();
     assert_eq!(r.or_u32(0).unwrap(), 42);
+    // Hello version 0 had no refresh rate: it reads as unknown.
+    let mut v0 = Message::Hello(hello(&[(Codec::H264, true)])).encode();
+    v0.truncate(v0.len() - 4);
+    v0[1] = 0;
+    let len = (v0.len() - HEADER_LEN) as u32;
+    v0[3..7].copy_from_slice(&len.to_le_bytes());
+    let Ok((Some(Message::Hello(read)), _)) = Message::decode(&v0) else {
+        panic!()
+    };
+    assert_eq!((read.refresh_mhz, read.max_fps), (0, 120));
     // Every kind has a version this build writes, in the header.
     for m in [Message::KeyframeRequest, Message::Resize { width: 1, height: 1 }] {
         let f = m.encode();

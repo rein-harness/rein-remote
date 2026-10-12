@@ -78,6 +78,9 @@ pub struct Hello {
     pub audio: bool,
     /// Bit set of `INPUT_*`: the input kinds a server accepts, or a client can send.
     pub input: u8,
+    /// The client's display refresh rate as it measured it, in millihertz (59940 for 59.94 Hz); 0
+    /// when unknown (a server, or a client older than Hello version 1). The server paces to it.
+    pub refresh_mhz: u32,
 }
 
 pub const INPUT_POINTER: u8 = 1;
@@ -234,7 +237,8 @@ pub mod kind {
 
 /// Each message's version, written in its frame header: raised when a field is added at the end.
 pub mod version {
-    pub const HELLO: u8 = 0;
+    /// 1: `refresh_mhz`.
+    pub const HELLO: u8 = 1;
     pub const CONFIG: u8 = 0;
     pub const VIDEO: u8 = 0;
     pub const AUDIO: u8 = 0;
@@ -351,6 +355,7 @@ impl Message {
                 w.u16(h.max_fps);
                 w.u8(h.audio as u8);
                 w.u8(h.input);
+                w.u32(h.refresh_mhz);
                 (kind::HELLO, 0)
             }
             Message::Config(c) => {
@@ -513,6 +518,7 @@ impl Message {
                     max_fps: r.u16()?,
                     audio: r.u8()? != 0,
                     input: r.u8()?,
+                    refresh_mhz: r.or_u32(0)?,
                 }))
             }
             kind::CONFIG => Some(Message::Config(Config {
