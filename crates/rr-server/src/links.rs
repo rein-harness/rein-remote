@@ -63,6 +63,30 @@ pub fn places() -> Vec<Place> {
     out
 }
 
+/// `text` as a QR code drawn with block characters (two rows a line), for a terminal.
+pub fn qr(text: &str) -> String {
+    let Ok(code) = qrcode::QrCode::new(text.as_bytes()) else {
+        return String::new();
+    };
+    let w = code.width();
+    let dark = |x: i64, y: i64| x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < w && code[(x as usize, y as usize)] == qrcode::Color::Dark;
+    let mut out = String::new();
+    // A quiet zone of 2 around it; light on dark terminals reads as well as dark on light.
+    for y in (-2..w as i64 + 2).step_by(2) {
+        out.push_str("  ");
+        for x in -2..w as i64 + 2 {
+            out.push(match (dark(x, y), dark(x, y + 1)) {
+                (true, true) => ' ',
+                (true, false) => '▄',
+                (false, true) => '▀',
+                (false, false) => '█',
+            });
+        }
+        out.push('\n');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

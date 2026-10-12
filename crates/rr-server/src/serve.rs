@@ -12,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const INDEX: &str = include_str!("../../../clients/web/index.html");
 pub const CLIENT_JS: &str = include_str!("../../../clients/web/rein-remote.js");
+pub const PAIR_JS: &str = include_str!("../../../clients/web/pair.js");
 
 pub struct Options {
     pub listen: String,
@@ -35,6 +36,11 @@ pub struct Options {
     /// the machine's tailnet name from Tailscale when it can give one.
     pub tls: Option<(std::path::PathBuf, std::path::PathBuf)>,
     pub tailscale_cert: bool,
+    /// Say where this server is on the local network (mDNS), when it listens beyond this computer.
+    pub mdns: bool,
+    /// Pairing (a code to enter once, then each device signs in with its key): `None` is on when it
+    /// listens beyond this computer.
+    pub pair: Option<bool>,
 }
 
 /// Latency and throughput, kept per session and shown by /stats.
@@ -108,6 +114,27 @@ pub fn run(source: Box<dyn Source>, opts: Options) -> Result<(), String> {
             }
         }
     }
+    // Who may connect: the token in the link, or a device paired with a code.
+    let reachable = listener.local_addr().is_ok_and(|a| a.ip().is_unspecified());
+    let gate = Arc::new(crate::pairing::Gate::new(opts.token.clone(), opts.pair.unwrap_or(reachable)));
+    if let (Some(code), Ok(at)) = (gate.new_code(), listener.local_addr()) {
+        let host = crate::links::places()
+            .into_iter()
+            .find(|p| p.label == "this network")
+            .map_or("localhost".to_string(), |p| p.host);
+        let url = format!(
+            "http://{host}:{}/#pair={}&id={}",
+            at.port(),
+            code.replace('-', ""),
+            gate.fingerprint().unwrap_or_default()
+        );
+        eprintln!(
+            "rein-remote: or pair a device once, then no link is needed: open this machine's page on it (http://{host}:{}/) and enter {code}, or scan:",
+            at.port()
+        );
+        eprintln!("{}", crate::links::qr(&url));
+        eprintln!("rein-remote: (the code works for 10 minutes, once; `rein-remote paired` lists the devices)");
+    }
     let tls = match &opts.tls {
         Some((c, k)) => Some(crate::conn::tls_from_pem(c, k)?),
         None => None,
@@ -119,7 +146,7 @@ pub fn run(source: Box<dyn Source>, opts: Options) -> Result<(), String> {
     let wt: Arc<Option<(u16, Option<[u8; 32]>)>> = Arc::new(match (opts.webtransport, listener.local_addr()) {
         (true, Ok(at)) => {
             let (source, stats, o) = (source.clone(), stats.clone(), opts.clone());
-            match crate::link::webtransport(at, opts.token.clone(), opts.tls.clone(), move |link| {
+            match crate::link::webtransport(at, gate.clone(), opts.tls.clone(), move |link| {
                 if let Err(e) = session(link, source.clone(), stats.clone(), &o) {
                     eprintln!("rein-remote: {e}");
                 }
@@ -136,6 +163,18 @@ pub fn run(source: Box<dyn Source>, opts: Options) -> Result<(), String> {
         }
         _ => None,
     });
+    // Found on the local network (mDNS), when it's reachable from there: by its fingerprint, nothing secret.
+    let _advert = match listener.local_addr() {
+        Ok(at) if opts.mdns && at.ip().is_unspecified() => crate::identity::Identity::load_or_create()
+            .and_then(|id| {
+                let a = crate::discover::advertise(at.port(), &id.fingerprint(), wt.as_ref().as_ref().map(|w| w.0), opts.tls.is_some())?;
+                eprintln!("rein-remote: on this network as {} (id {})", crate::discover::machine_name(), id.fingerprint());
+                Ok(a)
+            })
+            .map_err(|e| eprintln!("rein-remote: not found by name on this network ({e})"))
+            .ok(),
+        _ => None,
+    };
     if let Some((relay, room, secret)) = opts.relay.clone() {
         let (source, stats, opts) = (source.clone(), stats.clone(), opts.clone());
         let page = relay.replacen("ws", "http", 1);
@@ -148,9 +187,9 @@ pub fn run(source: Box<dyn Source>, opts: Options) -> Result<(), String> {
     }
     for conn in listener.incoming() {
         let Ok(stream) = conn else { continue };
-        let (source, stats, opts, wt, tls) = (source.clone(), stats.clone(), opts.clone(), wt.clone(), tls.clone());
+        let (source, stats, opts, wt, tls, gate) = (source.clone(), stats.clone(), opts.clone(), wt.clone(), tls.clone(), gate.clone());
         std::thread::spawn(move || {
-            if let Err(e) = handle(stream, source, stats, &opts, &wt, tls.as_ref()).or_else(|e| if e.is_empty() { Ok(()) } else { Err(e) }) {
+            if let Err(e) = handle(stream, source, stats, &opts, &wt, tls.as_ref(), &gate).or_else(|e| if e.is_empty() { Ok(()) } else { Err(e) }) {
                 eprintln!("rein-remote: {e}");
             }
         });
@@ -199,6 +238,7 @@ fn handle(
     opts: &Options,
     wt: &Option<(u16, Option<[u8; 32]>)>,
     tls: Option<&Arc<rustls::ServerConfig>>,
+    gate: &crate::pairing::Gate,
 ) -> Result<(), String> {
     let mut conn = crate::conn::Conn::accept(stream, tls)?;
     let head = conn.read_head()?;
@@ -207,16 +247,25 @@ fn handle(
     let target = req.split_whitespace().nth(1).unwrap_or("/").to_string();
     let path = target.split(['?', '#']).next().unwrap_or("/").to_string();
     let upgrade = req.to_ascii_lowercase().contains("upgrade: websocket");
-    let token_ok = opts.token.as_deref().is_none_or(|t| {
-        let given = target
-            .split_once('?')
-            .map_or("", |(_, q)| q)
-            .split('&')
-            .find_map(|kv| kv.strip_prefix("token="))
-            .unwrap_or("");
-        // Compared in full, not stopping at the first difference.
-        given.len() == t.len() && given.bytes().zip(t.bytes()).fold(0u8, |d, (a, b)| d | (a ^ b)) == 0
-    });
+    let query = target.split_once('?').map_or("", |(_, q)| q.split('#').next().unwrap_or(""));
+    // The token or a paired device's ticket (compared in full, not stopping at the first difference).
+    let token_ok = gate.allows(query);
+    // Pairing and signing in: small forms, answered here.
+    let method = req.split_whitespace().next().unwrap_or("GET").to_string();
+    if path.starts_with("/pair/") || path.starts_with("/auth") {
+        let body = if method == "POST" {
+            read_body(&head, &req, &mut conn)?
+        } else {
+            String::new()
+        };
+        if let Some((status, json)) = gate.handle(&method, &path, query, &body) {
+            let resp = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{json}",
+                json.len()
+            );
+            return conn.write_all(resp.as_bytes()).map_err(|e| e.to_string());
+        }
+    }
     if (path.starts_with("/stream") || path == "/stats") && !token_ok {
         let _ = conn.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         return Ok(());
@@ -234,18 +283,20 @@ fn handle(
     let (status, kind, body) = match path.as_str() {
         "/" | "/index.html" => ("200 OK", "text/html; charset=utf-8", INDEX.to_string()),
         "/rein-remote.js" => ("200 OK", "text/javascript; charset=utf-8", CLIENT_JS.to_string()),
+        "/pair.js" => ("200 OK", "text/javascript; charset=utf-8", PAIR_JS.to_string()),
         "/stats" => ("200 OK", "application/json", stats_json(&stats.lock().unwrap())),
         // Where WebTransport is, and its certificate's SHA-256 when the browser has to be given it
         // (a self-signed one; a real certificate needs nothing).
-        "/info" => (
-            "200 OK",
-            "application/json",
-            match wt {
-                Some((port, Some(hash))) => format!(r#"{{"webtransport":{{"port":{port},"hash":{hash:?}}}}}"#),
-                Some((port, None)) => format!(r#"{{"webtransport":{{"port":{port},"hash":null}}}}"#),
-                None => r#"{"webtransport":null}"#.to_string(),
-            },
-        ),
+        "/info" => ("200 OK", "application/json", {
+            let wt = match wt {
+                Some((port, Some(hash))) => format!(r#"{{"port":{port},"hash":{hash:?}}}"#),
+                Some((port, None)) => format!(r#"{{"port":{port},"hash":null}}"#),
+                None => "null".to_string(),
+            };
+            // This machine's fingerprint (the page signs in to the one it paired with) when it pairs.
+            let id = gate.fingerprint().map_or("null".to_string(), |f| format!("\"{f}\""));
+            format!(r#"{{"webtransport":{wt},"id":{id}}}"#)
+        }),
         _ => ("404 Not Found", "text/plain", "not found".to_string()),
     };
     let resp = format!(
@@ -253,6 +304,34 @@ fn handle(
         body.len()
     );
     conn.write_all(resp.as_bytes()).map_err(|e| e.to_string())
+}
+
+/// A POST's form body (what came with the head, then the rest up to its Content-Length, 8 KB at most).
+fn read_body(head: &[u8], req: &str, conn: &mut crate::conn::Conn) -> Result<String, String> {
+    use std::io::Read;
+    let len: usize = req
+        .lines()
+        .find_map(|l| {
+            l.split_once(':')
+                .filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
+                .map(|(_, v)| v.trim().parse().unwrap_or(0))
+        })
+        .unwrap_or(0);
+    if len > 8192 {
+        return Err("a request body too big".into());
+    }
+    let at = head.windows(4).position(|w| w == b"\r\n\r\n").map_or(head.len(), |p| p + 4);
+    let mut body = head[at..].to_vec();
+    let mut b = [0u8; 1024];
+    while body.len() < len {
+        let n = conn.read(&mut b).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&b[..n]);
+    }
+    body.truncate(len);
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 /// A frame the encoder finished, out to the client: numbered, timed (reading, encoding) and kept for

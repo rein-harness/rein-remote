@@ -8,6 +8,7 @@
 //!   rein-remote serve --display 2          # a display (macOS: its number in `displays`; Linux: :N)
 //!   rein-remote windows [--json]           # the windows it can show
 //!   rein-remote displays                   # the displays (macOS)
+//!   rein-remote discover                   # Rein Remote servers on this network (mDNS)
 //!   rein-remote selftest --window Notepad --type hi   # capture works, and typing changes what's seen
 //!   rein-remote serve --listen 0.0.0.0:7979 --fps 60 --bitrate 8000   # --fps auto (the default): the viewer's display rate
 //!   rein-remote serve --listen 127.0.0.1:0 --token T   # a free port (printed), the stream needs ?token=T
@@ -16,12 +17,15 @@
 mod adapt;
 mod capture;
 mod conn;
+mod discover;
 mod e2e;
 mod encode;
 #[cfg(target_os = "macos")]
 mod encode_vt;
+mod identity;
 mod link;
 mod links;
+mod pairing;
 mod relay;
 mod serve;
 mod yuv;
@@ -30,7 +34,7 @@ use capture::{Source, TestPattern};
 
 fn usage() -> ! {
     eprintln!(
-        "rein-remote {}\n\nusage:\n  rein-remote serve [--display :N | --window APP|TITLE|ID | --app NAME | --vnc HOST:PORT [--vnc-password P] | --pipe WxH | --test-pattern [WxH]] [--listen ADDR] [--fps auto|N] [--codec h264|h265|auto] [--bitrate KBPS] [--token T] [--webtransport on|off] [--tls-cert PEM --tls-key PEM] [--tailscale-cert on|off] [--relay ws(s)://HOST:PORT [--room CODE] [--relay-secret S]]\n  rein-remote relay [--listen ADDR] [--secret S]\n  rein-remote windows [--json]\n  rein-remote displays\n  rein-remote selftest [--window Q | --display :N | --test-pattern] [--type TEXT]\n  rein-remote --version",
+        "rein-remote {}\n\nusage:\n  rein-remote serve [--display :N | --window APP|TITLE|ID | --app NAME | --vnc HOST:PORT [--vnc-password P] | --pipe WxH | --test-pattern [WxH]] [--listen ADDR] [--fps auto|N] [--codec h264|h265|auto] [--bitrate KBPS] [--token T] [--webtransport on|off] [--tls-cert PEM --tls-key PEM] [--tailscale-cert on|off] [--mdns on|off] [--pair on|off] [--relay ws(s)://HOST:PORT [--room CODE] [--relay-secret S]]\n  rein-remote relay [--listen ADDR] [--secret S]\n  rein-remote windows [--json]\n  rein-remote displays\n  rein-remote discover [SECONDS]\n  rein-remote paired | unpair ID\n  rein-remote selftest [--window Q | --display :N | --test-pattern] [--type TEXT]\n  rein-remote --version",
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(2);
@@ -54,6 +58,56 @@ fn main() {
                 std::process::exit(1);
             }
         },
+        Some("paired") => {
+            let list = pairing::devices();
+            if list.is_empty() {
+                eprintln!("rein-remote: no devices paired (serve shows a code to pair one)");
+            }
+            for d in list {
+                println!("{}  {}  (since {})", d.id, if d.name.is_empty() { "?" } else { &d.name }, d.since);
+            }
+        }
+        Some("unpair") => match args.get(1).map(|id| pairing::unpair(id)) {
+            Some(Ok(true)) => println!("rein-remote: unpaired"),
+            Some(Ok(false)) => {
+                eprintln!("rein-remote: no paired device has that id (rein-remote paired lists them)");
+                std::process::exit(1);
+            }
+            Some(Err(e)) => {
+                eprintln!("rein-remote: {e}");
+                std::process::exit(1);
+            }
+            None => usage(),
+        },
+        Some("discover") => {
+            let secs = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(3);
+            match discover::discover(std::time::Duration::from_secs(secs)) {
+                Ok(list) if list.is_empty() => eprintln!("rein-remote: none found on this network in {secs} s"),
+                Ok(list) => {
+                    for f in list {
+                        let addrs: Vec<String> = f.addrs.iter().map(|a| a.to_string()).collect();
+                        println!(
+                            "{}  {}://{}:{}  id {}{}{}",
+                            f.name,
+                            if f.https { "https" } else { "http" },
+                            addrs.first().map_or("?", |a| a.as_str()),
+                            f.port,
+                            f.id,
+                            f.webtransport.map_or(String::new(), |p| format!("  webtransport udp {p}")),
+                            if addrs.len() > 1 {
+                                format!("  (also {})", addrs[1..].join(", "))
+                            } else {
+                                String::new()
+                            }
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("rein-remote: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Some("relay") => {
             let (mut listen, mut secret) = ("0.0.0.0:7990".to_string(), std::env::var("REIN_REMOTE_RELAY_SECRET").ok());
             let mut it = args[1..].iter();
@@ -98,6 +152,8 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
         relay: None,
         tls: None,
         tailscale_cert: true,
+        mdns: true,
+        pair: None,
         e2e_key: {
             let mut k = [0u8; 32];
             let _ = getrandom::fill(&mut k);
@@ -150,6 +206,8 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
             "--tls-cert" => tls_cert = Some(std::path::PathBuf::from(val()?)),
             "--tls-key" => tls_key = Some(std::path::PathBuf::from(val()?)),
             "--tailscale-cert" => opts.tailscale_cert = !matches!(val()?.as_str(), "off" | "false" | "no"),
+            "--mdns" => opts.mdns = !matches!(val()?.as_str(), "off" | "false" | "no"),
+            "--pair" => opts.pair = Some(!matches!(val()?.as_str(), "off" | "false" | "no")),
             "--room" => room = Some(val()?),
             "--relay-secret" => relay_secret = Some(val()?),
             "--webtransport" => opts.webtransport = !matches!(val()?.as_str(), "off" | "false" | "no"),

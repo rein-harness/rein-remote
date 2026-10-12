@@ -14,19 +14,71 @@
     canvas { max-width: 100%; max-height: 100%; outline: none; background: #000; touch-action: none; }
     #kb { margin-left: auto; background: none; color: inherit; border: 1px solid #2a2b31; border-radius: 6px; font: inherit; padding: 2px 10px; display: none; flex-shrink: 0; }
     @media (pointer: coarse) { #kb { display: block; } }
+    #pair { display: none; flex-direction: column; gap: 10px; align-items: center; text-align: center; padding: 24px; max-width: 340px; }
+    #pair input { font: 28px ui-monospace, Menlo, monospace; letter-spacing: 4px; width: 9ch; text-align: center; background: #15161a; color: inherit; border: 1px solid #2a2b31; border-radius: 8px; padding: 6px; }
+    #pair button { font: inherit; background: #4cc9ff; color: #0b0c0e; border: 0; border-radius: 6px; padding: 6px 16px; }
+    #pair .why { color: #ff8080; min-height: 1em; }
   </style>
 </head>
 <body>
   <main>
     <div id="bar"><b>Rein Remote</b><span id="stats">connecting…</span><button id="kb" aria-label="Keyboard">⌨ keyboard</button></div>
-    <div id="screen"><canvas id="c"></canvas></div>
+    <div id="screen">
+      <form id="pair">
+        <b>Pair this device</b>
+        <span>Enter the code the machine shows (rein-remote prints it when it starts). Once paired, this browser connects with nothing to type.</span>
+        <input id="code" inputmode="numeric" autocomplete="one-time-code" placeholder="123-456" aria-label="Pairing code">
+        <button>Pair</button>
+        <span class="why" id="why"></span>
+      </form>
+      <canvas id="c"></canvas>
+    </div>
   </main>
   <script type="module">
     import {connect} from './rein-remote.js';
-    const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/stream${location.search}`;
-    // WebTransport (QUIC) when the server offers it and the browser has it; else the WebSocket.
+    import {pair, paired, signIn} from './pair.js';
+    const status = (t) => (document.getElementById('stats').textContent = t);
     const info = await fetch('/info').then((r) => r.json(), () => ({}));
-    const wt = info.webtransport && {url: `https://${location.hostname}:${info.webtransport.port}/stream${location.search}`, hash: info.webtransport.hash};
+    // No token in the link and a machine that pairs: sign in with this browser's key, pairing first if
+    // it hasn't (the code from a scanned QR code is in the address after #, never sent anywhere).
+    let search = location.search;
+    if (!new URLSearchParams(search).has('token') && info.id) {
+      const hash = new URLSearchParams(location.hash.slice(1));
+      if (hash.get('id') && hash.get('id') !== info.id) status(`careful: this isn't the machine the QR code was for (${info.id})`);
+      if (!paired(info.id)) {
+        const form = document.getElementById('pair'), input = document.getElementById('code');
+        form.style.display = 'flex';
+        document.getElementById('c').style.display = 'none';
+        input.value = hash.get('pair') ?? '';
+        await new Promise((done) => {
+          form.onsubmit = async (e) => {
+            e.preventDefault();
+            document.getElementById('why').textContent = 'pairing…';
+            try {
+              await pair(location.origin, input.value);
+              done();
+            } catch (err) {
+              document.getElementById('why').textContent = err.message;
+            }
+          };
+          if (input.value) form.requestSubmit();
+        });
+        form.style.display = 'none';
+        document.getElementById('c').style.display = '';
+        history.replaceState(null, '', location.pathname + location.search);
+      }
+      try {
+        const q = new URLSearchParams(search);
+        q.set('ticket', await signIn(location.origin, info.id));
+        search = `?${q}`;
+      } catch (err) {
+        status(err.message);
+        throw err;
+      }
+    }
+    const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/stream${search}`;
+    // WebTransport (QUIC) when the server offers it and the browser has it; else the WebSocket.
+    const wt = info.webtransport && {url: `https://${location.hostname}:${info.webtransport.port}/stream${search}`, hash: info.webtransport.hash};
     const s = connect(url, document.getElementById('c'), {webtransport: wt || undefined});
     window.reinRemote = s;
     document.getElementById('kb').onclick = () => s.keyboard();

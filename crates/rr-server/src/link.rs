@@ -208,7 +208,7 @@ impl Link for WtLink {
 /// With `tls` (a real certificate), the browser checks it as for any site and there's no hash.
 pub fn webtransport<F>(
     addr: std::net::SocketAddr,
-    token: Option<String>,
+    gate: Arc<crate::pairing::Gate>,
     tls: Option<(std::path::PathBuf, std::path::PathBuf)>,
     session: F,
 ) -> Result<Option<[u8; 32]>, String>
@@ -250,22 +250,14 @@ where
         rt.block_on(async move {
             loop {
                 let incoming = endpoint.accept().await;
-                let (session, token) = (session.clone(), token.clone());
+                let (session, gate) = (session.clone(), gate.clone());
                 tokio::spawn(async move {
                     let Ok(request) = incoming.await else { return };
-                    // The same token as the WebSocket's, in the session's path (?token=…).
-                    if let Some(t) = &token {
-                        let given = request
-                            .path()
-                            .split_once('?')
-                            .map_or("", |(_, q)| q)
-                            .split('&')
-                            .find_map(|kv| kv.strip_prefix("token="))
-                            .unwrap_or("");
-                        if given.len() != t.len() || given.bytes().zip(t.bytes()).fold(0u8, |d, (a, b)| d | (a ^ b)) != 0 {
-                            request.forbidden().await;
-                            return;
-                        }
+                    // The same gate as the WebSocket's: the token, or a paired device's ticket.
+                    let query = request.path().split_once('?').map_or("", |(_, q)| q).to_string();
+                    if !gate.allows(&query) {
+                        request.forbidden().await;
+                        return;
                     }
                     let Ok(conn) = request.accept().await else { return };
                     // The client opens the control stream first.
