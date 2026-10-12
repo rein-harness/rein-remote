@@ -123,7 +123,8 @@ rein-remote install-service … --print            # what it would install, noth
 rein-remote uninstall-service [relay] [--system]
 ```
 
-Secrets stay out of the service's command line: `token = { file = "/etc/rein-remote/token" }`. The
+Secrets stay out of the service's command line: `token = { file = "/etc/rein-remote/token" }`
+(for sign-in, `oidc-client-secret-file = "/etc/rein-remote/oidc-secret"`). The
 command line wins over the file. See [docs/verification/service-install.md](docs/verification/service-install.md).
 
 ### Signed binaries
@@ -131,6 +132,40 @@ command line wins over the file. See [docs/verification/service-install.md](docs
 Releases are signed when the repository has the certificates (macOS: Developer ID and notarized;
 Windows: Authenticode, timestamped), and `SHA256SUMS` is signed with cosign (Sigstore,
 keyless). To check a download: [docs/verification/signing.md](docs/verification/signing.md).
+
+### Optional: sign-in with your identity provider, policies, an audit log, recording
+
+For a machine several people use, viewers can sign in with your identity provider (OIDC: Okta,
+Microsoft Entra ID, Google, Keycloak…; or SAML) instead of holding a link, and a policy says what each
+may do:
+
+```sh
+rein-remote serve --public-url https://remote.example.com \
+  --oidc-issuer https://example.okta.com --oidc-client-id ID --oidc-client-secret-file secret.txt \
+  --policy policy.toml --audit audit.jsonl --record recordings/
+```
+
+- `--public-url`: how browsers reach this server (the provider sends them back to
+  `<url>/sso/oidc/callback`). The client secret comes from a file or `REIN_REMOTE_OIDC_CLIENT_SECRET`,
+  never the command line. `--oidc-user-claim` (default `email`) and `--oidc-groups-claim` (`groups`)
+  say which claims name the user and their groups.
+- SAML instead: `--saml-idp-metadata FILE|URL` (in builds with `--features saml`, which needs
+  libxmlsec1); the ACS is `<url>/sso/saml/acs`, this side's metadata `<url>/sso/saml/metadata`.
+- `--policy FILE` (TOML or JSON): rules by user, group or how a viewer came in (`oidc`, `saml`,
+  `token`, `paired`, `relay`), the first that matches decides: `view_only` (the server drops their
+  input), `clipboard`, `audio`, `sources` (which of this machine's displays or windows), `record`,
+  `max_session_minutes`. No rule: refused, with the reason. Without `--policy`, everyone who signs
+  in may watch and control. `clipboard = false` stops pastes from this version's clients; a viewer
+  who may control can still type, and an older web client sends a paste as typing. With `--relay`,
+  viewers through it are `via = ["relay"]`: no rule for them, no relayed viewers.
+- `--audit FILE`: a JSON line for each sign-in (and refusal), each session's start and end (who,
+  from where, over what, which rule, its recording) and each pairing. Never a token or a secret.
+- `--record DIR`: each session's video as it was sent (and its sound) in an MP4 that plays in any
+  player.
+
+The page shows who you're signed in as, "view only" and "● recorded". Links with a token and paired
+devices keep working when you give them (`--token`, `--pair on`). Setting it up with a real provider:
+[docs/verification/identity.md](docs/verification/identity.md).
 
 ## How it works
 

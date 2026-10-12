@@ -34,6 +34,20 @@ p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
 mdns-sd = { version = "0.21", default-features = false }
 qrcode = { version = "0.14", default-features = false }
 toml = { version = "0.9", default-features = false, features = ["parse", "preserve_order", "serde", "std"] }
+# Sign-in (OIDC): the IdP's discovery, keys and token endpoint over HTTPS; ID tokens checked with ring
+# (already in the tree through rustls).
+ring = "0.17"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "3.2", default-features = false, features = ["rustls"] }
+rustls-native-certs = "0.8"
+# SAML (`--features saml`): samael verifies signed assertions with xmlsec1 (needs libxml2, libxmlsec1
+# and clang to build), so it's off by default and built and tested in CI on Linux.
+samael = { version = "0.0.22", optional = true }
+
+[features]
+saml = ["dep:samael"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

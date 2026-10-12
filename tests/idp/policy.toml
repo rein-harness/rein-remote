@@ -1,0 +1,13 @@
+# The rig's policy: rr-admins may do everything (and are recorded), rr-viewers may only watch;
+# anyone else (carol) is refused.
+[[rule]]
+name = "admins"
+groups = ["rr-admins"]
+record = true
+
+[[rule]]
+name = "viewers"
+groups = ["rr-viewers"]
+view_only = true
+clipboard = false
+record = false

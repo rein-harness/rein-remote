@@ -21,6 +21,8 @@
 
 mod adapt;
 mod audio;
+mod audit;
+mod auth;
 mod capture;
 mod config;
 mod conn;
@@ -41,6 +43,8 @@ mod link;
 mod links;
 mod metrics;
 mod pairing;
+mod policy;
+mod record;
 mod relay;
 mod serve;
 mod service;
@@ -51,7 +55,7 @@ use capture::{Source, TestPattern};
 
 fn usage() -> ! {
     eprintln!(
-        "rein-remote {}\n\nusage:\n  rein-remote serve [--config FILE.toml] [--display :N | --window APP|TITLE|ID | --app NAME | --kms [CONNECTOR] | --vnc HOST:PORT [--vnc-password P] | --pipe WxH | --test-pattern [WxH] [--motion full]] [--listen ADDR] [--fps auto|N] [--codec h264|h265|auto] [--bitrate KBPS] [--token T] [--webtransport on|off] [--tls-cert PEM --tls-key PEM] [--tailscale-cert on|off] [--mdns on|off] [--pair on|off] [--relay ws(s)://HOST:PORT ... [--room CODE] [--relay-secret S]] [--audio on|off]\n  rein-remote relay [--config FILE.toml] [--listen ADDR] [--secret S] [--metrics-listen ADDR|PORT|off]\n  rein-remote install-service [serve|relay] [--config FILE.toml] [--system] [--name NAME] [--print]\n  rein-remote uninstall-service [serve|relay] [--system] [--name NAME] [--print]\n  rein-remote windows [--json]\n  rein-remote displays\n  rein-remote discover [SECONDS]\n  rein-remote paired | unpair ID\n  rein-remote connect URL|NAME [--seconds N] [--pair CODE] [--json] [--webtransport on|off] [--datagrams on|off] [--direct on|off]\n  rein-remote selftest [--window Q | --display :N | --kms [CONNECTOR] | --test-pattern [WxH]] [--type TEXT] [--encode OUT.h264 [--frames N]]\n  rein-remote --version",
+        "rein-remote {}\n\nusage:\n  rein-remote serve [--config FILE.toml] [--display :N | --window APP|TITLE|ID | --app NAME | --kms [CONNECTOR] | --vnc HOST:PORT [--vnc-password P] | --pipe WxH | --test-pattern [WxH] [--motion full]] [--listen ADDR] [--fps auto|N] [--codec h264|h265|auto] [--bitrate KBPS] [--token T] [--webtransport on|off] [--tls-cert PEM --tls-key PEM] [--tailscale-cert on|off] [--mdns on|off] [--pair on|off] [--relay ws(s)://HOST:PORT ... [--room CODE] [--relay-secret S]] [--audio on|off] [--public-url URL --oidc-issuer URL --oidc-client-id ID [--oidc-client-secret-file F] [--oidc-scopes S] [--oidc-user-claim C] [--oidc-groups-claim C] | --saml-idp-metadata FILE|URL [--saml-entity-id ID] [--saml-user-attr A] [--saml-groups-attr A]] [--policy FILE] [--audit FILE] [--record DIR]\n  rein-remote relay [--config FILE.toml] [--listen ADDR] [--secret S] [--metrics-listen ADDR|PORT|off]\n  rein-remote install-service [serve|relay] [--config FILE.toml] [--system] [--name NAME] [--print]\n  rein-remote uninstall-service [serve|relay] [--system] [--name NAME] [--print]\n  rein-remote windows [--json]\n  rein-remote displays\n  rein-remote discover [SECONDS]\n  rein-remote paired | unpair ID\n  rein-remote connect URL|NAME [--seconds N] [--pair CODE] [--json] [--webtransport on|off] [--datagrams on|off] [--direct on|off]\n  rein-remote selftest [--window Q | --display :N | --kms [CONNECTOR] | --test-pattern [WxH]] [--type TEXT] [--encode OUT.h264 [--frames N]]\n  rein-remote --version",
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(2);
@@ -216,7 +220,17 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
             let _ = getrandom::fill(&mut k);
             k
         },
+        signin: None,
+        policy: None,
+        audit: Default::default(),
+        record: None,
+        source_label: String::new(),
     };
+    // Sign-in with an identity provider; a policy; the audit log; recording.
+    let (mut public_url, mut oidc_issuer, mut oidc_client, mut oidc_secret_file) = (None, None, None, None);
+    let (mut oidc_scopes, mut oidc_user_claim, mut oidc_groups_claim) = ("openid email profile".to_string(), "email".to_string(), "groups".to_string());
+    let (mut saml_metadata, mut saml_entity, mut saml_user_attr, mut saml_groups_attr) = (None, None, None, "groups".to_string());
+    let (mut policy, mut audit) = (None, None);
     let (mut relay, mut room, mut relay_secret) = (Vec::new(), None, std::env::var("REIN_REMOTE_RELAY_SECRET").ok());
     let (mut tls_cert, mut tls_key) = (None, None);
     let mut display: Option<String> = None;
@@ -265,6 +279,21 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
             }
             "--vnc-password" => vnc_password = Some(val()?),
             "--token" => opts.token = Some(val()?),
+            "--public-url" => public_url = Some(val()?),
+            "--oidc-issuer" => oidc_issuer = Some(val()?),
+            "--oidc-client-id" => oidc_client = Some(val()?),
+            "--oidc-client-secret-file" => oidc_secret_file = Some(val()?),
+            "--oidc-client-secret" => return Err("the client secret goes in a file (--oidc-client-secret-file) or REIN_REMOTE_OIDC_CLIENT_SECRET, never on the command line (where `ps` shows it)".into()),
+            "--oidc-scopes" => oidc_scopes = val()?,
+            "--oidc-user-claim" => oidc_user_claim = val()?,
+            "--oidc-groups-claim" => oidc_groups_claim = val()?,
+            "--saml-idp-metadata" => saml_metadata = Some(val()?),
+            "--saml-entity-id" => saml_entity = Some(val()?),
+            "--saml-user-attr" => saml_user_attr = Some(val()?),
+            "--saml-groups-attr" => saml_groups_attr = val()?,
+            "--policy" => policy = Some(val()?),
+            "--audit" => audit = Some(val()?),
+            "--record" => opts.record = Some(std::path::PathBuf::from(val()?)),
             // Again (or A,B): a fleet.
             "--relay" => relay.push(val()?),
             "--tls-cert" => tls_cert = Some(std::path::PathBuf::from(val()?)),
@@ -304,9 +333,30 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
         (None, None) => {}
         _ => return Err("--tls-cert and --tls-key go together".into()),
     }
-    // Reachable from other machines: never without a token (the link carries it).
+    if let Some(p) = &policy {
+        opts.policy = Some(policy::Policy::load(std::path::Path::new(p))?);
+    }
+    if let Some(a) = &audit {
+        opts.audit = std::sync::Arc::new(audit::Audit::open(std::path::Path::new(a))?);
+    }
+    opts.signin = signin(SignInArgs {
+        public_url,
+        oidc_issuer,
+        oidc_client,
+        oidc_secret_file,
+        oidc_scopes,
+        oidc_user_claim,
+        oidc_groups_claim,
+        saml_metadata,
+        saml_entity,
+        saml_user_attr,
+        saml_groups_attr,
+    })?
+    .map(std::sync::Arc::new);
+    // Reachable from other machines: never without a token (the link carries it), unless viewers sign
+    // in with the identity provider instead (then a token only when one is given).
     let loopback = opts.listen.starts_with("127.") || opts.listen.starts_with("localhost") || opts.listen.starts_with("[::1]");
-    if opts.token.is_none() && !loopback {
+    if opts.token.is_none() && !loopback && opts.signin.is_none() {
         let mut b = [0u8; 24];
         let _ = getrandom::fill(&mut b);
         const ALPHABET: &[u8] = b"abcdefghijkmnpqrstuvwxyz23456789";
@@ -326,6 +376,16 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
         }
         opts.relay = Some((relay, room, relay_secret));
     }
+    // What it shows, as a policy's `sources` names it.
+    opts.source_label = match (&pattern, &window) {
+        (Some(_), _) => "test-pattern".into(),
+        (None, _) if kms.is_some() => "kms".into(),
+        (None, _) if pipe.is_some() => "pipe".into(),
+        (None, _) if vnc.is_some() => format!("vnc:{}", vnc.as_deref().unwrap()),
+        (None, Some(q)) => format!("window:{q}"),
+        (None, None) if app.is_some() => format!("app:{}", app.as_deref().unwrap()),
+        (None, None) => display.as_ref().map_or("display".into(), |d| format!("display:{d}")),
+    };
     let elsewhere = || if sound == Some(true) { Sound::System } else { Sound::Off };
     let (source, with): (Box<dyn Source>, Sound) = match (pattern, window) {
         (Some((w, h)), _) if full_motion => (Box::new(TestPattern::full_motion(w, h)), Sound::Tone),
@@ -342,6 +402,86 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
     };
     opts.audio = audio::Audio::new(if sound == Some(false) { Sound::Off } else { with });
     serve::run(source, opts)
+}
+
+struct SignInArgs {
+    public_url: Option<String>,
+    oidc_issuer: Option<String>,
+    oidc_client: Option<String>,
+    oidc_secret_file: Option<String>,
+    oidc_scopes: String,
+    oidc_user_claim: String,
+    oidc_groups_claim: String,
+    saml_metadata: Option<String>,
+    saml_entity: Option<String>,
+    saml_user_attr: Option<String>,
+    saml_groups_attr: String,
+}
+
+/// Sign-in with an identity provider, as the flags set it up (None: not asked for). The provider is
+/// reached now, so a wrong issuer or metadata fails at start, not when someone signs in.
+fn signin(a: SignInArgs) -> Result<Option<auth::SignIn>, String> {
+    if a.oidc_issuer.is_none() && a.saml_metadata.is_none() {
+        if a.oidc_client.is_some() || a.public_url.is_some() {
+            return Err("--oidc-client-id and --public-url go with --oidc-issuer (or --saml-idp-metadata)".into());
+        }
+        return Ok(None);
+    }
+    // Where the provider sends browsers back: it must be told exactly (never guessed from a request).
+    let public = a.public_url.ok_or(
+        "sign-in needs --public-url (how browsers reach this server, e.g. https://remote.example.com), the address the identity provider sends them back to",
+    )?;
+    if !(public.starts_with("https://") || public.starts_with("http://")) || public.contains('?') || public.contains('#') {
+        return Err(format!("--public-url {public}: an http(s):// URL with no query"));
+    }
+    if public.starts_with("http://") {
+        eprintln!("rein-remote: --public-url is plain HTTP: the session cookie isn't Secure (for a test setup only)");
+    }
+    let mut s = auth::SignIn::new(&public);
+    if let Some(issuer) = a.oidc_issuer {
+        let client_id = a.oidc_client.ok_or("--oidc-issuer needs --oidc-client-id")?;
+        // The secret from a file or the environment (a command line shows in `ps`).
+        let client_secret = match a.oidc_secret_file {
+            Some(f) => Some(
+                std::fs::read_to_string(&f)
+                    .map_err(|e| format!("--oidc-client-secret-file {f}: {e}"))?
+                    .trim()
+                    .to_string(),
+            ),
+            None => std::env::var("REIN_REMOTE_OIDC_CLIENT_SECRET").ok().filter(|v| !v.is_empty()),
+        };
+        let o = auth::oidc::Oidc::discover(auth::oidc::Config {
+            issuer,
+            client_id,
+            client_secret,
+            redirect_uri: format!("{}/sso/oidc/callback", s.public_url),
+            scopes: a.oidc_scopes,
+            user_claim: a.oidc_user_claim,
+            groups_claim: a.oidc_groups_claim,
+        })
+        .map_err(|e| format!("OIDC: {e}"))?;
+        eprintln!("rein-remote: OIDC with {} (redirect URI {}/sso/oidc/callback)", o.issuer(), s.public_url);
+        s.oidc = Some(o);
+    }
+    if let Some(m) = a.saml_metadata {
+        #[cfg(feature = "saml")]
+        {
+            let entity = a.saml_entity.unwrap_or_else(|| format!("{}/sso/saml/metadata", s.public_url));
+            let saml = auth::saml::Saml::new(&m, &entity, &s.public_url, a.saml_user_attr, a.saml_groups_attr).map_err(|e| format!("SAML: {e}"))?;
+            eprintln!(
+                "rein-remote: SAML with {} (this service provider: {entity}, ACS {}/sso/saml/acs)",
+                saml.idp_entity(),
+                s.public_url
+            );
+            s.saml = Some(saml);
+        }
+        #[cfg(not(feature = "saml"))]
+        {
+            let _ = (m, a.saml_entity, a.saml_user_attr, a.saml_groups_attr);
+            return Err("this build has no SAML (build with `--features saml`, which needs libxmlsec1)".into());
+        }
+    }
+    Ok(Some(s))
 }
 
 /// `--test-pattern`'s optional size (the next argument when it's WxH).

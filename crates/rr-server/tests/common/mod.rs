@@ -99,7 +99,11 @@ pub fn get(addr: &str, path: &str, headers: &str) -> (u16, String) {
     use std::io::{Read, Write};
     let mut s = std::net::TcpStream::connect(addr).expect("connects");
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    write!(s, "GET {path} HTTP/1.1\r\nHost: {addr}\r\n{headers}Connection: close\r\n\r\n").unwrap();
+    // A server that closed before reading (one just restarted on this address) is "no answer yet"
+    // (status 0) for the callers that poll, not a panic.
+    if write!(s, "GET {path} HTTP/1.1\r\nHost: {addr}\r\n{headers}Connection: close\r\n\r\n").is_err() {
+        return (0, String::new());
+    }
     let mut out = String::new();
     let _ = s.read_to_string(&mut out);
     let status = out.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);

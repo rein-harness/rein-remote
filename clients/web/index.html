@@ -42,7 +42,23 @@
     // No token in the link and a machine that pairs: sign in with this browser's key, pairing first if
     // it hasn't (the code from a scanned QR code is in the address after #, never sent anywhere).
     let search = location.search;
-    if (!new URLSearchParams(search).has('token') && info.id) {
+    // Signed in with the machine's identity provider: this browser's sign-in, traded for a ticket for
+    // the stream (a browser sends no cookie with WebTransport); not signed in yet, off to sign in.
+    if (!new URLSearchParams(search).has('token') && info.signin) {
+      const r = await fetch('/sso/ticket', {method: 'POST', credentials: 'same-origin'});
+      const j = await r.json().catch(() => ({}));
+      if (r.status === 401) {
+        location.href = `/sso/login?next=${encodeURIComponent(location.pathname + location.search)}`;
+        await new Promise(() => {});
+      }
+      if (!r.ok) {
+        status(j.error ?? `not allowed (${r.status})`);
+        throw new Error(j.error);
+      }
+      const q = new URLSearchParams(search);
+      q.set('ticket', j.ticket);
+      search = `?${q}`;
+    } else if (!new URLSearchParams(search).has('token') && info.id) {
       const hash = new URLSearchParams(location.hash.slice(1));
       if (hash.get('id') && hash.get('id') !== info.id) status(`careful: this isn't the machine the QR code was for (${info.id})`);
       if (!paired(info.id)) {
@@ -90,7 +106,10 @@
       const a = t.audio;
       const av = [...(t.avSyncMs ?? [])].sort((x, y) => x - y);
       const sound = !a || !a.packets ? '' : a.state !== 'running' ? ' · sound: tap to hear it' : ` · sound ${a.offsetMs ?? '…'} ms${a.holdMs ? ` (picture waits ${Math.round(a.holdMs)} ms for it)` : ''}${av.length ? ` · sound after picture ${av[av.length >> 1]} ms` : ''}`;
-      document.getElementById('stats').textContent = `${t.state} · ${t.transport || '…'} · ${t.decoder || '…'} · ${t.frames} frames (${t.fps} fps${t.refreshHz ? `, display ${Math.round(t.refreshHz)} Hz` : ""}) · ${(t.bytes / 1e6).toFixed(1)} MB · rtt ${t.rttMs.toFixed(0)} ms${glass}${sound}${t.error ? ' · ' + t.error : ''}`;
+      // Who the server took this viewer for, and what it may do.
+      const ac = t.access;
+      const who = !ac ? '' : `${ac.user}${ac.viewOnly ? ' (view only)' : ''}${ac.recorded ? ' · ● recorded' : ''} · `;
+      document.getElementById('stats').textContent = `${who}${t.state} · ${t.transport || '…'} · ${t.decoder || '…'} · ${t.frames} frames (${t.fps} fps${t.refreshHz ? `, display ${Math.round(t.refreshHz)} Hz` : ""}) · ${(t.bytes / 1e6).toFixed(1)} MB · rtt ${t.rttMs.toFixed(0)} ms${glass}${sound}${t.error ? ' · ' + t.error : ''}`;
     }, 500);
   </script>
 </body>

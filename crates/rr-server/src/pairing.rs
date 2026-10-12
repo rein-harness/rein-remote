@@ -10,9 +10,14 @@
 //! The code is printed when the server starts (and as a QR code), lasts ten minutes, and is spent
 //! after a pairing or five wrong tries: an attacker gets five guesses at a million codes.
 
+use crate::audit::Audit;
+use crate::auth::{random_hex, Admission, Principal, SignIn};
 use crate::identity::{fingerprint, verify, Identity};
+use crate::policy::{Decision, Perms, Policy};
 use rr_proto::pair::{client_auth_message, confirm_eq, key_mac, server_auth_message, Keys, Role, Spake};
+use sha2::Digest;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -29,15 +34,23 @@ struct Code {
     sessions: HashMap<String, (Keys, Instant)>,
 }
 
-/// The gate in front of the stream.
+/// The gate in front of the stream: who a viewer is (the link's token, a paired device's ticket, a
+/// browser signed in with the identity provider) and what the policy lets them do.
 pub struct Gate {
     token: Option<String>,
     identity: Option<Identity>,
     code: Mutex<Option<Code>>,
-    tickets: Mutex<HashMap<String, Instant>>,
-    /// Tickets for one session (a direct path offered inside a relayed session).
-    once: Mutex<HashMap<String, Instant>>,
+    /// Tickets (a minute's use), by their SHA-256, with who they're for.
+    tickets: Mutex<HashMap<[u8; 32], (Instant, Principal)>>,
+    /// Tickets for one session (a direct path offered inside a relayed session), by their SHA-256.
+    once: Mutex<HashMap<[u8; 32], (Instant, Principal)>>,
     challenges: Mutex<HashMap<Vec<u8>, Instant>>,
+    /// Sign-in with an identity provider, when it's set up.
+    pub signin: Option<Arc<SignIn>>,
+    pub policy: Option<Policy>,
+    pub audit: Arc<Audit>,
+    /// What this server shows, as a policy's `sources` name it (`display`, `window:Simulator`…).
+    pub source: String,
 }
 
 /// A device that paired.
@@ -176,12 +189,25 @@ impl Gate {
             tickets: Mutex::new(HashMap::new()),
             once: Mutex::new(HashMap::new()),
             challenges: Mutex::new(HashMap::new()),
+            signin: None,
+            policy: None,
+            audit: Arc::default(),
+            source: String::new(),
         }
     }
 
-    /// Whether anything at all guards the stream (a token, or pairing).
+    /// With sign-in, a policy, an audit log, and the name of what it shows.
+    pub fn with_access(mut self, signin: Option<Arc<SignIn>>, policy: Option<Policy>, audit: Arc<Audit>, source: String) -> Self {
+        self.signin = signin;
+        self.policy = policy;
+        self.audit = audit;
+        self.source = source;
+        self
+    }
+
+    /// Whether anything at all guards the stream (a token, pairing, or sign-in).
     pub fn guarded(&self) -> bool {
-        self.token.is_some() || self.identity.is_some()
+        self.token.is_some() || self.identity.is_some() || self.signin.is_some()
     }
 
     pub fn fingerprint(&self) -> Option<String> {
@@ -208,39 +234,94 @@ impl Gate {
     }
 
     /// Whether a request's query (`token=…` or `ticket=…`) lets it in.
+    #[cfg(test)]
     pub fn allows(&self, query: &str) -> bool {
+        self.admit(query, None).is_some()
+    }
+
+    /// Who a request is: by the query's `token=` or `ticket=`, or a signed-in browser's session cookie
+    /// (`cookies`: the Cookie header, only from this server's own page). None: not let in.
+    pub fn admit(&self, query: &str, cookies: Option<&str>) -> Option<Principal> {
         if !self.guarded() {
-            return true;
+            return Some(Principal::new("anyone", "open"));
         }
         let q = form(query);
         if let (Some(t), Some(given)) = (&self.token, q.get("token")) {
             if same(t, given) {
-                return true;
+                return Some(Principal::new("token", "token"));
             }
         }
         if let Some(given) = q.get("ticket") {
+            // By the ticket's hash: nothing here depends on how much of the secret matched.
+            let key: [u8; 32] = sha2::Sha256::digest(given.as_bytes()).into();
             let mut once = self.once.lock().unwrap();
-            once.retain(|_, exp| *exp > Instant::now());
-            if let Some(t) = once.keys().find(|t| same(t, given)).cloned() {
-                once.remove(&t);
-                return true;
+            once.retain(|_, (exp, _)| *exp > Instant::now());
+            if let Some((_, p)) = once.remove(&key) {
+                return Some(p);
             }
             drop(once);
             let mut tickets = self.tickets.lock().unwrap();
-            tickets.retain(|_, exp| *exp > Instant::now());
+            tickets.retain(|_, (exp, _)| *exp > Instant::now());
             // A minute's use (the page tries WebTransport, then the WebSocket, with the same one).
-            return tickets.keys().any(|t| same(t, given));
+            if let Some((_, p)) = tickets.get(&key) {
+                return Some(p.clone());
+            }
         }
-        false
+        if let (Some(s), Some(c)) = (&self.signin, cookies) {
+            return s.session(c);
+        }
+        None
     }
 
-    /// A ticket that lets one session in, within a minute (a direct path offered to a viewer who came
-    /// through the relay: it opens WebTransport straight here with it).
-    pub fn ticket_once(&self) -> String {
-        let t = hex(&random(24));
+    /// What the policy lets `p` do here (everything, without a policy).
+    pub fn decide(&self, p: &Principal) -> Decision {
+        match &self.policy {
+            Some(policy) => policy.decide(&p.who(), &self.source),
+            None => Decision::Allow {
+                rule: "none".into(),
+                perms: Perms::FULL,
+            },
+        }
+    }
+
+    /// `p` let in for a session over `transport` from `addr`, or why not (said in the audit log).
+    pub fn admission(&self, p: Principal, transport: &'static str, addr: String) -> Result<Admission, String> {
+        match self.decide(&p) {
+            Decision::Allow { rule, perms } => Ok(Admission {
+                id: random_hex(8),
+                principal: p,
+                rule,
+                perms,
+                transport,
+                addr,
+            }),
+            Decision::Deny { rule, reason } => {
+                self.audit.log(
+                    "session_refused",
+                    serde_json::json!({"user": p.user, "groups": p.groups, "via": p.via, "addr": addr, "transport": transport, "source": self.source, "rule": rule, "reason": reason}),
+                );
+                eprintln!("rein-remote: refused {} ({reason})", p.user);
+                Err(reason)
+            }
+        }
+    }
+
+    /// A ticket for `p` (a minute's use): the page puts it on the stream's URL.
+    pub fn ticket_for(&self, p: Principal) -> String {
+        let t = random_hex(24);
+        let mut tickets = self.tickets.lock().unwrap();
+        tickets.retain(|_, (exp, _)| *exp > Instant::now());
+        tickets.insert(sha2::Sha256::digest(t.as_bytes()).into(), (Instant::now() + TICKET_LIFE, p));
+        t
+    }
+
+    /// A ticket that lets one session in, within a minute, as `p` (a direct path offered to a viewer
+    /// who came through the relay: it opens WebTransport straight here with it).
+    pub fn ticket_once(&self, p: Principal) -> String {
+        let t = random_hex(24);
         let mut once = self.once.lock().unwrap();
-        once.retain(|_, exp| *exp > Instant::now());
-        once.insert(t.clone(), Instant::now() + TICKET_LIFE);
+        once.retain(|_, (exp, _)| *exp > Instant::now());
+        once.insert(sha2::Sha256::digest(t.as_bytes()).into(), (Instant::now() + TICKET_LIFE, p));
         t
     }
 
@@ -371,14 +452,17 @@ impl Gate {
         }
         let key = f.get("key").and_then(|x| unhex(x)).unwrap_or_default();
         let sig = f.get("sig").and_then(|x| unhex(x)).unwrap_or_default();
-        let known = devices().into_iter().any(|d| confirm_eq(&d.public, &key));
-        if !known || !verify(&key, &client_auth_message(&nonce, &id.public()), &sig) {
+        let known = devices().into_iter().find(|d| confirm_eq(&d.public, &key));
+        let Some(device) = known.filter(|_| verify(&key, &client_auth_message(&nonce, &id.public()), &sig)) else {
             return error("403 Forbidden", "this device isn't paired with this machine");
-        }
-        let ticket = hex(&random(24));
-        let mut t = self.tickets.lock().unwrap();
-        t.retain(|_, exp| *exp > Instant::now());
-        t.insert(ticket.clone(), Instant::now() + TICKET_LIFE);
+        };
+        // The device by its name (and its fingerprint, which a policy can name too).
+        let user = if device.name.is_empty() {
+            format!("device {}", device.id)
+        } else {
+            format!("{} ({})", device.name, device.id)
+        };
+        let ticket = self.ticket_for(Principal::new(user, "paired"));
         ("200 OK", format!(r#"{{"ticket":"{ticket}"}}"#))
     }
 }
@@ -445,6 +529,8 @@ mod tests {
         let (st, t) = gate.handle("POST", "/auth", "", &body).unwrap();
         assert_eq!(st, "200 OK");
         assert!(gate.allows(&format!("ticket={}", json(&t, "ticket"))));
+        let p = gate.admit(&format!("ticket={}", json(&t, "ticket")), None).unwrap();
+        assert_eq!((p.user.as_str(), p.via), (format!("test phone ({})", fingerprint(&public)).as_str(), "paired"));
         assert!(!gate.allows("ticket=abc"));
         // The same challenge doesn't answer twice; an unknown key isn't let in.
         assert_eq!(gate.handle("POST", "/auth", "", &body).unwrap().0, "403 Forbidden");
@@ -492,7 +578,7 @@ mod tests {
     #[test]
     fn a_ticket_for_one_session_lets_one_in() {
         let gate = Gate::new(Some("tok".into()), false);
-        let t = gate.ticket_once();
+        let t = gate.ticket_once(Principal::new("relay viewer", "relay"));
         assert!(!gate.allows("ticket=nope"));
         assert!(gate.allows(&format!("ticket={t}&direct=1")));
         assert!(!gate.allows(&format!("ticket={t}")), "spent");
