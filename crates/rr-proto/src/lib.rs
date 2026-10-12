@@ -21,6 +21,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod fec;
 mod wire;
 
 pub use wire::{Reader, Writer};
