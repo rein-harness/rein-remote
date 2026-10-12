@@ -511,7 +511,8 @@ mod tests {
             std::fs::write(&path, &want).unwrap();
         }
         assert_eq!(
-            std::fs::read_to_string(&path).ok().as_deref(),
+            // (A Windows checkout may have turned its line ends into CRLF.)
+            std::fs::read_to_string(&path).ok().map(|s| s.replace("\r\n", "\n")).as_deref(),
             Some(want.as_str()),
             "run with RR_WRITE_VECTORS=1 to update {path}"
         );

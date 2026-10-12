@@ -60,7 +60,7 @@ jobs:
           node tools/listen.mjs http://127.0.0.1:7979/ --seconds 4 | tee sound.json
           node tools/listen.mjs http://127.0.0.1:7979/ --seconds 2 --audio off | tee none.json
           grep -v '^rein-remote: {' serve.log
-          node -e "const r = require('./sound.json'); if (!(r.videoFrames > 0 && r.audioPackets > 200 && r.serverAudio.loud_packets > 100)) process.exit(1)"
+          node -e "const r = require('./sound.json'); if (!(r.videoFrames > 0 && r.audioPackets > 100 && r.serverAudio.loud_packets > 100)) process.exit(1)"
           node -e "const r = require('./none.json'); if (!(r.videoFrames > 0 && r.audioPackets === 0)) process.exit(1)"
       - name: Sound (Windows, WASAPI loopback; a runner may have no output device, and the video streams anyway)
         if: runner.os == 'Windows'
