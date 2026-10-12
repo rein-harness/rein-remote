@@ -1,0 +1,57 @@
+{
+  "realm": "rr",
+  "enabled": true,
+  "sslRequired": "none",
+  "groups": [{"name": "rr-admins"}, {"name": "rr-viewers"}],
+  "users": [
+    {"username": "alice", "email": "alice@corp.example", "emailVerified": true, "firstName": "Alice", "lastName": "Admin", "enabled": true,
+     "credentials": [{"type": "password", "value": "alice-pw", "temporary": false}], "groups": ["/rr-admins"]},
+    {"username": "bob", "email": "bob@corp.example", "emailVerified": true, "firstName": "Bob", "lastName": "Viewer", "enabled": true,
+     "credentials": [{"type": "password", "value": "bob-pw", "temporary": false}], "groups": ["/rr-viewers"]},
+    {"username": "carol", "email": "carol@corp.example", "emailVerified": true, "firstName": "Carol", "lastName": "Nobody", "enabled": true,
+     "credentials": [{"type": "password", "value": "carol-pw", "temporary": false}]}
+  ],
+  "clients": [
+    {
+      "clientId": "rein-remote",
+      "name": "Rein Remote (OIDC)",
+      "protocol": "openid-connect",
+      "enabled": true,
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "rr-test-oidc-secret",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": ["http://rr.test:7979/sso/oidc/callback"],
+      "webOrigins": ["http://rr.test:7979"],
+      "attributes": {"pkce.code.challenge.method": "S256"},
+      "protocolMappers": [
+        {"name": "groups", "protocol": "openid-connect", "protocolMapper": "oidc-group-membership-mapper",
+         "config": {"claim.name": "groups", "full.path": "false", "id.token.claim": "true", "access.token.claim": "false", "userinfo.token.claim": "true"}}
+      ]
+    },
+    {
+      "clientId": "rein-remote-saml",
+      "name": "Rein Remote (SAML)",
+      "protocol": "saml",
+      "enabled": true,
+      "frontchannelLogout": false,
+      "redirectUris": ["http://rr.test:7980/sso/saml/acs"],
+      "attributes": {
+        "saml_assertion_consumer_url_post": "http://rr.test:7980/sso/saml/acs",
+        "saml.assertion.signature": "true",
+        "saml.server.signature": "true",
+        "saml.signature.algorithm": "RSA_SHA256",
+        "saml.client.signature": "false",
+        "saml.authnstatement": "true",
+        "saml_name_id_format": "email",
+        "saml_force_name_id_format": "true",
+        "saml.force.post.binding": "true"
+      },
+      "protocolMappers": [
+        {"name": "groups", "protocol": "saml", "protocolMapper": "saml-group-membership-mapper",
+         "config": {"attribute.name": "groups", "attribute.nameformat": "Basic", "full.path": "false", "single": "false"}}
+      ]
+    }
+  ]
+}
