@@ -1,6 +1,7 @@
 //! Little-endian primitives for frame bodies.
 
 use crate::Error;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 #[derive(Default)]
 pub struct Writer(Vec<u8>);
@@ -37,6 +38,28 @@ impl Writer {
     pub fn bytes(&mut self, b: &[u8]) {
         self.u32(b.len() as u32);
         self.0.extend_from_slice(b);
+    }
+    /// An address: family (4 or 6), the address's bytes, the port.
+    pub fn addr(&mut self, a: &SocketAddr) {
+        match a.ip() {
+            IpAddr::V4(v) => {
+                self.u8(4);
+                self.0.extend_from_slice(&v.octets());
+            }
+            IpAddr::V6(v) => {
+                self.u8(6);
+                self.0.extend_from_slice(&v.octets());
+            }
+        }
+        self.u16(a.port());
+    }
+    /// Addresses: a count (u8, so 255 at most), then each.
+    pub fn addrs(&mut self, list: &[SocketAddr]) {
+        let n = list.len().min(255);
+        self.u8(n as u8);
+        for a in &list[..n] {
+            self.addr(a);
+        }
     }
 }
 
@@ -81,6 +104,18 @@ impl<'a> Reader<'a> {
     pub fn bytes(&mut self) -> Result<&'a [u8], Error> {
         let n = self.u32()? as usize;
         self.take(n)
+    }
+    pub fn addr(&mut self) -> Result<SocketAddr, Error> {
+        let ip = match self.u8()? {
+            4 => IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(self.take(4)?).unwrap())),
+            6 => IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(self.take(16)?).unwrap())),
+            _ => return Err(Error::Malformed("address family")),
+        };
+        Ok(SocketAddr::new(ip, self.u16()?))
+    }
+    pub fn addrs(&mut self) -> Result<Vec<SocketAddr>, Error> {
+        let n = self.u8()? as usize;
+        (0..n).map(|_| self.addr()).collect()
     }
     /// Bytes left in the body: a field added in a later version is there only when this is non-zero.
     pub fn remaining(&self) -> usize {

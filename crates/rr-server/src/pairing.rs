@@ -35,6 +35,8 @@ pub struct Gate {
     identity: Option<Identity>,
     code: Mutex<Option<Code>>,
     tickets: Mutex<HashMap<String, Instant>>,
+    /// Tickets for one session (a direct path offered inside a relayed session).
+    once: Mutex<HashMap<String, Instant>>,
     challenges: Mutex<HashMap<Vec<u8>, Instant>>,
 }
 
@@ -172,6 +174,7 @@ impl Gate {
             identity,
             code: Mutex::new(None),
             tickets: Mutex::new(HashMap::new()),
+            once: Mutex::new(HashMap::new()),
             challenges: Mutex::new(HashMap::new()),
         }
     }
@@ -211,12 +214,29 @@ impl Gate {
             }
         }
         if let Some(given) = q.get("ticket") {
+            let mut once = self.once.lock().unwrap();
+            once.retain(|_, exp| *exp > Instant::now());
+            if let Some(t) = once.keys().find(|t| same(t, given)).cloned() {
+                once.remove(&t);
+                return true;
+            }
+            drop(once);
             let mut tickets = self.tickets.lock().unwrap();
             tickets.retain(|_, exp| *exp > Instant::now());
             // A minute's use (the page tries WebTransport, then the WebSocket, with the same one).
             return tickets.keys().any(|t| same(t, given));
         }
         false
+    }
+
+    /// A ticket that lets one session in, within a minute (a direct path offered to a viewer who came
+    /// through the relay: it opens WebTransport straight here with it).
+    pub fn ticket_once(&self) -> String {
+        let t = hex(&random(24));
+        let mut once = self.once.lock().unwrap();
+        once.retain(|_, exp| *exp > Instant::now());
+        once.insert(t.clone(), Instant::now() + TICKET_LIFE);
+        t
     }
 
     /// The pairing and sign-in routes: `Some((status, json))` when `path` is one of them.
@@ -462,6 +482,16 @@ mod tests {
         );
         std::env::remove_var("REIN_REMOTE_HOME");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_ticket_for_one_session_lets_one_in() {
+        let gate = Gate::new(Some("tok".into()), false);
+        let t = gate.ticket_once();
+        assert!(!gate.allows("ticket=nope"));
+        assert!(gate.allows(&format!("ticket={t}&direct=1")));
+        assert!(!gate.allows(&format!("ticket={t}")), "spent");
+        assert!(gate.allows("token=tok"));
     }
 
     #[test]

@@ -1,8 +1,12 @@
 //! `rein-remote relay`: for a machine you can't reach directly (behind NAT, a firewall, no Tailscale).
 //! The machine connects out to the relay (`serve --relay`), a viewer opens the relay's page with the
 //! room's code, and the relay pairs them and passes their messages along. Self-hosted: run it
-//! anywhere both can reach (a small VPS), behind HTTPS for wss://. It sees the stream as it passes
-//! (TLS protects it on the way, not from the relay itself); end-to-end encryption is on the roadmap.
+//! anywhere both can reach (a small VPS), behind HTTPS for wss://. What it passes is sealed end to end
+//! (the key is in the viewer's link after #, which it never sees).
+//!
+//! It also answers on UDP, on the same port: "what address do you see me from?" (rr-proto's `punch`),
+//! for a room it has open. That's how a host and a native viewer learn their addresses beyond their
+//! NATs and go straight to each other (rr-client's `direct`); the relay never sees what they say.
 
 use crate::serve::{CLIENT_JS, INDEX};
 use std::collections::HashMap;
@@ -13,6 +17,8 @@ use std::time::{Duration, Instant};
 use tungstenite::{Message as Ws, WebSocket};
 
 type Rooms = Arc<Mutex<HashMap<String, WebSocket<TcpStream>>>>;
+/// Rooms with a viewer in them now (how many sessions each), apart from the ones waiting.
+type Busy = Arc<Mutex<HashMap<String, usize>>>;
 
 fn query<'a>(target: &'a str, key: &str) -> Option<&'a str> {
     target.split_once('?')?.1.split('&').find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
@@ -36,11 +42,19 @@ pub fn run(listen: &str, secret: Option<String>) -> Result<(), String> {
         }
     );
     let rooms: Rooms = Arc::default();
+    let busy: Busy = Arc::default();
+    match listener.local_addr().and_then(std::net::UdpSocket::bind) {
+        Ok(udp) => {
+            let (rooms, busy) = (rooms.clone(), busy.clone());
+            std::thread::spawn(move || reflect(udp, rooms, busy));
+        }
+        Err(e) => eprintln!("rein-remote relay: no UDP on its port ({e}): sessions stay relayed, never direct"),
+    }
     for conn in listener.incoming() {
         let Ok(stream) = conn else { continue };
-        let (rooms, secret) = (rooms.clone(), secret.clone());
+        let (rooms, busy, secret) = (rooms.clone(), busy.clone(), secret.clone());
         std::thread::spawn(move || {
-            if let Err(e) = handle(stream, rooms, secret) {
+            if let Err(e) = handle(stream, rooms, busy, secret) {
                 eprintln!("rein-remote relay: {e}");
             }
         });
@@ -48,7 +62,30 @@ pub fn run(listen: &str, secret: Option<String>) -> Result<(), String> {
     Ok(())
 }
 
-fn handle(mut stream: TcpStream, rooms: Rooms, secret: Option<String>) -> Result<(), String> {
+/// Answers probes: the address each came from, for a room that's open (waiting, or with a viewer in
+/// it). The answer is never bigger than the probe, so the relay can't be used to amplify.
+fn reflect(udp: std::net::UdpSocket, rooms: Rooms, busy: Busy) {
+    use rr_proto::punch::{room_hash, Packet};
+    let mut buf = [0u8; 512];
+    loop {
+        let Ok((n, from)) = udp.recv_from(&mut buf) else { continue };
+        let Some(Packet::Probe { id, room_hash: asked }) = Packet::decode(&buf[..n]) else {
+            continue;
+        };
+        if n < rr_proto::punch::PROBE_LEN {
+            continue;
+        }
+        let open = {
+            let (r, b) = (rooms.lock().unwrap(), busy.lock().unwrap());
+            r.keys().chain(b.keys()).any(|room| rr_proto::pair::confirm_eq(&room_hash(room), &asked))
+        };
+        if open {
+            let _ = udp.send_to(&Packet::Seen { id, addr: from }.encode(), from);
+        }
+    }
+}
+
+fn handle(mut stream: TcpStream, rooms: Rooms, busy: Busy, secret: Option<String>) -> Result<(), String> {
     let mut head = [0u8; 2048];
     let n = stream.peek(&mut head).map_err(|e| e.to_string())?;
     let req = String::from_utf8_lossy(&head[..n]).to_string();
@@ -89,7 +126,15 @@ fn handle(mut stream: TcpStream, rooms: Rooms, secret: Option<String>) -> Result
         };
         let viewer = tungstenite::accept(stream).map_err(|e| e.to_string())?;
         eprintln!("rein-remote relay: a viewer joined room {}", &room[..6]);
+        *busy.lock().unwrap().entry(room.clone()).or_default() += 1;
         pipe(host, viewer);
+        let mut b = busy.lock().unwrap();
+        if let Some(n) = b.get_mut(&room) {
+            *n -= 1;
+            if *n == 0 {
+                b.remove(&room);
+            }
+        }
         return Ok(());
     }
     // The web client, as the machine itself serves it (it reads the room from the page's address).
@@ -108,8 +153,10 @@ fn handle(mut stream: TcpStream, rooms: Rooms, secret: Option<String>) -> Result
     stream.write_all(resp.as_bytes()).map_err(|e| e.to_string())
 }
 
-/// Pass messages both ways until either side goes.
+/// Pass messages both ways until either side goes. First, a text message to the machine (`a`): a
+/// viewer joined (its wait for a hello starts now; what the two say to each other is binary).
 fn pipe(mut a: WebSocket<TcpStream>, mut b: WebSocket<TcpStream>) {
+    let _ = a.send(Ws::Text("viewer".into()));
     for ws in [&mut a, &mut b] {
         let _ = ws.get_mut().set_nonblocking(true);
         let _ = ws.get_mut().set_nodelay(true);

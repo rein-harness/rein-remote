@@ -1,0 +1,89 @@
+//! Running `rein-remote` for a test: its stderr read line by line, waited on for what it prints, and the
+//! process ended when the test is done with it.
+
+#![allow(dead_code)]
+
+use std::io::{BufRead, BufReader};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+pub struct Proc {
+    child: Child,
+    lines: mpsc::Receiver<String>,
+    pub seen: Vec<String>,
+}
+
+impl Proc {
+    pub fn start(args: &[&str], env: &[(&str, &str)]) -> Proc {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rein-remote"));
+        cmd.args(args).stdout(Stdio::null()).stderr(Stdio::piped()).env_remove("REIN_REMOTE_TOKEN");
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().expect("rein-remote starts");
+        let err = child.stderr.take().unwrap();
+        let (tx, lines) = mpsc::channel();
+        std::thread::spawn(move || {
+            for l in BufReader::new(err).lines().map_while(Result::ok) {
+                if tx.send(l).is_err() {
+                    break;
+                }
+            }
+        });
+        Proc { child, lines, seen: vec![] }
+    }
+
+    /// The first line (from now) with `what` in it.
+    pub fn wait_for(&mut self, what: &str, within: Duration) -> String {
+        let end = Instant::now() + within;
+        while let Some(left) = end.checked_duration_since(Instant::now()) {
+            match self.lines.recv_timeout(left) {
+                Ok(l) => {
+                    self.seen.push(l.clone());
+                    if l.contains(what) {
+                        return l;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        panic!("rein-remote didn't print {what:?} in {within:?}; it printed:\n{}", self.seen.join("\n"));
+    }
+
+    /// The address from its "on http://ADDR" line (what Rein reads too).
+    pub fn listening(&mut self) -> String {
+        let l = self.wait_for("on http://", Duration::from_secs(30));
+        l.split("on http://").nth(1).unwrap().split_whitespace().next().unwrap().to_string()
+    }
+}
+
+impl Drop for Proc {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Events from a session until `done` says so (or it ends, or time's up): whether it did.
+pub fn until(s: &rr_client::Session, within: Duration, mut done: impl FnMut(&rr_client::Event) -> bool) -> bool {
+    let end = Instant::now() + within;
+    while let Some(left) = end.checked_duration_since(Instant::now()) {
+        match s.next_event(left.min(Duration::from_millis(200))) {
+            Some(rr_client::Event::Closed(why)) => panic!("the session closed: {why:?}"),
+            Some(e) if done(&e) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+pub fn frames(s: &rr_client::Session, n: usize, within: Duration) -> bool {
+    let mut got = 0;
+    until(s, within, |e| {
+        if matches!(e, rr_client::Event::Video { .. }) {
+            got += 1;
+        }
+        got >= n
+    })
+}

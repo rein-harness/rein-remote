@@ -43,3 +43,21 @@ test('loss comes from the sequence numbers', () => {
   assert.equal(r.lossPermille(), Math.floor(((expected - ds.length) * 1000) / expected));
   assert.equal(r.lossPermille(), 0);
 });
+
+test('a datagram lost between two counts still counts', () => {
+  // Counted after each datagram (a client's feedback after each frame): every gap shows in the count after it.
+  const r = new FecReassembler(8);
+  const unwrap = (d) => {
+    const s = d[14] | (d[15] << 8);
+    return s < 32768 ? s + 65536 : s;
+  };
+  const ds = cases[3].datagrams.map(hex).sort((a, b) => unwrap(a) - unwrap(b));
+  let gaps = 0, counted = 0;
+  ds.forEach((d, i) => {
+    if (i > 0 && unwrap(d) - unwrap(ds[i - 1]) > 1) gaps++;
+    r.push(d);
+    if (r.lossPermille() > 0) counted++;
+  });
+  assert.ok(gaps > 0);
+  assert.equal(counted, gaps);
+});

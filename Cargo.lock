@@ -1572,6 +1572,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "rr-client"
+version = "0.1.1"
+dependencies = [
+ "aes-gcm",
+ "getrandom 0.3.4",
+ "hkdf",
+ "if-addrs",
+ "mdns-sd",
+ "p256",
+ "rr-proto",
+ "rustls",
+ "rustls-native-certs",
+ "sha2 0.10.9",
+ "tokio",
+ "tungstenite",
+ "wtransport",
+]
+
+[[package]]
 name = "rr-proto"
 version = "0.1.1"
 dependencies = [
@@ -1605,6 +1624,7 @@ dependencies = [
  "openh264-sys2",
  "p256",
  "qrcode",
+ "rr-client",
  "rr-proto",
  "rustls",
  "rustls-pemfile",

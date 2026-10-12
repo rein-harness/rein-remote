@@ -10,6 +10,7 @@
 //!   rein-remote windows [--json]           # the windows it can show
 //!   rein-remote displays                   # the displays (macOS)
 //!   rein-remote discover                   # Rein Remote servers on this network (mDNS)
+//!   rein-remote connect URL|NAME --seconds 10   # a viewer that counts what comes (transport, fps, latency)
 //!   rein-remote selftest --window Notepad --type hi   # capture works, and typing changes what's seen
 //!   rein-remote selftest --test-pattern 1920x1080 --encode out.h264   # the encoder in use, timed; its stream saved
 //!   rein-remote serve --listen 0.0.0.0:7979 --fps 60 --bitrate 8000   # --fps auto (the default): the viewer's display rate
@@ -19,8 +20,7 @@
 mod adapt;
 mod capture;
 mod conn;
-mod discover;
-mod e2e;
+mod connect;
 mod encode;
 #[cfg(windows)]
 mod encode_mf;
@@ -42,7 +42,7 @@ use capture::{Source, TestPattern};
 
 fn usage() -> ! {
     eprintln!(
-        "rein-remote {}\n\nusage:\n  rein-remote serve [--display :N | --window APP|TITLE|ID | --app NAME | --kms [CONNECTOR] | --vnc HOST:PORT [--vnc-password P] | --pipe WxH | --test-pattern [WxH] [--motion full]] [--listen ADDR] [--fps auto|N] [--codec h264|h265|auto] [--bitrate KBPS] [--token T] [--webtransport on|off] [--tls-cert PEM --tls-key PEM] [--tailscale-cert on|off] [--mdns on|off] [--pair on|off] [--relay ws(s)://HOST:PORT [--room CODE] [--relay-secret S]]\n  rein-remote relay [--listen ADDR] [--secret S]\n  rein-remote windows [--json]\n  rein-remote displays\n  rein-remote discover [SECONDS]\n  rein-remote paired | unpair ID\n  rein-remote selftest [--window Q | --display :N | --kms [CONNECTOR] | --test-pattern [WxH]] [--type TEXT] [--encode OUT.h264 [--frames N]]\n  rein-remote --version",
+        "rein-remote {}\n\nusage:\n  rein-remote serve [--display :N | --window APP|TITLE|ID | --app NAME | --kms [CONNECTOR] | --vnc HOST:PORT [--vnc-password P] | --pipe WxH | --test-pattern [WxH] [--motion full]] [--listen ADDR] [--fps auto|N] [--codec h264|h265|auto] [--bitrate KBPS] [--token T] [--webtransport on|off] [--tls-cert PEM --tls-key PEM] [--tailscale-cert on|off] [--mdns on|off] [--pair on|off] [--relay ws(s)://HOST:PORT [--room CODE] [--relay-secret S]]\n  rein-remote relay [--listen ADDR] [--secret S]\n  rein-remote windows [--json]\n  rein-remote displays\n  rein-remote discover [SECONDS]\n  rein-remote paired | unpair ID\n  rein-remote connect URL|NAME [--seconds N] [--pair CODE] [--json] [--webtransport on|off] [--datagrams on|off] [--direct on|off]\n  rein-remote selftest [--window Q | --display :N | --kms [CONNECTOR] | --test-pattern [WxH]] [--type TEXT] [--encode OUT.h264 [--frames N]]\n  rein-remote --version",
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(2);
@@ -89,7 +89,7 @@ fn main() {
         },
         Some("discover") => {
             let secs = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(3);
-            match discover::discover(std::time::Duration::from_secs(secs)) {
+            match rr_client::discover::discover(std::time::Duration::from_secs(secs)) {
                 Ok(list) if list.is_empty() => eprintln!("rein-remote: none found on this network in {secs} s"),
                 Ok(list) => {
                     for f in list {
@@ -127,6 +127,12 @@ fn main() {
                 }
             }
             if let Err(e) = relay::run(&listen, secret) {
+                eprintln!("rein-remote: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some("connect") => {
+            if let Err(e) = connect::run(&args[1..]) {
                 eprintln!("rein-remote: {e}");
                 std::process::exit(1);
             }
