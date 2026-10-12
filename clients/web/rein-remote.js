@@ -725,7 +725,9 @@ function openLink(url, wt) {
           link.ondata(value);
           continue;
         }
+        const lostBefore = link.fec.lost;
         const frame = link.fec.push(value);
+        if (link.fec.lost > lostBefore) link.onloss?.();
         if (frame) link.ondata(frame);
       }
     })();
@@ -991,6 +993,16 @@ export function connect(url, canvas, opts = {}) {
     }, 1000);
   };
   link.onclose = () => ((stats.state = 'closed'), clearInterval(pingTimer));
+  // A frame lost for good (datagrams the parity couldn't make up for): the decoder can't go on past
+  // it without a keyframe, so ask (at most every 250 ms, like the native client). Without this a
+  // lost first keyframe was never asked for again and nothing ever showed.
+  let keyAskedAt = -Infinity;
+  link.onloss = () => {
+    lost++;
+    if (performance.now() - keyAskedAt < 250) return;
+    keyAskedAt = performance.now();
+    send(new W().frame(K.KEYFRAME_REQUEST));
+  };
   link.onerror = (e) => (stats.error = e);
   link.ondata = (bytes) => {
     // A sealed session (through a relay) opened without its key: say what's missing.

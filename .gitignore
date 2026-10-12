@@ -5,3 +5,5 @@
 /tests/nat/out/
 /tests/relay-fleet/rein-remote.linux
 /tests/relay-fleet/out/
+/tests/netem/logs/
+/tests/netem/rein-remote.linux
