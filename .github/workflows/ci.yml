@@ -18,10 +18,18 @@ jobs:
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
       - name: Format
         run: cargo fmt --all --check
+      # The viewer's gamepads (gilrs) read devices through libudev on Linux; its window's keyboard
+      # needs libxkbcommon-x11 (loaded at run time).
+      - name: Linux packages
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libudev-dev libxkbcommon-x11-0 > /dev/null
       - name: Lint
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      - name: Test (web client)
+        if: runner.os == 'Linux'
+        run: node --test clients/web/test/*.test.mjs
       # Which Media Foundation H.264 encoder the runner has (no GPU: Microsoft's software one), and
       # what the encoder tests saw with it.
       - name: Media Foundation encoder (Windows)
@@ -69,9 +77,161 @@ jobs:
           RR_H264_OUT=/tmp/headers.h264 cargo test -q -p rr-server a_stream_from_these_headers_decodes
           ffmpeg -v error -i /tmp/headers.h264 -f rawvideo -pix_fmt yuv420p /tmp/headers.yuv
           cmp /tmp/headers.yuv /tmp/headers.h264.yuv
+      # Session recording (--record): a recorded session (H.264 from the encoder a stream uses, real
+      # Opus) read back by ffprobe, every frame and packet, and decoded by ffmpeg with nothing to say.
+      - name: Session recordings play (ffmpeg, Linux)
+        if: runner.os == 'Linux'
+        run: RR_REQUIRE_FFPROBE=1 cargo test -q -p rr-server a_recording_plays -- --nocapture
+      # The viewer's VA-API decoder reads the stream's headers itself (h264.rs): what it reads from the
+      # encoder's stream, next to what ffmpeg reads, in the log.
+      - name: H.264 headers as the viewer's VA-API decoder reads them, next to ffmpeg's (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          RR_H264_TRACE=/tmp/auto.h264 cargo test -q -p rr-viewer an_openh264_screen_stream -- --nocapture | grep -E '^(sps|pps|slice)' | head -40
+          ffmpeg -v error -i /tmp/auto.h264 -c copy -bsf:v trace_headers -f null - 2>&1 | grep -E 'frame_num|slice_type|first_mb' | head -40
+      # Gamepads on the server: a virtual Xbox 360 pad made through uinput and read back through evdev,
+      # as games read one (root: the runner's user can't open /dev/uinput or /dev/input); on Windows,
+      # what it says without ViGEmBus.
+      - name: Virtual gamepad (Linux uinput; Windows without ViGEmBus)
+        if: runner.os != 'macOS'
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo modprobe uinput
+            bin=$(cargo test -p rr-server --no-run --message-format=json 2>/dev/null | jq -r 'select(.profile.test and (.target.kind | index("bin"))) | .executable' | head -1)
+            sudo RR_UINPUT_TEST=1 "$bin" gamepad --nocapture
+          else
+            cargo test -p rr-server gamepad -- --nocapture
+          fi
+      # Sound: a client that plays it gets Opus packets of what the machine plays, one that says it
+      # doesn't gets none, and with no sound to be had the video streams on its own.
+      - name: Sound (Linux, PulseAudio with a null sink as the output and a tone played into it)
+        if: runner.os == 'Linux'
+        run: |
+          node -e "process.exit(typeof WebSocket === 'function' ? 0 : 1)" || export NODE_OPTIONS=--experimental-websocket
+          sudo apt-get install -y -qq pulseaudio pulseaudio-utils > /dev/null
+          pulseaudio -D --exit-idle-time=-1
+          pactl load-module module-null-sink sink_name=rr && pactl set-default-sink rr
+          Xvfb :21 -screen 0 1280x720x24 & sleep 2
+          ./target/release/rein-remote serve --display :21 --listen 127.0.0.1:7979 --webtransport off 2> serve.log & sleep 2
+          pactl load-module module-sine sink=rr frequency=440
+          node tools/listen.mjs http://127.0.0.1:7979/ --seconds 4 | tee sound.json
+          node tools/listen.mjs http://127.0.0.1:7979/ --seconds 2 --audio off | tee none.json
+          grep -v '^rein-remote: {' serve.log
+          node -e "const r = require('./sound.json'); if (!(r.videoFrames > 0 && r.audioPackets > 100 && r.serverAudio.loud_packets > 100)) process.exit(1)"
+          node -e "const r = require('./none.json'); if (!(r.videoFrames > 0 && r.audioPackets === 0)) process.exit(1)"
+      - name: Sound (Windows, WASAPI loopback; a runner may have no output device, and the video streams anyway)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          node -e "process.exit(typeof WebSocket === 'function' ? 0 : 1)"
+          if ($LASTEXITCODE -ne 0) { $env:NODE_OPTIONS = '--experimental-websocket' }
+          Start-Process notepad
+          Start-Sleep -Seconds 2
+          $p = Start-Process ./target/release/rein-remote.exe -ArgumentList 'serve','--window','Notepad','--listen','127.0.0.1:7979','--webtransport','off' -RedirectStandardError serve.log -PassThru
+          Start-Sleep -Seconds 3
+          node tools/listen.mjs http://127.0.0.1:7979/ --seconds 4 | Tee-Object -FilePath sound.json
+          Stop-Process $p
+          Get-Content serve.log | Select-String -NotMatch '^rein-remote: \{'
+          $r = Get-Content sound.json -Raw | ConvertFrom-Json
+          if ($r.videoFrames -lt 1) { throw 'no video' }
+          if ($r.audioPackets -eq 0 -and -not (Select-String -Path serve.log -Pattern 'no sound \(' -Quiet)) { throw 'no sound, and no reason why' }
       - name: Selftest (macOS, test pattern; screen capture needs a permission runners can't give)
         if: runner.os == 'macOS'
         run: cargo run --release -p rr-server -- selftest --test-pattern
+      # Config by file and services: the relay installed for real, from a config file whose secret is in
+      # a file of its own (never on the service's command line), up and answering /healthz, then removed.
+      # Each OS: the user's kind (systemd --user, a LaunchAgent, a scheduled task at logon) when the
+      # runner has one, and the system's (a systemd unit, a LaunchDaemon, a Windows service).
+      - name: Service install (Linux, systemd)
+        if: runner.os == 'Linux'
+        run: |
+          b=$PWD/target/release/rein-remote d=$RUNNER_TEMP/svc
+          mkdir -p "$d" && printf 's3cret-%s\n' "$RANDOM$RANDOM" > "$d/secret" && chmod 600 "$d/secret"
+          printf 'listen = "127.0.0.1:7995"\nmetrics-listen = "127.0.0.1:7996"\nsecret = { file = "secret" }\n' > "$d/relay.toml"
+          up() { for i in $(seq 1 40); do curl -fsS http://127.0.0.1:7995/healthz && echo && return 0; sleep 0.25; done; return 1; }
+          down() { for i in $(seq 1 40); do curl -fsS -m 1 http://127.0.0.1:7995/healthz > /dev/null 2>&1 || return 0; sleep 0.25; done; ps -eo pid,ppid,args | grep '[r]ein-remote'; systemctl --user --no-pager status rein-remote-relay || true; return 1; }
+          no_secret() { ps -eo args | grep '[r]ein-remote relay' | tee "$d/args"; ! grep -qF "$(cat "$d/secret")" "$d/args"; }
+          $b install-service relay --config "$d/relay.toml" --print
+          sudo loginctl enable-linger "$USER" || true
+          export XDG_RUNTIME_DIR=/run/user/$(id -u)
+          for i in $(seq 1 20); do systemctl --user show-environment > /dev/null 2>&1 && break; sleep 0.5; done
+          if systemctl --user show-environment > /dev/null 2>&1; then
+            $b install-service relay --config "$d/relay.toml"
+            up
+            no_secret
+            curl -fsS http://127.0.0.1:7996/metrics | grep '^rein_remote_relay'
+            systemctl --user --no-pager status rein-remote-relay | head -4 || true
+            $b uninstall-service relay
+            down
+          else
+            echo "::warning::no systemd user manager on this runner: the user unit was printed, not installed"
+          fi
+          sudo $b install-service relay --system --config "$d/relay.toml"
+          up
+          no_secret
+          systemctl --no-pager status rein-remote-relay | head -4 || true
+          sudo $b uninstall-service relay --system
+          down
+          test ! -e /etc/systemd/system/rein-remote-relay.service
+      - name: Service install (macOS, launchd)
+        if: runner.os == 'macOS'
+        run: |
+          b=$PWD/target/release/rein-remote d=$RUNNER_TEMP/svc
+          mkdir -p "$d" && printf 's3cret-%s\n' "$RANDOM$RANDOM" > "$d/secret" && chmod 600 "$d/secret"
+          printf 'listen = "127.0.0.1:7995"\nmetrics-listen = "127.0.0.1:7996"\nsecret = { file = "secret" }\n' > "$d/relay.toml"
+          up() { for i in $(seq 1 40); do curl -fsS http://127.0.0.1:7995/healthz && echo && return 0; sleep 0.25; done; return 1; }
+          down() { for i in $(seq 1 40); do curl -fsS -m 1 http://127.0.0.1:7995/healthz > /dev/null 2>&1 || return 0; sleep 0.25; done; return 1; }
+          no_secret() { ps -axo args | grep '[r]ein-remote relay' | tee "$d/args"; ! grep -qF "$(cat "$d/secret")" "$d/args"; }
+          $b install-service relay --config "$d/relay.toml" --print
+          if $b install-service relay --config "$d/relay.toml"; then
+            up
+            no_secret
+            curl -fsS http://127.0.0.1:7996/metrics | grep '^rein_remote_relay'
+            $b uninstall-service relay
+            down
+          else
+            $b uninstall-service relay || true
+            echo "::warning::no GUI session for a LaunchAgent on this runner: printed, not installed"
+          fi
+          sudo $b install-service relay --system --config "$d/relay.toml"
+          up
+          no_secret
+          sudo $b uninstall-service relay --system
+          down
+          test ! -e /Library/LaunchDaemons/com.rein-harness.rein-remote-relay.plist
+      - name: Service install (Windows, a service and a scheduled task)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $b = "$PWD\target\release\rein-remote.exe"; $d = "$env:RUNNER_TEMP\svc"
+          New-Item -ItemType Directory -Force $d | Out-Null
+          $secret = "s3cret-" + (Get-Random)
+          [IO.File]::WriteAllText("$d\secret", $secret)
+          [IO.File]::WriteAllText("$d\relay.toml", "listen = `"127.0.0.1:7995`"`nmetrics-listen = `"127.0.0.1:7996`"`nsecret = { file = `"secret`" }`n")
+          Get-ChildItem $d | Format-Table Name, Length, FullName
+          function Up { for ($i = 0; $i -lt 60; $i++) { try { return Invoke-RestMethod http://127.0.0.1:7995/healthz } catch { Start-Sleep -Milliseconds 250 } }; throw 'not up' }
+          function Down { for ($i = 0; $i -lt 60; $i++) { try { Invoke-RestMethod -TimeoutSec 1 http://127.0.0.1:7995/healthz | Out-Null; Start-Sleep -Milliseconds 250 } catch { return } }; throw 'still up' }
+          function NoSecret { $a = (Get-CimInstance Win32_Process -Filter "Name='rein-remote.exe'").CommandLine; $a; if ($a -match [regex]::Escape($secret)) { throw 'the secret is on the command line' } }
+          & $b install-service relay --system --config "$d\relay.toml" --print
+          & $b install-service relay --system --config "$d\relay.toml"
+          Up; NoSecret
+          sc.exe qc rein-remote-relay
+          (Invoke-WebRequest http://127.0.0.1:7996/metrics).Content -split "`n" | Select-String '^rein_remote_relay'
+          & $b uninstall-service relay --system; Down
+          Get-Content "$env:ProgramData\rein-remote\rein-remote-relay.log"
+          & $b install-service relay --config "$d\relay.toml" --print
+          & $b install-service relay --config "$d\relay.toml"
+          Up; NoSecret
+          & $b uninstall-service relay; Down
+      # The binary for the signing job.
+      - name: Keep the binary for the signing job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rein-remote-${{ runner.os }}
+          path: target/release/rein-remote${{ runner.os == 'Windows' && '.exe' || '' }}
+          retention-days: 1
       # The npm packages, installed from their tarballs, and Rein's contract with the binary (how
       # rein-harness's src/preview/remote.ts starts and talks to it).
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -93,6 +253,107 @@ jobs:
           cd "$RUNNER_TEMP/app" && npm init -y > /dev/null && npm install --no-audit --no-fund "$RUNNER_TEMP"/tgz/*.tgz
           npx rein-remote --version
           node "$GITHUB_WORKSPACE/npm/contract.mjs" $w
+      # The desktop viewer against a test-pattern server on the runner: decoding in software and with
+      # whatever the runner's hardware gives (none on Linux and Windows runners: it must say so and
+      # decode in software), the pointer sent and seen in the decoded picture (the pattern draws a
+      # cross there), then in a window (Linux: on Xvfb), reading the pattern's barcode for latency.
+      - name: Viewer smoke test (headless and in a window)
+        shell: bash
+        env:
+          DISPLAY: ':20'
+        run: |
+          cargo build --release -p rr-server -p rr-viewer
+          x=""; [ "$RUNNER_OS" = Windows ] && x=.exe
+          ./target/release/rein-remote$x serve --test-pattern 1280x720 --listen 127.0.0.1:7982 --token tok --mdns off 2> serve.log &
+          sleep 3
+          url="http://127.0.0.1:7982/?token=tok"
+          v=./target/release/rein-remote-viewer$x
+          $v "$url" --headless --frames 120 --decoder software --move 640,500
+          $v "$url" --headless --frames 120 --decoder auto --move 640,500
+          $v "$url" --headless --frames 60 --webtransport off --decoder software
+          # Windows: Media Foundation's decoder on the runner (no GPU: its own software decoding).
+          if [ "$RUNNER_OS" = Windows ]; then RR_DECODER=mediafoundation $v "$url" --headless --frames 120 --decoder hardware --move 640,500; fi
+          # Linux: no GPU here, so VA-API must say why it can't, and not decode.
+          if [ "$RUNNER_OS" = Linux ]; then
+            if out=$($v "$url" --headless --frames 10 --seconds 8 --decoder hardware 2>&1); then echo "VA-API decoded without a GPU?"; exit 1; fi
+            echo "$out"; echo "$out" | grep -q "VA-API"
+          fi
+          if ! $v "$url" --measure --seconds 5; then
+            [ "$RUNNER_OS" = macOS ] || exit 1
+            echo "no window on this runner"
+          fi
+          kill %1 || true
+          # What the server said (its per-second stats left out): the encoder, each viewer, adapting.
+          grep -v '^rein-remote: {' serve.log || true
+  # SAML sign-in (`--features saml`): samael verifies signatures with xmlsec1, which needs libxml2,
+  # libxmlsec1 (OpenSSL) and clang for its bindings; off by default, so the other builds don't need them.
+  saml:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust
+        run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
+      - name: Packages
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libxml2-dev libxmlsec1-dev libxmlsec1-openssl libclang-dev libssl-dev pkg-config libudev-dev > /dev/null
+      - name: Lint
+        run: cargo clippy -p rr-server --features saml --all-targets -- -D warnings
+      - name: Test
+        run: cargo test -p rr-server --features saml -- auth saml policy
+  # Signing, as release.yml does it, with identities made here (nothing secret): macOS ad-hoc with the
+  # hardened runtime, Windows Authenticode with a self-signed certificate trusted on the runner only,
+  # cosign with a key generated here. Each signature checked, and a changed byte refused.
+  # docs/verification/signing.md has the same with real certificates.
+  signing:
+    needs: test
+    # Each OS's binary, whether or not the other OSes' tests passed.
+    if: ${{ !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: rein-remote-${{ runner.os }}
+          path: bin
+      - name: codesign, ad-hoc (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          chmod +x bin/rein-remote
+          sh tools/sign/macos.sh bin/rein-remote
+          ./bin/rein-remote --version
+          cp bin/rein-remote changed && printf 'x' | dd of=changed bs=1 seek=4096 conv=notrunc 2> /dev/null
+          if codesign --verify --strict changed 2> /dev/null; then echo "a changed binary verified"; exit 1; fi
+          echo "a changed byte: refused"
+      - name: signtool, a self-signed certificate (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./tools/sign/windows.ps1 bin/rein-remote.exe -SelfSigned
+          ./bin/rein-remote.exe --version
+          Copy-Item bin/rein-remote.exe changed.exe
+          $f = [IO.File]::Open("$PWD/changed.exe", 'Open', 'ReadWrite'); $f.Position = 4096; $f.WriteByte(120); $f.Close()
+          $s = Get-AuthenticodeSignature changed.exe
+          if ($s.Status -eq 'Valid') { throw 'a changed binary verified' }
+          "a changed byte: $($s.Status)"
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        if: runner.os == 'Linux'
+        with:
+          cosign-release: v3.1.3
+      - name: cosign, a key generated here (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          chmod +x bin/rein-remote
+          export COSIGN_PASSWORD=$(openssl rand -hex 16)
+          cosign generate-key-pair > /dev/null
+          (cd bin && sha256sum rein-remote > SHA256SUMS && cat SHA256SUMS)
+          COSIGN_KEY=cosign.key COSIGN_PUB=cosign.pub sh tools/sign/cosign.sh bin/SHA256SUMS bin/rein-remote
+          (cd bin && sha256sum -c SHA256SUMS)
+          cp bin/rein-remote changed && printf 'x' | dd of=changed bs=1 seek=4096 conv=notrunc 2> /dev/null
+          if cosign verify-blob --key cosign.pub --bundle bin/rein-remote.sigstore.json --insecure-ignore-tlog=true changed; then echo "a changed binary verified"; exit 1; fi
+          echo "a changed byte: refused"
   wasm:
     runs-on: ubuntu-latest
     steps:
@@ -101,3 +362,105 @@ jobs:
         run: rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown && rustup default stable
       - name: The protocol for the web client
         run: cargo build -p rr-proto --target wasm32-unknown-unknown --release
+  # The iOS and iPadOS app: the Rust core as an XCFramework, the app for the simulator, and its tests
+  # there: units, then the whole way against a server on the runner (decoded with VideoToolbox, the
+  # pointer seen coming back in the video, a tap through UIKit).
+  ios:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust
+        run: rustup toolchain install stable --profile minimal --target aarch64-apple-ios-sim && rustup default stable
+      - name: The server to test against
+        run: cargo build --release -p rr-server
+      - name: The core as an XCFramework (the simulator)
+        run: clients/ios/build-core.sh sim
+      - name: The Xcode project
+        run: brew install xcodegen && cd clients/ios && xcodegen
+      - name: Build and test in the simulator
+        run: |
+          # Full size throughout (a busy runner would have the server lower it, and the cross with it).
+          RR_ADAPT=off ./target/release/rein-remote serve --test-pattern 1280x720 --listen 127.0.0.1:7979 --token ci --mdns off 2> serve.log &
+          sleep 2
+          udid=$(clients/ios/simulator.sh)
+          echo "simulator $udid"
+          cd clients/ios
+          TEST_RUNNER_RR_URL='http://127.0.0.1:7979/?token=ci' xcodebuild test -project ReinRemote.xcodeproj -scheme ReinRemote \
+            -destination "id=$udid" -derivedDataPath DerivedData | tee xcodebuild.log | grep -E "Test Case|selftest:|ui test:|error:|\*\* "
+          test "${PIPESTATUS[0]}" -eq 0
+      - name: The server's log
+        if: always()
+        run: |
+          grep -v '^rein-remote: {' serve.log || true
+  # The Android app: the Rust core (crates/rr-jni) built with cargo-ndk for a phone and the emulator,
+  # the APK, and the unit tests (gestures, keys, gamepads, the barcode reader, links).
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target aarch64-linux-android,x86_64-linux-android && rustup default stable
+          cargo install cargo-ndk --locked
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: The core for Android (arm64-v8a, x86_64)
+        run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" clients/android/build-core.sh arm64-v8a x86_64
+      - name: Unit tests and the APK
+        working-directory: clients/android
+        run: ./gradlew --no-daemon testDebugUnitTest assembleDebug
+  # The app in the emulator (x86_64, KVM) against a server on the runner, which it reaches at 10.0.2.2:
+  # frames decoded by MediaCodec, the pointer's cross seen coming back, a tap through the input system.
+  android-emulator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target x86_64-linux-android && rustup default stable
+          cargo install cargo-ndk --locked
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: The server, and the core for the emulator
+        run: |
+          cargo build --release -p rr-server
+          ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" clients/android/build-core.sh x86_64
+      - name: The APKs (a release build signed with the debug key, as measured)
+        working-directory: clients/android
+        run: ./gradlew --no-daemon -Prr.testBuildType=release assembleRelease assembleReleaseAndroidTest
+      - name: The server
+        run: |
+          ./target/release/rein-remote serve --test-pattern 1280x720 --listen 127.0.0.1:7979 --token ci --mdns off 2> serve.log &
+          sleep 2
+      - name: Instrumented tests in the emulator
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: 34
+          target: default
+          arch: x86_64
+          ram-size: 2048M
+          disable-animations: true
+          emulator-options: -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect
+          working-directory: clients/android
+          script: |
+            adb install -r -t app/build/outputs/apk/release/app-release.apk
+            adb install -r -t app/build/outputs/apk/androidTest/release/app-release-androidTest.apk
+            adb logcat -c
+            adb shell am instrument -w -r -e rrUrl 'http://10.0.2.2:7979/?token=ci' dev.reinharness.remote.test/androidx.test.runner.AndroidJUnitRunner | tee instrument.log
+            adb logcat -d -s rein-remote | grep -E 'selftest:|android test:|video:' | tail -40
+            grep -q '^OK (' instrument.log
+      - name: The server's log
+        if: always()
+        run: |
+          grep -v '^rein-remote: {' serve.log || true

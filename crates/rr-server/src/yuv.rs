@@ -159,3 +159,60 @@ mod tests {
         assert!(f.y.iter().all(|&y| y == f.y[0]) && f.u.iter().all(|&u| u == 128));
     }
 }
+
+/// A BGRA picture scaled down (to ¾ or ½, or any smaller size): each output pixel the average of the
+/// source pixels under it (a box filter, so text stays legible rather than aliased). `out` is
+/// `dw × dh`, rows packed.
+pub fn scale_down(src: &[u8], stride: usize, w: usize, h: usize, out: &mut Vec<u8>, dw: usize, dh: usize) {
+    out.resize(dw * dh * 4, 0);
+    if dw == 0 || dh == 0 || w == 0 || h == 0 {
+        return;
+    }
+    // Source columns for each output column (fixed point: 16 fractional bits), and the same for rows.
+    let span = |n: usize, dn: usize, i: usize| ((i * n) / dn, (((i + 1) * n) / dn).max((i * n) / dn + 1).min(n));
+    let cols: Vec<(usize, usize)> = (0..dw).map(|x| span(w, dw, x)).collect();
+    for y in 0..dh {
+        let (y0, y1) = span(h, dh, y);
+        let row = &mut out[y * dw * 4..(y + 1) * dw * 4];
+        for (x, &(x0, x1)) in cols.iter().enumerate() {
+            let mut acc = [0u32; 4];
+            for sy in y0..y1 {
+                let line = &src[sy * stride..];
+                for sx in x0..x1 {
+                    let p = &line[sx * 4..sx * 4 + 4];
+                    acc[0] += p[0] as u32;
+                    acc[1] += p[1] as u32;
+                    acc[2] += p[2] as u32;
+                    acc[3] += p[3] as u32;
+                }
+            }
+            let n = ((y1 - y0) * (x1 - x0)) as u32;
+            for c in 0..4 {
+                row[x * 4 + c] = (acc[c] / n) as u8;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod scale_tests {
+    use super::scale_down;
+
+    #[test]
+    fn halves_and_three_quarters_average_what_they_cover() {
+        // 4×2: a white and a black half.
+        let mut src = vec![0u8; 4 * 2 * 4];
+        for y in 0..2 {
+            for x in 0..2 {
+                src[(y * 4 + x) * 4..(y * 4 + x) * 4 + 4].copy_from_slice(&[255; 4]);
+            }
+        }
+        let mut out = Vec::new();
+        scale_down(&src, 16, 4, 2, &mut out, 2, 1);
+        assert_eq!(out, vec![255, 255, 255, 255, 0, 0, 0, 0]);
+        scale_down(&src, 16, 4, 2, &mut out, 3, 1);
+        assert_eq!(out.len(), 12);
+        assert_eq!(out[0], 255);
+        assert_eq!(out[8], 0);
+    }
+}

@@ -57,6 +57,14 @@ impl H264 {
             // A still screen sends almost nothing; a keyframe only when one is needed.
             p.bEnableFrameSkip = true;
             p.uiIntraPeriod = 0;
+            // A "scene change" (with full motion, a game or a video, every frame looks like one) as a
+            // P-frame against a long-term reference, not an IDR: openh264's screen mode makes each an
+            // IDR otherwise (it keeps scene detection on whatever's asked), many times a delta's size.
+            // (Screen mode allows long-term references only on a "lossless link": ours delivers every
+            // frame, or the client asks for a keyframe.)
+            p.bIsLosslessLink = true;
+            p.bEnableLongTermReference = true;
+            p.iLTRRefNum = 1;
             p.eSpsPpsIdStrategy = CONSTANT_ID;
             p.bEnableBackgroundDetection = false;
             p.iComplexityMode = LOW_COMPLEXITY;
@@ -197,6 +205,10 @@ pub trait VideoEncoder: Send {
     fn encode(&mut self, bgra: &[u8], stride: usize, tag: u64) -> Result<Vec<Encoded>, String>;
     /// Whether it reads the system's own frames in place (zero copy): see `encode_surface`.
     fn takes_surfaces(&self) -> bool {
+        false
+    }
+    /// Whether it scales a surface bigger than its own size itself (in hardware).
+    fn scales_surfaces(&self) -> bool {
         false
     }
     /// A frame as the system's own image (`Source::surface`), read where it is.
@@ -370,6 +382,22 @@ mod tests {
         // HEVC has no software encoder: no fallback either.
         assert!(open_as("auto", Codec::H265, 320, 240, 30.0, 2000).is_err());
         assert!(!open_as("software", Codec::H264, 320, 240, 30.0, 2000).unwrap().hardware());
+    }
+
+    #[test]
+    fn full_motion_makes_deltas_not_keyframes() {
+        let (w, h) = (320, 240);
+        let mut enc = H264::new(w, h, 30.0, 2000).unwrap();
+        // The test pattern's full motion: a detailed scene scrolling, every pixel changing each frame.
+        let mut p = crate::capture::TestPattern::full_motion(w, h);
+        let mut keys = 0;
+        for _ in 0..20 {
+            let f = crate::capture::Source::grab(&mut p).unwrap();
+            if let Some(e) = enc.encode(f.bgra, f.stride).unwrap() {
+                keys += e.keyframe as u32;
+            }
+        }
+        assert_eq!(keys, 1, "only the first is a keyframe");
     }
 }
 

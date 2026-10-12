@@ -131,6 +131,14 @@ has been verified.
     5% loss: p95 110 against 126. On a clean link the same as the WebSocket (14 ms glass to glass at
     720p on a Mac). Rein's web UI keeps the WebSocket (through its own HTTPS proxy). Next: video as
     datagrams with forward error correction, so a lost packet costs no retransmission.
+  - **Status (datagrams, native QUIC):** video goes as WebTransport datagrams with forward error
+    correction (Reed-Solomon over GF(256), Cauchy parity; the same code in Rust and in the page,
+    checked against shared vectors in CI), each datagram numbered so the client counts loss and
+    reports it (Feedback v1); the server sends parity for it (3× the loss, 10–50%). BBR congestion
+    control (a lossy link no longer stalls whole frames). A lost frame the parity can't make up for
+    asks for a keyframe. Native clients get the same over QUIC (`crates/rr-client`, `rein-remote
+    connect`), tested end to end in CI on all three. On this Mac, Chrome over datagrams: 60 fps,
+    10 ms glass to glass.
 - LAN discovery (mDNS), pairing codes, mutual keys.
   - **Status:** no setup on a tailnet or a local network: `serve` listens on every interface behind a
     random token and prints a link per way in (tailnet name, tailnet address, local network,
@@ -140,6 +148,13 @@ has been verified.
     on a tailnet: the https:// tailnet link 15 ms glass to glass over WebTransport; the http://
     tailnet and LAN links ~31 fps at 46–53 ms through Media Source; no token, 403. mDNS discovery is
     next.
+  - **Status (mDNS, pairing):** `serve` advertises itself over mDNS (`--mdns on|off`) and
+    `rein-remote discover` (and the desktop, iOS and Android clients) find it: verified on this
+    Mac's LAN. Pairing: a 6-digit code (10 minutes, one pairing, 5 tries) printed with a QR code;
+    SPAKE2 over P-256 (RFC 9382's M and N) then each side's key, so a paired device signs in with
+    its key (ECDSA), no token. `rein-remote paired` / `unpair`. Verified in headless Chrome over the
+    LAN on a plain-HTTP page (all 8 checks of `tools/pair-e2e.mjs`), and by the iOS and Android
+    clients in their simulators.
 - Rendezvous with NAT hole punching; the relay (self-hostable).
   - **Status:** the relay is in: `rein-remote relay` (self-hosted, `--secret` for who may host) pairs
     a machine that connected out (`serve --relay ws(s)://…`, a random 24-character room) with a
@@ -150,6 +165,11 @@ has been verified.
     and changes refused; verified: the right key streams (14 ms glass to glass), a wrong key is
     refused at both ends, a link without its key says so. Still to do: NAT hole punching
     (straight over QUIC when it works).
+  - **Status (hole punching):** the relay also brokers a direct path: both ends learn their public
+    UDP address from it and punch (DirectOffer / DirectAnswer), then the session moves onto QUIC
+    directly. In Docker behind two NATs: direct after 0.5–1.2 s, round trip 97 → 45 ms; it stays
+    on the relay when UDP is blocked or a NAT is symmetric. Real NATs:
+    [manual test](docs/verification/nat-hole-punching.md).
 - Delay-based bitrate controller; frame rate and resolution adaptation; intra refresh.
   - **Status:** a delay-based controller (each frame's round trip on the server's own clock, its
     rise over the lowest of the last 10 s is queuing; a backed-up socket counts too) cuts the
@@ -162,7 +182,18 @@ has been verified.
     random text over 1.5 Mbit/s (more than the link can carry): 229 ms p50 adapting against 505 ms
     not. Still to tune: the target oscillates above capacity on such content, and the first keyframe
     takes a second on a 300 kbit/s link (resolution adaptation and a smaller first keyframe are next).
+  - **Status (adaptation):** starts at 800 kbit/s with a ×1.5 slow start (a small first keyframe),
+    cuts to 85% of what was delivered and probes back up under a ceiling; the picture scales to ¾
+    below 22% of the top bitrate and to ½ below 10% (2 s hysteresis; input mapped back), the
+    client's own decoding time left out of the delay. openh264 with long-term references, so full
+    motion stays P-frames. On this Mac's loopback, full motion at 720p: 53 fps, 22 ms glass to
+    glass, 7.7 Mbit/s.
 - Opus audio, synchronized with video.
+  - **Status:** Opus (libopus) from the system's sound: ScreenCaptureKit on macOS, PulseAudio on
+    Linux, WASAPI loopback on Windows (`--audio on|off`). In Chrome on this Mac the sound plays
+    10.4 ms after its picture (median; 13.8 ms p95) over WebTransport, 10.5 / 12.6 over the
+    WebSocket; the picture waits for the sound while it plays (`?sync=off` to not). Windows' real
+    capture: [manual test](docs/verification/audio.md).
 - **Verified:** latency and quality measured on LAN, on a throttled link (tc netem: loss, delay,
   low bandwidth) and through the relay; a fast-moving game scene stays smooth on the bad link.
 
@@ -171,6 +202,30 @@ has been verified.
 - Desktop: Windows, macOS, Linux (Rust core, platform hardware decode, gamepads).
 - Mobile: iOS and iPadOS (Swift, VideoToolbox), Android (Kotlin, MediaCodec); touch, keyboard,
   gamepads, pointer on iPad.
+- **Status:** all three are in, on one Rust core (`crates/rr-client`: WebTransport with datagrams
+  and FEC, the WebSocket, the relay with hole punching, pairing, mDNS), exposed to Swift as a C ABI
+  (`crates/rr-ffi`, an XCFramework) and to Kotlin through JNI (`crates/rr-jni`).
+  Desktop (`rein-remote-viewer`, winit): VideoToolbox's pictures go straight to the window's layer,
+  so the CPU never copies them; on this Mac (A18 Pro, server on the same machine, 1280×720 test
+  pattern, 902 of 902 barcodes read) 9 / 12 ms glass to glass p50 / p95 at 60 fps and ~10% of one
+  core (HEVC 9 / 18 ms; openh264 13 / 15 ms at 44%; relay then punched direct 13 / 15 ms); keys
+  typed into the window reached TextEdit behind other windows, the pointer arrived where sent.
+  Media Foundation and VA-API decoders (software fallback after three failures), gamepads through
+  gilrs, and on the server a virtual Xbox pad (uinput on Linux, read back in CI; ViGEmBus on
+  Windows). CI runs the viewer on all three in software: Windows 11 / 16 ms, Linux under Xvfb 34 /
+  36 ms. iOS and iPadOS (SwiftUI): VideoToolbox into `AVSampleBufferDisplayLayer`, Opus through
+  Apple's decoder in sync, touch gestures like the web client's, both keyboards, the iPad pointer,
+  gamepads, Bonjour, pairing by code or QR. In the iOS 26.5 simulator (iPhone 17): 60 fps, 9 / 15 ms
+  glass to glass (HEVC 9 / 17; WebSocket 17 / 22–40; relay then direct 12 / 28), a pointer move
+  seen in the picture 51–54 ms later, sound 15–22 ms from its picture, a UIKit tap landing as a
+  click; CI runs it in the simulator too. Android (Kotlin, MediaCodec onto a Surface, Opus into a
+  low-latency AudioTrack, NsdManager, the same gestures and gamepad bits): in the emulator at 720p,
+  59.6 fps, 13 / 29 ms glass to glass (the emulator's codec, which decodes on the host; Android's
+  software HEVC 12 / 57 ms), a tap through the touch system seen as a click in 103–136 ms, pairing
+  then a stored key; CI builds it and runs it in an emulator (38.5 fps, 36 / 40 ms). Real devices
+  still to verify, step by step: [desktop GPUs and gamepads](docs/verification/desktop-client.md),
+  [iPhone and iPad](docs/verification/ios-client.md),
+  [an Android phone](docs/verification/android-client.md).
 - **Verified:** each connects, streams and controls on real devices.
 
 ## Phase 6 — larger deployments
@@ -179,3 +234,27 @@ has been verified.
 - A relay fleet, health and metrics, headless install and config by file.
 - Signed and notarized binaries on every platform.
 - **Verified:** a multi-user deployment behind an identity provider, with policies enforced.
+- **Status:** all in. Sign-in: OIDC (code flow with PKCE, discovery, ID tokens checked on `ring`,
+  RS256 and ES256 only, the client secret from a file) and SAML (`--features saml`, samael on
+  xmlsec1, plus our own checks: the IdP's certificate required, the audience, each request answered
+  once, SHA-256 or stronger); a session cookie stored only as a hash, traded for a one-minute ticket
+  for WebTransport. Policies (`--policy`, TOML or JSON) by user, group or way in: view only (input
+  dropped), clipboard, audio, sources, recording, a time limit; no rule, no entry, with the reason
+  shown (rr-proto's new Access and Notice messages, which older clients skip). Audit log
+  (`--audit`, JSON lines, no secrets). Recording (`--record`, fragmented MP4 with the video as sent
+  and Opus). **Verified** (`tests/idp/run.sh`: Keycloak 26.2.5, rein-remote showing an xterm,
+  headless Chromium; OIDC and SAML both): alice (admins) streamed and her typed command ran; bob
+  (viewers) streamed but his 57 input events were dropped and his command never ran; carol (no
+  group) refused with the reason; no sign-in, 401; every event in the audit log and no secret in it;
+  only alice's session recorded, 40 of 40 frames, decoded by ffmpeg without a message. A real IdP
+  tenant (Okta, Entra, Google): [manual test](docs/verification/identity.md). Relay fleet: `serve
+  --relay A --relay B` keeps its room on every relay and the link lists the others after `#`;
+  `/healthz` and Prometheus `/metrics` on `serve` (token) and the relay (`--metrics-listen`,
+  localhost). Killing the relay a viewer was on: a frame through the other one 60 ms later (median
+  of 10, worst 85); behind one haproxy name in Docker, with relays killed outright, 1.16 s without a
+  picture (median of 5, worst 1.88). Config by file (`--config FILE.toml`, every flag a key, secrets
+  from files) and `install-service` (systemd, launchd, a Windows service or logon task): CI installs
+  a relay all six ways and it answers. Signing: `tools/sign` in release.yml when the secrets exist
+  (codesign with the hardened runtime and notarytool, signtool, cosign on SHA256SUMS); CI signs with
+  identities made on the runner and refuses a tampered copy on all three. Real certificates
+  (Developer ID with notarization, an OV/EV certificate): [manual test](docs/verification/signing.md).

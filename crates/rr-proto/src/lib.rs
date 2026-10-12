@@ -21,6 +21,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod fec;
+pub mod pair;
+pub mod punch;
 mod wire;
 
 pub use wire::{Reader, Writer};
@@ -75,13 +78,32 @@ pub struct Hello {
     pub max_width: u16,
     pub max_height: u16,
     pub max_fps: u16,
+    /// A server: it can stream the sound the machine plays. A client: it plays Opus (48 kHz,
+    /// stereo); a server sends `Audio` only to a client that says so.
     pub audio: bool,
     /// Bit set of `INPUT_*`: the input kinds a server accepts, or a client can send.
     pub input: u8,
     /// The client's display refresh rate as it measured it, in millihertz (59940 for 59.94 Hz); 0
     /// when unknown (a server, or a client older than Hello version 1). The server paces to it.
     pub refresh_mhz: u32,
+    /// Bit set of `FEATURE_*` (Hello version 2; 0 from older peers).
+    pub features: u32,
 }
+
+/// A client that takes video as datagrams with forward error correction (see [`fec`]), when the
+/// transport has datagrams (WebTransport, QUIC).
+pub const FEATURE_VIDEO_DATAGRAMS: u32 = 1;
+/// A viewer that can take a direct path when it came through a relay: it can punch through NAT and
+/// open QUIC itself (native clients; a browser can't, it has no UDP of its own). The host may then
+/// send a [`DirectOffer`].
+pub const FEATURE_DIRECT: u32 = 2;
+/// A client that takes `Audio` as datagrams of their own (one whole frame each, told apart from
+/// video's by the first byte: the frame's kind), when the transport has datagrams: a lost packet is a
+/// gap, never a wait. Without it, audio goes in order with the control messages.
+pub const FEATURE_AUDIO_DATAGRAMS: u32 = 4;
+/// A server that takes [`Input::Paste`] (a paste, told apart from typing so a policy can turn the
+/// clipboard off). A client sends a paste as `Paste` only to a server that says so, else as `Text`.
+pub const FEATURE_PASTE: u32 = 8;
 
 pub const INPUT_POINTER: u8 = 1;
 pub const INPUT_KEYBOARD: u8 = 2;
@@ -109,9 +131,11 @@ pub struct Video {
     pub data: Vec<u8>,
 }
 
-/// One Opus packet.
+/// One Opus packet (48 kHz, stereo; 10 or 20 ms).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Audio {
+    /// Capture time of its first sample, microseconds on the server's clock: the same clock as
+    /// `Video`'s, so a client plays sound and picture at the same delay.
     pub timestamp_us: u64,
     pub data: Vec<u8>,
 }
@@ -171,7 +195,7 @@ pub enum Input {
         down: bool,
         key: String,
     },
-    /// Text typed (an IME, a phone keyboard, a paste).
+    /// Text typed (an IME, a phone keyboard; a paste to a server without [`FEATURE_PASTE`]).
     Text {
         text: String,
     },
@@ -179,7 +203,10 @@ pub enum Input {
     Touch {
         points: Vec<(u8, u16, u16)>,
     },
-    /// A gamepad's state: buttons as a bit set, then sticks and triggers.
+    /// A gamepad's whole state, sent when any of it changes: `buttons` as a bit set of
+    /// [`gamepad`]'s `BUTTON_*`, the sticks (−32768 left/up … 32767 right/down), the triggers
+    /// (0 released … 255 fully pressed). `pad` tells a client's pads apart (0, 1…); a pad unplugged
+    /// is sent once more at rest, so nothing stays held.
     Gamepad {
         pad: u8,
         buttons: u32,
@@ -190,6 +217,38 @@ pub enum Input {
         lt: u8,
         rt: u8,
     },
+    /// Text pasted from the client's clipboard (input kind 9; only to a server with
+    /// [`FEATURE_PASTE`]: an older server skips input kinds it doesn't know).
+    Paste {
+        text: String,
+    },
+}
+
+/// What a gamepad's `buttons` bits mean: bit `n` is button `n` of the W3C Gamepad API's standard
+/// layout (an Xbox-style pad: A at the bottom of the four), so a browser's `gamepad.buttons[n]`
+/// maps straight to it. The triggers are also sent as analog values (`lt`, `rt`); their bits say
+/// they're pressed past half way. New buttons get new bits; a reader ignores bits it doesn't know.
+pub mod gamepad {
+    pub const BUTTON_SOUTH: u32 = 1 << 0;
+    pub const BUTTON_EAST: u32 = 1 << 1;
+    pub const BUTTON_WEST: u32 = 1 << 2;
+    pub const BUTTON_NORTH: u32 = 1 << 3;
+    pub const BUTTON_LEFT_BUMPER: u32 = 1 << 4;
+    pub const BUTTON_RIGHT_BUMPER: u32 = 1 << 5;
+    pub const BUTTON_LEFT_TRIGGER: u32 = 1 << 6;
+    pub const BUTTON_RIGHT_TRIGGER: u32 = 1 << 7;
+    /// Back / Select / View.
+    pub const BUTTON_SELECT: u32 = 1 << 8;
+    /// Start / Menu.
+    pub const BUTTON_START: u32 = 1 << 9;
+    pub const BUTTON_LEFT_STICK: u32 = 1 << 10;
+    pub const BUTTON_RIGHT_STICK: u32 = 1 << 11;
+    pub const BUTTON_UP: u32 = 1 << 12;
+    pub const BUTTON_DOWN: u32 = 1 << 13;
+    pub const BUTTON_LEFT: u32 = 1 << 14;
+    pub const BUTTON_RIGHT: u32 = 1 << 15;
+    /// The logo button (Xbox, PS, Home).
+    pub const BUTTON_GUIDE: u32 = 1 << 16;
 }
 
 /// What arrived and when: drives the bitrate, frame rate and resolution.
@@ -201,7 +260,68 @@ pub struct Feedback {
     pub decoded_us: u64,
     /// Frames lost since the last feedback.
     pub lost: u16,
+    /// Of the datagrams the client expected since the last feedback, the share that never came, in
+    /// thousandths (Feedback version 1; 0 from older clients, or without datagrams). It sets how much
+    /// parity goes with the video.
+    pub loss_permille: u16,
 }
+
+/// A way around the relay, offered by the host inside a sealed relayed session (so the relay, which
+/// can't read it, can't use or change any of it): where its QUIC socket may be reached, the
+/// certificate to expect there, and a ticket good for one session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectOffer {
+    /// The host's WebTransport socket as the relay saw it (its address on the far side of its NAT),
+    /// then its addresses on its own networks.
+    pub candidates: Vec<std::net::SocketAddr>,
+    /// The SHA-256 of the host's WebTransport certificate: the viewer accepts that one and no other.
+    pub cert_sha256: Vec<u8>,
+    /// What the host's gate lets in once (`?ticket=`), for a minute.
+    pub ticket: String,
+}
+
+/// The viewer's side of it: where its own QUIC socket may be reached (as the relay saw it, then on its
+/// networks). Both then send punch packets ([`punch`]) to the other's candidates, and the viewer opens
+/// WebTransport straight to the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectAnswer {
+    pub candidates: Vec<std::net::SocketAddr>,
+}
+
+/// What this viewer may do in this session, as the server's policy decided (server → client, after
+/// `Config`): so a client can say "view only" or "this session is recorded" instead of leaving the
+/// viewer to guess. The server enforces all of it whatever the client does with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Access {
+    /// Who the server took the viewer for (a signed-in user's name, "token", a paired device).
+    pub user: String,
+    /// Bit set of `ACCESS_*`.
+    pub flags: u32,
+    /// Seconds until the session ends by policy; 0: no limit.
+    pub seconds_left: u32,
+}
+
+/// Input is dropped: the viewer sees, and can't control.
+pub const ACCESS_VIEW_ONLY: u32 = 1;
+/// Pastes and clipboard messages are dropped.
+pub const ACCESS_NO_CLIPBOARD: u32 = 2;
+/// No sound for this viewer.
+pub const ACCESS_NO_AUDIO: u32 = 4;
+/// The session is being recorded.
+pub const ACCESS_RECORDED: u32 = 8;
+
+/// Something the viewer should be told, usually why the server is about to close the session
+/// (server → client). A client shows `text`; `code` is one of `NOTICE_*` (unknown codes: just show it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    pub code: u16,
+    pub text: String,
+}
+
+/// The session reached its policy's time limit and ends (sign in again for another).
+pub const NOTICE_TIME_LIMIT: u16 = 1;
+/// The viewer isn't allowed (any more) and the session ends.
+pub const NOTICE_REFUSED: u16 = 2;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
@@ -217,6 +337,10 @@ pub enum Message {
     Resize { width: u16, height: u16 },
     Ping { id: u32, sent_us: u64 },
     Pong { id: u32, sent_us: u64 },
+    DirectOffer(DirectOffer),
+    DirectAnswer(DirectAnswer),
+    Access(Access),
+    Notice(Notice),
 }
 
 /// Frame kinds on the wire.
@@ -233,23 +357,32 @@ pub mod kind {
     pub const RESIZE: u8 = 10;
     pub const PING: u8 = 11;
     pub const PONG: u8 = 12;
+    pub const DIRECT_OFFER: u8 = 13;
+    pub const DIRECT_ANSWER: u8 = 14;
+    pub const ACCESS: u8 = 15;
+    pub const NOTICE: u8 = 16;
 }
 
 /// Each message's version, written in its frame header: raised when a field is added at the end.
 pub mod version {
-    /// 1: `refresh_mhz`.
-    pub const HELLO: u8 = 1;
+    /// 1: `refresh_mhz`. 2: `features`.
+    pub const HELLO: u8 = 2;
     pub const CONFIG: u8 = 0;
     pub const VIDEO: u8 = 0;
     pub const AUDIO: u8 = 0;
     pub const CURSOR: u8 = 0;
     pub const INPUT: u8 = 0;
-    pub const FEEDBACK: u8 = 0;
+    /// 1: `loss_permille`.
+    pub const FEEDBACK: u8 = 1;
     pub const KEYFRAME_REQUEST: u8 = 0;
     pub const CLIPBOARD: u8 = 0;
     pub const RESIZE: u8 = 0;
     pub const PING: u8 = 0;
     pub const PONG: u8 = 0;
+    pub const DIRECT_OFFER: u8 = 0;
+    pub const DIRECT_ANSWER: u8 = 0;
+    pub const ACCESS: u8 = 0;
+    pub const NOTICE: u8 = 0;
 
     /// The version this build writes for a kind.
     pub fn of(kind: u8) -> u8 {
@@ -266,6 +399,10 @@ pub mod version {
             k::CLIPBOARD => CLIPBOARD,
             k::RESIZE => RESIZE,
             k::PING => PING,
+            k::DIRECT_OFFER => DIRECT_OFFER,
+            k::DIRECT_ANSWER => DIRECT_ANSWER,
+            k::ACCESS => ACCESS,
+            k::NOTICE => NOTICE,
             _ => PONG,
         }
     }
@@ -356,6 +493,7 @@ impl Message {
                 w.u8(h.audio as u8);
                 w.u8(h.input);
                 w.u32(h.refresh_mhz);
+                w.u32(h.features);
                 (kind::HELLO, 0)
             }
             Message::Config(c) => {
@@ -454,6 +592,10 @@ impl Message {
                         w.u8(*lt);
                         w.u8(*rt);
                     }
+                    Input::Paste { text } => {
+                        w.u8(9);
+                        w.str(text);
+                    }
                 }
                 (kind::INPUT, 0)
             }
@@ -462,6 +604,7 @@ impl Message {
                 w.u64(f.received_us);
                 w.u64(f.decoded_us);
                 w.u16(f.lost);
+                w.u16(f.loss_permille);
                 (kind::FEEDBACK, 0)
             }
             Message::KeyframeRequest => (kind::KEYFRAME_REQUEST, 0),
@@ -478,6 +621,27 @@ impl Message {
                 w.u32(*id);
                 w.u64(*sent_us);
                 (if matches!(self, Message::Ping { .. }) { kind::PING } else { kind::PONG }, 0)
+            }
+            Message::DirectOffer(o) => {
+                w.addrs(&o.candidates);
+                w.bytes(&o.cert_sha256);
+                w.str(&o.ticket);
+                (kind::DIRECT_OFFER, 0)
+            }
+            Message::DirectAnswer(a) => {
+                w.addrs(&a.candidates);
+                (kind::DIRECT_ANSWER, 0)
+            }
+            Message::Access(a) => {
+                w.str(&a.user);
+                w.u32(a.flags);
+                w.u32(a.seconds_left);
+                (kind::ACCESS, 0)
+            }
+            Message::Notice(n) => {
+                w.u16(n.code);
+                w.str(&n.text);
+                (kind::NOTICE, 0)
             }
         }
     }
@@ -519,6 +683,7 @@ impl Message {
                     audio: r.u8()? != 0,
                     input: r.u8()?,
                     refresh_mhz: r.or_u32(0)?,
+                    features: r.or_u32(0)?,
                 }))
             }
             kind::CONFIG => Some(Message::Config(Config {
@@ -593,6 +758,7 @@ impl Message {
                     lt: r.u8()?,
                     rt: r.u8()?,
                 },
+                9 => Input::Paste { text: r.str()? },
                 // An input kind this build doesn't know (a newer peer): skipped, not an error.
                 _ => return Ok((None, HEADER_LEN + len)),
             })),
@@ -601,6 +767,7 @@ impl Message {
                 received_us: r.u64()?,
                 decoded_us: r.u64()?,
                 lost: r.u16()?,
+                loss_permille: r.or_u16(0)?,
             })),
             kind::KEYFRAME_REQUEST => Some(Message::KeyframeRequest),
             kind::CLIPBOARD => Some(Message::Clipboard { text: r.str()? }),
@@ -616,6 +783,21 @@ impl Message {
                 id: r.u32()?,
                 sent_us: r.u64()?,
             }),
+            kind::DIRECT_OFFER => Some(Message::DirectOffer(DirectOffer {
+                candidates: r.addrs()?,
+                cert_sha256: r.bytes()?.to_vec(),
+                ticket: r.str()?,
+            })),
+            kind::DIRECT_ANSWER => Some(Message::DirectAnswer(DirectAnswer { candidates: r.addrs()? })),
+            kind::ACCESS => Some(Message::Access(Access {
+                user: r.str()?,
+                flags: r.u32()?,
+                seconds_left: r.u32()?,
+            })),
+            kind::NOTICE => Some(Message::Notice(Notice {
+                code: r.u16()?,
+                text: r.str()?,
+            })),
             _ => None,
         };
         Ok((msg, HEADER_LEN + len))

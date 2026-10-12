@@ -501,6 +501,10 @@ impl VideoEncoder for VideoToolbox {
     fn takes_surfaces(&self) -> bool {
         true
     }
+    // The session scales an image of another size to its own (in hardware).
+    fn scales_surfaces(&self) -> bool {
+        true
+    }
     fn encode_surface(&mut self, surface: &crate::capture::Surface, tag: u64) -> Result<Vec<Encoded>, String> {
         VideoToolbox::encode_surface(self, surface, tag)
     }

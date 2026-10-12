@@ -2,7 +2,9 @@
 // Measure a stream the way a viewer sees it: opens a rein-remote page in headless Chrome (over the
 // DevTools protocol, no dependencies), lets it play, and prints what its client measured: frames
 // shown a second, glass to glass (with `serve --test-pattern` and `?measure`), the decoder, the
-// display's refresh rate, and the server's own /stats.
+// display's refresh rate, and the server's own /stats. With sound: the packets the page got and
+// played, the offset sound and picture share, and with `serve --test-pattern` and `?measure`, sound
+// against picture: each beep's onset as it goes out against its flash as drawn (target: ±20 ms).
 //
 //   node tools/measure.mjs 'http://127.0.0.1:7979/?measure' [--seconds 10] [--warmup 2]
 //        [--chrome PATH] [--viewport 390x844] [--mobile] [--flags '--foo --bar']
@@ -96,7 +98,7 @@ await send('Emulation.setDeviceMetricsOverride', {width: vw, height: vh, deviceS
 if (argv.includes('--mobile')) await send('Emulation.setTouchEmulationEnabled', {enabled: true, maxTouchPoints: 5});
 await send('Page.navigate', {url});
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const statsExpr = `(() => { const s = window.reinRemote?.stats; return s && {...s, glassMs: [...s.glassMs]}; })()`;
+const statsExpr = `(() => { const s = window.reinRemote?.stats; return s && {...s, glassMs: [...s.glassMs], avSyncMs: [...(s.avSyncMs ?? [])], audio: s.audio && {...s.audio}}; })()`;
 // Until it's streaming.
 for (let i = 0; i < 100 && (await evaluate(statsExpr))?.state !== 'streaming'; i++) await sleep(100);
 await sleep(warmup * 1000);
@@ -127,6 +129,22 @@ console.log(
       mbit: +((((b?.bytes ?? 0) - (a?.bytes ?? 0)) * 8) / dt / 1e6).toFixed(2),
       glassMs: glass.length ? {p50: pct(glass, 0.5), p95: pct(glass, 0.95), samples: glass.length} : null,
       error: b?.error || undefined,
+      fec: b?.fecRecovered !== undefined ? {recovered: b.fecRecovered, lost: b.fecLost} : undefined,
+      audio: b?.audio
+        ? {
+            ...b.audio,
+            packets: b.audio.packets - (a?.audio?.packets ?? 0),
+            played: b.audio.played - (a?.audio?.played ?? 0),
+            dropped: b.audio.dropped - (a?.audio?.dropped ?? 0),
+          }
+        : undefined,
+      // Beep minus flash, ms (positive: the sound comes after the picture), over the measured seconds.
+      avSyncMs: (() => {
+        const seen = (b?.avSyncMs ?? []).slice(a?.avSyncMs?.length ?? 0);
+        const v = [...seen].sort((x, y) => x - y);
+        const abs = v.map(Math.abs).sort((x, y) => x - y);
+        return v.length ? {p50: pct(v, 0.5), p95abs: pct(abs, 0.95), min: v[0], max: v[v.length - 1], samples: v.length, values: seen} : undefined;
+      })(),
       server,
     },
     null,

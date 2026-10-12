@@ -8,7 +8,11 @@
 //!   rein-remote serve --app Safari         # one app, all its windows (macOS)
 //!   rein-remote serve --display 2          # a display (macOS: its number in `displays`; Linux: :N)
 //!   rein-remote windows [--json]           # the windows it can show
+//!   rein-remote serve --config serve.toml  # flags from a file (TOML, each key a flag's name)
+//!   rein-remote install-service --config serve.toml [--print]   # started with the session (systemd, launchd, a task)
 //!   rein-remote displays                   # the displays (macOS)
+//!   rein-remote discover                   # Rein Remote servers on this network (mDNS)
+//!   rein-remote connect URL|NAME --seconds 10   # a viewer that counts what comes (transport, fps, latency)
 //!   rein-remote selftest --window Notepad --type hi   # capture works, and typing changes what's seen
 //!   rein-remote selftest --test-pattern 1920x1080 --encode out.h264   # the encoder in use, timed; its stream saved
 //!   rein-remote serve --listen 0.0.0.0:7979 --fps 60 --bitrate 8000   # --fps auto (the default): the viewer's display rate
@@ -16,9 +20,13 @@
 //!                                                      # (or REIN_REMOTE_TOKEN; kept out of `ps`)
 
 mod adapt;
+mod audio;
+mod audit;
+mod auth;
 mod capture;
+mod config;
 mod conn;
-mod e2e;
+mod connect;
 mod encode;
 #[cfg(windows)]
 mod encode_mf;
@@ -26,26 +34,49 @@ mod encode_mf;
 mod encode_vaapi;
 #[cfg(target_os = "macos")]
 mod encode_vt;
+mod fleet;
+mod gamepad;
 #[cfg(target_os = "linux")]
 mod h264;
+mod identity;
 mod link;
 mod links;
+mod metrics;
+mod pairing;
+mod policy;
+mod record;
 mod relay;
 mod serve;
+mod service;
 mod yuv;
 
+use audio::Sound;
 use capture::{Source, TestPattern};
 
 fn usage() -> ! {
     eprintln!(
-        "rein-remote {}\n\nusage:\n  rein-remote serve [--display :N | --window APP|TITLE|ID | --app NAME | --kms [CONNECTOR] | --vnc HOST:PORT [--vnc-password P] | --pipe WxH | --test-pattern [WxH]] [--listen ADDR] [--fps auto|N] [--codec h264|h265|auto] [--bitrate KBPS] [--token T] [--webtransport on|off] [--tls-cert PEM --tls-key PEM] [--tailscale-cert on|off] [--relay ws(s)://HOST:PORT [--room CODE] [--relay-secret S]]\n  rein-remote relay [--listen ADDR] [--secret S]\n  rein-remote windows [--json]\n  rein-remote displays\n  rein-remote selftest [--window Q | --display :N | --kms [CONNECTOR] | --test-pattern [WxH]] [--type TEXT] [--encode OUT.h264 [--frames N]]\n  rein-remote --version",
+        "rein-remote {}\n\nusage:\n  rein-remote serve [--config FILE.toml] [--display :N | --window APP|TITLE|ID | --app NAME | --kms [CONNECTOR] | --vnc HOST:PORT [--vnc-password P] | --pipe WxH | --test-pattern [WxH] [--motion full]] [--listen ADDR] [--fps auto|N] [--codec h264|h265|auto] [--bitrate KBPS] [--token T] [--webtransport on|off] [--tls-cert PEM --tls-key PEM] [--tailscale-cert on|off] [--mdns on|off] [--pair on|off] [--relay ws(s)://HOST:PORT ... [--room CODE] [--relay-secret S]] [--audio on|off] [--public-url URL --oidc-issuer URL --oidc-client-id ID [--oidc-client-secret-file F] [--oidc-scopes S] [--oidc-user-claim C] [--oidc-groups-claim C] | --saml-idp-metadata FILE|URL [--saml-entity-id ID] [--saml-user-attr A] [--saml-groups-attr A]] [--policy FILE] [--audit FILE] [--record DIR]\n  rein-remote relay [--config FILE.toml] [--listen ADDR] [--secret S] [--metrics-listen ADDR|PORT|off]\n  rein-remote install-service [serve|relay] [--config FILE.toml] [--system] [--name NAME] [--print]\n  rein-remote uninstall-service [serve|relay] [--system] [--name NAME] [--print]\n  rein-remote windows [--json]\n  rein-remote displays\n  rein-remote discover [SECONDS]\n  rein-remote paired | unpair ID\n  rein-remote connect URL|NAME [--seconds N] [--pair CODE] [--json] [--webtransport on|off] [--datagrams on|off] [--direct on|off]\n  rein-remote selftest [--window Q | --display :N | --kms [CONNECTOR] | --test-pattern [WxH]] [--type TEXT] [--encode OUT.h264 [--frames N]]\n  rein-remote --version",
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(2);
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    std::process::exit(dispatch(std::env::args().skip(1).collect()));
+}
+
+/// A command and its arguments (also what a Windows service runs): the exit code.
+fn dispatch(mut args: Vec<String>) -> i32 {
+    // A service's flags from a file (`--config PATH`, TOML: each key a flag's name); the command line wins.
+    if matches!(args.first().map(String::as_str), Some("serve" | "relay")) {
+        match config::expand(&args[1..]) {
+            Ok(flags) => args.splice(1.., flags).for_each(drop),
+            Err(e) => {
+                eprintln!("rein-remote: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
     match args.first().map(String::as_str) {
         Some("--version") | Some("-V") => println!("rein-remote {}", env!("CARGO_PKG_VERSION")),
         Some("windows") => match list_windows(args.get(1).map(String::as_str) == Some("--json")) {
@@ -62,17 +93,78 @@ fn main() {
                 std::process::exit(1);
             }
         },
+        Some("paired") => {
+            let list = pairing::devices();
+            if list.is_empty() {
+                eprintln!("rein-remote: no devices paired (serve shows a code to pair one)");
+            }
+            for d in list {
+                println!("{}  {}  (since {})", d.id, if d.name.is_empty() { "?" } else { &d.name }, d.since);
+            }
+        }
+        Some("unpair") => match args.get(1).map(|id| pairing::unpair(id)) {
+            Some(Ok(true)) => println!("rein-remote: unpaired"),
+            Some(Ok(false)) => {
+                eprintln!("rein-remote: no paired device has that id (rein-remote paired lists them)");
+                std::process::exit(1);
+            }
+            Some(Err(e)) => {
+                eprintln!("rein-remote: {e}");
+                std::process::exit(1);
+            }
+            None => usage(),
+        },
+        Some("discover") => {
+            let secs = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(3);
+            match rr_client::discover::discover(std::time::Duration::from_secs(secs)) {
+                Ok(list) if list.is_empty() => eprintln!("rein-remote: none found on this network in {secs} s"),
+                Ok(list) => {
+                    for f in list {
+                        let addrs: Vec<String> = f.addrs.iter().map(|a| a.to_string()).collect();
+                        println!(
+                            "{}  {}://{}:{}  id {}{}{}",
+                            f.name,
+                            if f.https { "https" } else { "http" },
+                            addrs.first().map_or("?", |a| a.as_str()),
+                            f.port,
+                            f.id,
+                            f.webtransport.map_or(String::new(), |p| format!("  webtransport udp {p}")),
+                            if addrs.len() > 1 {
+                                format!("  (also {})", addrs[1..].join(", "))
+                            } else {
+                                String::new()
+                            }
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("rein-remote: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Some("relay") => {
             let (mut listen, mut secret) = ("0.0.0.0:7990".to_string(), std::env::var("REIN_REMOTE_RELAY_SECRET").ok());
+            // Metrics on this machine only, unless asked: a port number alone is 127.0.0.1's.
+            let mut metrics = Some("127.0.0.1:7991".to_string());
             let mut it = args[1..].iter();
             while let Some(a) = it.next() {
                 match (a.as_str(), it.next()) {
                     ("--listen", Some(v)) => listen = v.clone(),
                     ("--secret", Some(v)) => secret = Some(v.clone()),
+                    ("--metrics-listen", Some(v)) if v == "off" => metrics = None,
+                    ("--metrics-listen", Some(v)) if v.parse::<u16>().is_ok() => metrics = Some(format!("127.0.0.1:{v}")),
+                    ("--metrics-listen", Some(v)) => metrics = Some(v.clone()),
                     _ => usage(),
                 }
             }
-            if let Err(e) = relay::run(&listen, secret) {
+            if let Err(e) = relay::run(&listen, secret, metrics.as_deref()) {
+                eprintln!("rein-remote: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some("connect") => {
+            if let Err(e) = connect::run(&args[1..]) {
                 eprintln!("rein-remote: {e}");
                 std::process::exit(1);
             }
@@ -87,11 +179,25 @@ fn main() {
         Some("serve") => {
             if let Err(e) = serve_cmd(&args[1..]) {
                 eprintln!("rein-remote: {e}");
-                std::process::exit(1);
+                return 1;
+            }
+        }
+        Some(c @ ("install-service" | "uninstall-service")) => {
+            if let Err(e) = service::run(&args[1..], c == "install-service") {
+                eprintln!("rein-remote: {e}");
+                return 1;
+            }
+        }
+        #[cfg(windows)]
+        Some("service-run") => {
+            if let Err(e) = service::windows::run(&args[1..]) {
+                eprintln!("rein-remote: {e}");
+                return 1;
             }
         }
         _ => usage(),
     }
+    0
 }
 
 fn serve_cmd(args: &[String]) -> Result<(), String> {
@@ -106,13 +212,26 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
         relay: None,
         tls: None,
         tailscale_cert: true,
+        mdns: true,
+        pair: None,
+        audio: None,
         e2e_key: {
             let mut k = [0u8; 32];
             let _ = getrandom::fill(&mut k);
             k
         },
+        signin: None,
+        policy: None,
+        audit: Default::default(),
+        record: None,
+        source_label: String::new(),
     };
-    let (mut relay, mut room, mut relay_secret) = (None, None, std::env::var("REIN_REMOTE_RELAY_SECRET").ok());
+    // Sign-in with an identity provider; a policy; the audit log; recording.
+    let (mut public_url, mut oidc_issuer, mut oidc_client, mut oidc_secret_file) = (None, None, None, None);
+    let (mut oidc_scopes, mut oidc_user_claim, mut oidc_groups_claim) = ("openid email profile".to_string(), "email".to_string(), "groups".to_string());
+    let (mut saml_metadata, mut saml_entity, mut saml_user_attr, mut saml_groups_attr) = (None, None, None, "groups".to_string());
+    let (mut policy, mut audit) = (None, None);
+    let (mut relay, mut room, mut relay_secret) = (Vec::new(), None, std::env::var("REIN_REMOTE_RELAY_SECRET").ok());
     let (mut tls_cert, mut tls_key) = (None, None);
     let mut display: Option<String> = None;
     let mut window: Option<String> = None;
@@ -121,7 +240,11 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
     let mut pipe: Option<(usize, usize)> = None;
     let mut vnc_password = std::env::var("REIN_REMOTE_VNC_PASSWORD").ok();
     let mut pattern: Option<(usize, usize)> = None;
+    let mut full_motion = false;
     let mut kms: Option<Option<String>> = None;
+    // Sound: on unless turned off; for a VNC display or piped frames, off unless turned on (this
+    // machine's sound isn't theirs).
+    let mut sound: Option<bool> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut val = || it.next().cloned().ok_or_else(|| format!("{a} needs a value"));
@@ -147,6 +270,7 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
             "--display" => display = Some(val()?),
             "--window" => window = Some(val()?),
             "--app" => app = Some(val()?),
+            "--motion" => full_motion = val()? == "full",
             "--vnc" => vnc = Some(val()?),
             "--pipe" => {
                 let v = val()?;
@@ -155,15 +279,52 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
             }
             "--vnc-password" => vnc_password = Some(val()?),
             "--token" => opts.token = Some(val()?),
-            "--relay" => relay = Some(val()?),
+            "--public-url" => public_url = Some(val()?),
+            "--oidc-issuer" => oidc_issuer = Some(val()?),
+            "--oidc-client-id" => oidc_client = Some(val()?),
+            "--oidc-client-secret-file" => oidc_secret_file = Some(val()?),
+            "--oidc-client-secret" => return Err("the client secret goes in a file (--oidc-client-secret-file) or REIN_REMOTE_OIDC_CLIENT_SECRET, never on the command line (where `ps` shows it)".into()),
+            "--oidc-scopes" => oidc_scopes = val()?,
+            "--oidc-user-claim" => oidc_user_claim = val()?,
+            "--oidc-groups-claim" => oidc_groups_claim = val()?,
+            "--saml-idp-metadata" => saml_metadata = Some(val()?),
+            "--saml-entity-id" => saml_entity = Some(val()?),
+            "--saml-user-attr" => saml_user_attr = Some(val()?),
+            "--saml-groups-attr" => saml_groups_attr = val()?,
+            "--policy" => policy = Some(val()?),
+            "--audit" => audit = Some(val()?),
+            "--record" => opts.record = Some(std::path::PathBuf::from(val()?)),
+            // Again (or A,B): a fleet.
+            "--relay" => relay.push(val()?),
             "--tls-cert" => tls_cert = Some(std::path::PathBuf::from(val()?)),
             "--tls-key" => tls_key = Some(std::path::PathBuf::from(val()?)),
             "--tailscale-cert" => opts.tailscale_cert = !matches!(val()?.as_str(), "off" | "false" | "no"),
+            "--mdns" => opts.mdns = !matches!(val()?.as_str(), "off" | "false" | "no"),
+            "--pair" => opts.pair = Some(!matches!(val()?.as_str(), "off" | "false" | "no")),
             "--room" => room = Some(val()?),
             "--relay-secret" => relay_secret = Some(val()?),
             "--webtransport" => opts.webtransport = !matches!(val()?.as_str(), "off" | "false" | "no"),
-            "--test-pattern" => pattern = Some(size_arg(&mut it)?.unwrap_or((1280, 720))),
-            "--kms" => kms = Some(optional_arg(&mut it)),
+            // `on`/`off` too (what `true`/`false` are in a config file).
+            "--test-pattern" => {
+                pattern = match on_off(&mut it) {
+                    Some(false) => None,
+                    _ => Some(size_arg(&mut it)?.unwrap_or((1280, 720))),
+                }
+            }
+            "--kms" => {
+                kms = match on_off(&mut it) {
+                    Some(false) => None,
+                    Some(true) => Some(None),
+                    None => Some(optional_arg(&mut it)),
+                }
+            }
+            "--audio" => {
+                sound = Some(match val()?.as_str() {
+                    "on" | "true" | "yes" => true,
+                    "off" | "false" | "no" => false,
+                    _ => return Err("--audio is on or off".into()),
+                })
+            }
             _ => usage(),
         }
     }
@@ -172,15 +333,37 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
         (None, None) => {}
         _ => return Err("--tls-cert and --tls-key go together".into()),
     }
-    // Reachable from other machines: never without a token (the link carries it).
+    if let Some(p) = &policy {
+        opts.policy = Some(policy::Policy::load(std::path::Path::new(p))?);
+    }
+    if let Some(a) = &audit {
+        opts.audit = std::sync::Arc::new(audit::Audit::open(std::path::Path::new(a))?);
+    }
+    opts.signin = signin(SignInArgs {
+        public_url,
+        oidc_issuer,
+        oidc_client,
+        oidc_secret_file,
+        oidc_scopes,
+        oidc_user_claim,
+        oidc_groups_claim,
+        saml_metadata,
+        saml_entity,
+        saml_user_attr,
+        saml_groups_attr,
+    })?
+    .map(std::sync::Arc::new);
+    // Reachable from other machines: never without a token (the link carries it), unless viewers sign
+    // in with the identity provider instead (then a token only when one is given).
     let loopback = opts.listen.starts_with("127.") || opts.listen.starts_with("localhost") || opts.listen.starts_with("[::1]");
-    if opts.token.is_none() && !loopback {
+    if opts.token.is_none() && !loopback && opts.signin.is_none() {
         let mut b = [0u8; 24];
         let _ = getrandom::fill(&mut b);
         const ALPHABET: &[u8] = b"abcdefghijkmnpqrstuvwxyz23456789";
         opts.token = Some(b.iter().map(|x| ALPHABET[*x as usize % 32] as char).collect());
     }
-    if let Some(r) = relay {
+    let relay = fleet::relays(&relay);
+    if !relay.is_empty() {
         // A room code nobody can guess: 24 characters from the system's randomness.
         let room = room.unwrap_or_else(|| {
             let mut b = [0u8; 24];
@@ -191,18 +374,114 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
         if room.len() < 16 {
             return Err("--room needs 16 characters or more (or leave it out for a random one)".into());
         }
-        opts.relay = Some((r, room, relay_secret));
+        opts.relay = Some((relay, room, relay_secret));
     }
-    let source: Box<dyn Source> = match (pattern, window) {
-        (Some((w, h)), _) => Box::new(TestPattern::new(w, h)),
-        (None, _) if kms.is_some() => open_kms(kms.unwrap().as_deref())?,
-        (None, _) if pipe.is_some() => Box::new(capture::pipe::Pipe::open(pipe.unwrap().0, pipe.unwrap().1)),
-        (None, _) if vnc.is_some() => Box::new(capture::vnc::Vnc::open(vnc.as_deref().unwrap(), vnc_password.as_deref())?),
+    // What it shows, as a policy's `sources` names it.
+    opts.source_label = match (&pattern, &window) {
+        (Some(_), _) => "test-pattern".into(),
+        (None, _) if kms.is_some() => "kms".into(),
+        (None, _) if pipe.is_some() => "pipe".into(),
+        (None, _) if vnc.is_some() => format!("vnc:{}", vnc.as_deref().unwrap()),
+        (None, Some(q)) => format!("window:{q}"),
+        (None, None) if app.is_some() => format!("app:{}", app.as_deref().unwrap()),
+        (None, None) => display.as_ref().map_or("display".into(), |d| format!("display:{d}")),
+    };
+    let elsewhere = || if sound == Some(true) { Sound::System } else { Sound::Off };
+    let (source, with): (Box<dyn Source>, Sound) = match (pattern, window) {
+        (Some((w, h)), _) if full_motion => (Box::new(TestPattern::full_motion(w, h)), Sound::Tone),
+        (Some((w, h)), _) => (Box::new(TestPattern::new(w, h)), Sound::Tone),
+        (None, _) if kms.is_some() => (open_kms(kms.unwrap().as_deref())?, Sound::System),
+        (None, _) if pipe.is_some() => (Box::new(capture::pipe::Pipe::open(pipe.unwrap().0, pipe.unwrap().1)), elsewhere()),
+        (None, _) if vnc.is_some() => (
+            Box::new(capture::vnc::Vnc::open(vnc.as_deref().unwrap(), vnc_password.as_deref())?),
+            elsewhere(),
+        ),
         (None, Some(q)) => open_window(&q)?,
         (None, None) if app.is_some() => open_app(app.as_deref().unwrap())?,
         (None, None) => open_display(display.as_deref())?,
     };
+    opts.audio = audio::Audio::new(if sound == Some(false) { Sound::Off } else { with });
     serve::run(source, opts)
+}
+
+struct SignInArgs {
+    public_url: Option<String>,
+    oidc_issuer: Option<String>,
+    oidc_client: Option<String>,
+    oidc_secret_file: Option<String>,
+    oidc_scopes: String,
+    oidc_user_claim: String,
+    oidc_groups_claim: String,
+    saml_metadata: Option<String>,
+    saml_entity: Option<String>,
+    saml_user_attr: Option<String>,
+    saml_groups_attr: String,
+}
+
+/// Sign-in with an identity provider, as the flags set it up (None: not asked for). The provider is
+/// reached now, so a wrong issuer or metadata fails at start, not when someone signs in.
+fn signin(a: SignInArgs) -> Result<Option<auth::SignIn>, String> {
+    if a.oidc_issuer.is_none() && a.saml_metadata.is_none() {
+        if a.oidc_client.is_some() || a.public_url.is_some() {
+            return Err("--oidc-client-id and --public-url go with --oidc-issuer (or --saml-idp-metadata)".into());
+        }
+        return Ok(None);
+    }
+    // Where the provider sends browsers back: it must be told exactly (never guessed from a request).
+    let public = a.public_url.ok_or(
+        "sign-in needs --public-url (how browsers reach this server, e.g. https://remote.example.com), the address the identity provider sends them back to",
+    )?;
+    if !(public.starts_with("https://") || public.starts_with("http://")) || public.contains('?') || public.contains('#') {
+        return Err(format!("--public-url {public}: an http(s):// URL with no query"));
+    }
+    if public.starts_with("http://") {
+        eprintln!("rein-remote: --public-url is plain HTTP: the session cookie isn't Secure (for a test setup only)");
+    }
+    let mut s = auth::SignIn::new(&public);
+    if let Some(issuer) = a.oidc_issuer {
+        let client_id = a.oidc_client.ok_or("--oidc-issuer needs --oidc-client-id")?;
+        // The secret from a file or the environment (a command line shows in `ps`).
+        let client_secret = match a.oidc_secret_file {
+            Some(f) => Some(
+                std::fs::read_to_string(&f)
+                    .map_err(|e| format!("--oidc-client-secret-file {f}: {e}"))?
+                    .trim()
+                    .to_string(),
+            ),
+            None => std::env::var("REIN_REMOTE_OIDC_CLIENT_SECRET").ok().filter(|v| !v.is_empty()),
+        };
+        let o = auth::oidc::Oidc::discover(auth::oidc::Config {
+            issuer,
+            client_id,
+            client_secret,
+            redirect_uri: format!("{}/sso/oidc/callback", s.public_url),
+            scopes: a.oidc_scopes,
+            user_claim: a.oidc_user_claim,
+            groups_claim: a.oidc_groups_claim,
+        })
+        .map_err(|e| format!("OIDC: {e}"))?;
+        eprintln!("rein-remote: OIDC with {} (redirect URI {}/sso/oidc/callback)", o.issuer(), s.public_url);
+        s.oidc = Some(o);
+    }
+    if let Some(m) = a.saml_metadata {
+        #[cfg(feature = "saml")]
+        {
+            let entity = a.saml_entity.unwrap_or_else(|| format!("{}/sso/saml/metadata", s.public_url));
+            let saml = auth::saml::Saml::new(&m, &entity, &s.public_url, a.saml_user_attr, a.saml_groups_attr).map_err(|e| format!("SAML: {e}"))?;
+            eprintln!(
+                "rein-remote: SAML with {} (this service provider: {entity}, ACS {}/sso/saml/acs)",
+                saml.idp_entity(),
+                s.public_url
+            );
+            s.saml = Some(saml);
+        }
+        #[cfg(not(feature = "saml"))]
+        {
+            let _ = (m, a.saml_entity, a.saml_user_attr, a.saml_groups_attr);
+            return Err("this build has no SAML (build with `--features saml`, which needs libxmlsec1)".into());
+        }
+    }
+    Ok(Some(s))
 }
 
 /// `--test-pattern`'s optional size (the next argument when it's WxH).
@@ -213,6 +492,17 @@ fn size_arg(it: &mut std::slice::Iter<String>) -> Result<Option<(usize, usize)>,
     let size = (w.parse().map_err(|_| "WxH")?, h.parse().map_err(|_| "WxH")?);
     it.next();
     Ok(Some(size))
+}
+
+/// A flag that takes an optional value given `on` or `off`: which (and it's taken), or None.
+fn on_off(it: &mut std::slice::Iter<String>) -> Option<bool> {
+    let v = match it.clone().next().map(String::as_str) {
+        Some("on" | "true" | "yes") => true,
+        Some("off" | "false" | "no") => false,
+        _ => return None,
+    };
+    it.next();
+    Some(v)
 }
 
 /// A flag's optional value (the next argument, unless it's another flag).
@@ -257,19 +547,24 @@ fn open_kms(_connector: Option<&str>) -> Result<Box<dyn Source>, String> {
     Err("--kms is Linux's (the screen through the kernel's display driver)".into())
 }
 
+// Each source with the sound that goes with it: on macOS, ScreenCaptureKit's for the same content
+// (one app's sound for a window or an app); elsewhere, everything the machine plays.
+
 #[cfg(target_os = "macos")]
-fn open_window(query: &str) -> Result<Box<dyn Source>, String> {
-    Ok(Box::new(capture::mac::MacWindow::open(query)?))
+fn open_window(query: &str) -> Result<(Box<dyn Source>, Sound), String> {
+    let w = capture::mac::MacWindow::open(query)?;
+    let sound = Sound::Mac(w.sound());
+    Ok((Box::new(w), sound))
 }
 
 #[cfg(target_os = "linux")]
-fn open_window(query: &str) -> Result<Box<dyn Source>, String> {
-    Ok(Box::new(capture::x11::X11::open_window(None, query)?))
+fn open_window(query: &str) -> Result<(Box<dyn Source>, Sound), String> {
+    Ok((Box::new(capture::x11::X11::open_window(None, query)?), Sound::System))
 }
 
 #[cfg(windows)]
-fn open_window(query: &str) -> Result<Box<dyn Source>, String> {
-    Ok(Box::new(capture::win::WinSource::open_window(query)?))
+fn open_window(query: &str) -> Result<(Box<dyn Source>, Sound), String> {
+    Ok((Box::new(capture::win::WinSource::open_window(query)?), Sound::System))
 }
 
 #[cfg(target_os = "macos")]
@@ -357,31 +652,35 @@ fn esc(s: &str) -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn open_display(display: Option<&str>) -> Result<Box<dyn Source>, String> {
-    Ok(Box::new(capture::x11::X11::open(display)?))
+fn open_display(display: Option<&str>) -> Result<(Box<dyn Source>, Sound), String> {
+    Ok((Box::new(capture::x11::X11::open(display)?), Sound::System))
 }
 
 #[cfg(target_os = "macos")]
-fn open_display(display: Option<&str>) -> Result<Box<dyn Source>, String> {
-    Ok(Box::new(capture::mac::MacWindow::open_display(display)?))
+fn open_display(display: Option<&str>) -> Result<(Box<dyn Source>, Sound), String> {
+    let d = capture::mac::MacWindow::open_display(display)?;
+    let sound = Sound::Mac(d.sound());
+    Ok((Box::new(d), sound))
 }
 
 #[cfg(target_os = "macos")]
-fn open_app(query: &str) -> Result<Box<dyn Source>, String> {
-    Ok(Box::new(capture::mac::MacWindow::open_app(query)?))
+fn open_app(query: &str) -> Result<(Box<dyn Source>, Sound), String> {
+    let a = capture::mac::MacWindow::open_app(query)?;
+    let sound = Sound::Mac(a.sound());
+    Ok((Box::new(a), sound))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn open_app(_query: &str) -> Result<Box<dyn Source>, String> {
+fn open_app(_query: &str) -> Result<(Box<dyn Source>, Sound), String> {
     Err("--app is for macOS (elsewhere, --window shows one of an app's windows)".into())
 }
 
 #[cfg(windows)]
-fn open_display(display: Option<&str>) -> Result<Box<dyn Source>, String> {
+fn open_display(display: Option<&str>) -> Result<(Box<dyn Source>, Sound), String> {
     if display.is_some() {
         return Err("--display is for Linux and macOS; on Windows, no source streams the primary display".into());
     }
-    Ok(Box::new(capture::win::WinSource::open_display()?))
+    Ok((Box::new(capture::win::WinSource::open_display()?), Sound::System))
 }
 
 #[cfg(target_os = "macos")]
@@ -487,9 +786,9 @@ fn selftest(args: &[String]) -> Result<String, String> {
     let mut src: Box<dyn Source> = match (pattern, window) {
         (Some((w, h)), _) => Box::new(TestPattern::new(w, h)),
         (None, _) if kms.is_some() => open_kms(kms.clone().unwrap().as_deref())?,
-        (None, Some(q)) => open_window(&q)?,
-        (None, None) if app.is_some() => open_app(app.as_deref().unwrap())?,
-        (None, None) => open_display(display.as_deref())?,
+        (None, Some(q)) => open_window(&q)?.0,
+        (None, None) if app.is_some() => open_app(app.as_deref().unwrap())?.0,
+        (None, None) => open_display(display.as_deref())?.0,
     };
     if let Some(path) = encode_to {
         return encode_test(&mut src, &path, frames);

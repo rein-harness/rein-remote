@@ -21,6 +21,25 @@ export interface Stats {
   refreshHz: number;
   /** Frames shown in the last second. */
   fps: number;
+  /**
+   * What the server's policy lets this viewer do (null until the server says, and from a server
+   * without policies). The server enforces it whatever the page does with it.
+   */
+  access: Access | null;
+}
+
+export interface Access {
+  /** Who the server took this viewer for (a signed-in user, "token", a paired device). */
+  user: string;
+  /** Input is dropped: the viewer can watch and not control. */
+  viewOnly: boolean;
+  /** Pastes are let through. */
+  clipboard: boolean;
+  audio: boolean;
+  /** The session is being recorded. */
+  recorded: boolean;
+  /** Seconds until the session ends by policy when it started (0: no limit). */
+  secondsLeft: number;
 }
 
 export interface ConnectOptions {

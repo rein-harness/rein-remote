@@ -16,6 +16,16 @@ pub mod win;
 pub mod x11;
 
 use rr_proto::{CursorShape, Input};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// When the test pattern's latest flash was captured (µs, the video's clock; 0: none yet): the test
+/// tone beeps from that very microsecond (audio::tone), for measuring audio against video.
+pub static FLASH_ONSET_US: AtomicU64 = AtomicU64::new(0);
+
+/// The test pattern flashes for the first 100 ms of every second.
+pub fn flashing(at_us: u64) -> bool {
+    at_us / 1000 % 1000 < 100
+}
 
 pub struct Frame<'a> {
     pub bgra: &'a [u8],
@@ -115,6 +125,13 @@ pub struct TestPattern {
     pointer: Option<(usize, usize)>,
     /// What was drawn over the background last frame, to put back: the block's left edge, the cross.
     drawn: Option<(usize, Option<(usize, usize)>)>,
+    /// Full motion (`--motion full`): a detailed scene scrolling under it all, every pixel changing
+    /// every frame, as a game's would; the texture it scrolls (twice the width, so rows copy whole).
+    scene: Option<Vec<u8>>,
+    /// Whether the flash (a white square, top left) was on in the last frame.
+    flash: bool,
+    /// The time to draw (µs) instead of now: tests.
+    at_us: Option<u64>,
 }
 
 impl TestPattern {
@@ -126,7 +143,40 @@ impl TestPattern {
             buf: vec![0; w * h * 4],
             pointer: None,
             drawn: None,
+            scene: None,
+            flash: false,
+            at_us: None,
         }
+    }
+
+    /// Every pixel moving every frame: a busy textured scene scrolling diagonally (hard to encode, as
+    /// a game is), with the block, the barcode and the pointer's cross on top.
+    pub fn full_motion(w: usize, h: usize) -> Self {
+        let mut t = Self::new(w, h);
+        let tw = w * 2;
+        let mut scene = vec![0u8; tw * h * 4];
+        let mut x: u32 = 0x9e37_79b9;
+        for (i, px) in scene.chunks_exact_mut(4).enumerate() {
+            let (cx, cy) = ((i % tw) as u32, (i / tw) as u32);
+            // Smooth bands plus fine noise: gradients and detail, like a rendered scene.
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            let n = (x & 63) as u8;
+            px.copy_from_slice(&[
+                (((cx * 3 + cy) % 256) as u8).wrapping_add(n),
+                (((cx + cy * 2) / 3 % 256) as u8).wrapping_add(n / 2),
+                ((((cx ^ cy) >> 2) % 256) as u8).wrapping_add(n / 3),
+                255,
+            ]);
+        }
+        t.scene = Some(scene);
+        t
+    }
+
+    /// The flash's square: the top left sixth.
+    fn flash_area(&self) -> (usize, usize) {
+        (self.w / 6, self.h / 6)
     }
 
     fn background(&mut self, x0: usize, x1: usize, y0: usize, y1: usize) {
@@ -164,8 +214,18 @@ impl Source for TestPattern {
     fn grab(&mut self) -> Result<Frame<'_>, String> {
         self.n += 1;
         let (w, h, n) = (self.w, self.h, self.n as usize);
+        // Full motion: the scene, scrolled on, under everything (all of it changes).
+        if let Some(scene) = &self.scene {
+            let (tw, dx, dy) = (w * 2, (n * 6) % w.max(1), (n * 2) % h.max(1));
+            for y in 0..h {
+                let sy = (y + dy) % h;
+                self.buf[y * w * 4..(y + 1) * w * 4].copy_from_slice(&scene[(sy * tw + dx) * 4..(sy * tw + dx + w) * 4]);
+            }
+            self.drawn = Some((0, None));
+        }
         // The background once; after that, only what was drawn over it goes back.
-        match self.drawn.take() {
+        match self.drawn.take().filter(|_| self.scene.is_none()) {
+            None if self.scene.is_some() => {}
             None => self.background(0, w, 0, h),
             Some((bx, cross)) => {
                 self.background(bx, bx + w / 12, h / 3, h / 3 + h / 6);
@@ -174,6 +234,26 @@ impl Source for TestPattern {
                 }
             }
         }
+        // The flash, for the first 100 ms of each second: drawn or put back each frame (a still frame
+        // wouldn't show it starting). The first frame of a flash says when, for the tone's beep.
+        let now = self.at_us.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_micros() as u64)
+        });
+        let flash = flashing(now);
+        let (fw, fh) = self.flash_area();
+        if flash {
+            if !self.flash {
+                FLASH_ONSET_US.store(now, Ordering::Relaxed);
+            }
+            for y in 0..fh {
+                self.buf[y * w * 4..(y * w + fw) * 4].fill(255);
+            }
+        } else if self.flash && self.scene.is_none() {
+            self.background(0, fw, 0, fh);
+        }
+        self.flash = flash;
         // A white block moving left to right, one step a frame.
         let bx = (n * 8) % w.max(1);
         for y in h / 3..(h / 3 + h / 6).min(h) {
@@ -185,9 +265,7 @@ impl Source for TestPattern {
         // The capture time as a barcode along the bottom, for measuring glass to glass: a client
         // that shares this clock reads it from the decoded frame (rein-remote.js, `measure`).
         // Blocks of 24×24: white, black (sync), then the time in milliseconds, 32 bits, high first.
-        let ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as u64) as u32;
+        let ms = (now / 1000) as u32;
         const B: usize = 24;
         if w >= 34 * B && h >= B {
             for k in 0..34 {
@@ -275,11 +353,14 @@ mod tests {
             if n == 30 {
                 p.input(&Input::PointerMove { x: 5, y: 200 }).unwrap();
             }
+            // 40 ms a frame: the flash (the first 100 ms of each second) comes and goes.
+            p.at_us = Some(1_700_000_000_000_000 + n * 40_000);
             let got = p.grab().unwrap().bgra.to_vec();
             // The same frame drawn from scratch.
             let mut fresh = TestPattern::new(w, h);
             fresh.n = p.n - 1;
             fresh.pointer = p.pointer;
+            fresh.at_us = p.at_us;
             assert!(fresh.grab().unwrap().bgra == got.as_slice(), "frame {n}");
         }
     }

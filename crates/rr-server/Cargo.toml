@@ -13,7 +13,10 @@ path = "src/main.rs"
 
 [dependencies]
 openh264-sys2 = "0.6.6"
+# libopus (BSD), built from its source by CMake and linked in statically.
+opusic-sys = "0.7.5"
 rr-proto = {path = "../rr-proto"}
+rr-client = {path = "../rr-client"}
 aes-gcm = "0.10.3"
 des = "0.9.0"
 getrandom = "0.3"
@@ -22,11 +25,29 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pemfile = "2.2.0"
 hkdf = "0.12.4"
 sha2 = "0.10.9"
-socket2 = "0.6.1"
+socket2 = { version = "0.6.1", features = ["all"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
-wtransport = "0.7.2"
+wtransport = { version = "0.7.2", features = ["quinn"] }
 zune-jpeg = "0.4"
 tungstenite = { version = "0.29.0", features = ["rustls-tls-native-roots"] }
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
+mdns-sd = { version = "0.21", default-features = false }
+qrcode = { version = "0.14", default-features = false }
+toml = { version = "0.9", default-features = false, features = ["parse", "preserve_order", "serde", "std"] }
+# Sign-in (OIDC): the IdP's discovery, keys and token endpoint over HTTPS; ID tokens checked with ring
+# (already in the tree through rustls).
+ring = "0.17"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "3.2", default-features = false, features = ["rustls"] }
+rustls-native-certs = "0.8"
+# SAML (`--features saml`): samael verifies signed assertions with xmlsec1 (needs libxml2, libxmlsec1
+# and clang to build), so it's off by default and built and tested in CI on Linux.
+samael = { version = "0.0.22", optional = true }
+
+[features]
+saml = ["dep:samael"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -60,10 +81,14 @@ windows = { version = "0.62.2", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_System_Com_StructuredStorage",
     "Win32_System_LibraryLoader",
     "Win32_System_Ole",
+    "Win32_System_Performance",
     "Win32_System_Variant",
     "Win32_System_WinRT",
     "Win32_System_WinRT_Direct3D11",
@@ -73,3 +98,8 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 windows-capture = "2.0.1"
+windows-service = "0.8"
+
+[dev-dependencies]
+# The C ABI the apps link, tested against this server (tests/ffi.rs).
+rr-ffi = {path = "../rr-ffi"}

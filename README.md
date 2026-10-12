@@ -30,13 +30,16 @@ Early: the design is done and being built one verified piece at a time
 | Client: web (WebCodecs, embeddable `<rein-remote>`) | working: decode (hardware when there is), mouse, wheel, keyboard, touch gestures and the device's on-screen keyboard (phase 1) |
 | Packages (npm): `@rein-harness/remote`, `@rein-harness/remote-server` | working: the web client, and the server per platform (`npx rein-remote`), checked against Rein's contract in CI on all three (phase 2) |
 | Rein previews | working: a Rein web UI chat shows a native Linux app through Rein Remote, from a phone, through a reverse proxy (phase 2) |
-| Client: Windows / macOS / Linux | todo (phase 5) |
-| Client: iOS / iPadOS / Android | todo (phase 5) |
+| Client: Windows / macOS / Linux (`rein-remote-viewer`, Rust) | working on this Mac: VideoToolbox decoded straight into the window (no copy), 9 / 12 ms glass to glass p50 / p95 at 60 fps, ~10% of one core; mouse, keys and text, the remote pointer, a picker of machines on the network, pairing; Windows and Linux on CI runners in software (11 / 16 ms Windows); GPU decoders (Media Foundation, VA-API) and real gamepads still to verify ([manual test](docs/verification/desktop-client.md)) (phase 5) |
+| Client: iOS / iPadOS (`clients/ios`, Swift on the Rust core) | in the simulator: VideoToolbox H.264 and HEVC, 60 fps, 9 / 15 ms glass to glass over WebTransport datagrams, Opus in sync (15–22 ms), a UIKit tap as a click, pairing, Bonjour, real certificates; a real iPhone and iPad still to verify ([manual test](docs/verification/ios-client.md)) (phase 5) |
+| Client: Android (`clients/android`, Kotlin on the Rust core) | in the emulator: 59.6 fps, 13 / 29 ms glass to glass at 720p (the emulator's codec, decoding on the host), MediaCodec decode (H.264, HEVC), a tap seen as a click, pairing, WebTransport and the WebSocket, Opus decoded; keyboards, gamepads and the other gestures unit-tested; a real phone still to verify ([docs/verification/android-client.md](docs/verification/android-client.md)) (phase 5) |
 | Transport: WebSocket | working, with keyframe-and-skip when the link backs up (phase 1) |
 | Transport: WebTransport (QUIC) | working: a stream per frame, self-signed certificate by hash, falls back to the WebSocket by itself (phase 4) |
-| Transport: relay (behind NAT, no open ports) | working: `rein-remote relay` (self-hosted), `serve --relay`; NAT hole punching todo (phase 4) |
-| Adaptive bitrate, audio | todo (phase 4) |
-| Pairing, enterprise sign-in and policy | todo (phases 4, 6) |
+| Transport: relay (behind NAT, no open ports) | working: `rein-remote relay` (self-hosted), `serve --relay`, end-to-end sealed; NAT hole punching moves the session onto a direct QUIC path (behind two NATs in Docker: 0.5–1.2 s, round trip 97 → 45 ms; [real NATs](docs/verification/nat-hole-punching.md)) (phase 4) |
+| Datagrams with FEC, discovery, pairing | working: video as WebTransport/QUIC datagrams with Reed-Solomon parity sized to the measured loss (60 fps, 10 ms glass to glass in Chrome on a Mac); mDNS discovery; 6-digit pairing codes (SPAKE2) then each device's own key (phase 4) |
+| Adaptive bitrate and resolution, audio | working: delay-based control from 800 kbit/s up, the picture scaled to ¾ or ½ on a slow link; Opus sound 10.4 ms after its picture (median, Chrome on a Mac) (phase 4) |
+| Enterprise sign-in, policy, audit, recording | working: OIDC and SAML sign-in, policies (view only, clipboard, audio, sources, time limit), a JSON-lines audit log, MP4 recording; verified with Keycloak in Docker: a viewer's input dropped, an unknown user refused, the recording decoded ([real IdP test](docs/verification/identity.md)) (phase 6) |
+| Relay fleet, metrics, config file, services, signing | working: several relays per machine with failover (a frame through the other in 60 ms), `/healthz` and `/metrics`, `--config FILE.toml`, `install-service` on all three (installed in CI), binaries signed in CI with runner-made identities; real certificates and notarization: [manual test](docs/verification/signing.md) (phase 6) |
 
 ## Try it
 
@@ -95,6 +98,77 @@ The relay can't read what it passes: the machine makes a key and puts it in the 
 end with AES-256-GCM (keys per session and direction, from HKDF). A wrong key or an altered message
 is refused. The viewer's page needs HTTPS (or localhost) for the browser's crypto.
 
+Several relays (a fleet): give `--relay` once per relay (or `--relay A,B`). The machine opens its room
+on every one and keeps it open; the link names the one that answered fastest, and the others after
+`#` (`&alt=`), where a native viewer tries them in turn. Or put them behind one name (a load balancer
+checking each relay's `/healthz`): any of them has the room. See
+[docs/verification/relay-fleet.md](docs/verification/relay-fleet.md).
+
+### Health and metrics
+
+- `GET /healthz`: alive, as JSON (`status`, `version`, `uptime_s`, `sessions`, …). On `serve` it needs
+  the token like `/stats`; on a relay it's on its port for anyone (no room or key in it).
+- `GET /metrics`: Prometheus's text format (viewers, sessions, frames and bytes sent, each relay's
+  health, round trip and registrations; on a relay: hosts waiting, sessions, bytes relayed,
+  rendezvous answered, requests refused). On `serve`, with the token, best as a bearer
+  (`Authorization: Bearer TOKEN`, Prometheus's `authorization: {credentials_file: …}`) so it's not in a
+  URL. On a relay, on its own address: `--metrics-listen` (default `127.0.0.1:7991`, this machine only;
+  a port alone is 127.0.0.1's; `off`).
+
+### Config by file, and running as a service
+
+```sh
+rein-remote serve --config serve.toml            # each key a flag: listen = "0.0.0.0:7979", fps = 60, relay = [...]
+rein-remote install-service --config serve.toml  # started with your session (systemd --user, a LaunchAgent, a task at logon)
+rein-remote install-service relay --config relay.toml --system   # a relay with the machine (systemd, a LaunchDaemon, a Windows service)
+rein-remote install-service … --print            # what it would install, nothing changed
+rein-remote uninstall-service [relay] [--system]
+```
+
+Secrets stay out of the service's command line: `token = { file = "/etc/rein-remote/token" }`
+(for sign-in, `oidc-client-secret-file = "/etc/rein-remote/oidc-secret"`). The
+command line wins over the file. See [docs/verification/service-install.md](docs/verification/service-install.md).
+
+### Signed binaries
+
+Releases are signed when the repository has the certificates (macOS: Developer ID and notarized;
+Windows: Authenticode, timestamped), and `SHA256SUMS` is signed with cosign (Sigstore,
+keyless). To check a download: [docs/verification/signing.md](docs/verification/signing.md).
+
+### Optional: sign-in with your identity provider, policies, an audit log, recording
+
+For a machine several people use, viewers can sign in with your identity provider (OIDC: Okta,
+Microsoft Entra ID, Google, Keycloak…; or SAML) instead of holding a link, and a policy says what each
+may do:
+
+```sh
+rein-remote serve --public-url https://remote.example.com \
+  --oidc-issuer https://example.okta.com --oidc-client-id ID --oidc-client-secret-file secret.txt \
+  --policy policy.toml --audit audit.jsonl --record recordings/
+```
+
+- `--public-url`: how browsers reach this server (the provider sends them back to
+  `<url>/sso/oidc/callback`). The client secret comes from a file or `REIN_REMOTE_OIDC_CLIENT_SECRET`,
+  never the command line. `--oidc-user-claim` (default `email`) and `--oidc-groups-claim` (`groups`)
+  say which claims name the user and their groups.
+- SAML instead: `--saml-idp-metadata FILE|URL` (in builds with `--features saml`, which needs
+  libxmlsec1); the ACS is `<url>/sso/saml/acs`, this side's metadata `<url>/sso/saml/metadata`.
+- `--policy FILE` (TOML or JSON): rules by user, group or how a viewer came in (`oidc`, `saml`,
+  `token`, `paired`, `relay`), the first that matches decides: `view_only` (the server drops their
+  input), `clipboard`, `audio`, `sources` (which of this machine's displays or windows), `record`,
+  `max_session_minutes`. No rule: refused, with the reason. Without `--policy`, everyone who signs
+  in may watch and control. `clipboard = false` stops pastes from this version's clients; a viewer
+  who may control can still type, and an older web client sends a paste as typing. With `--relay`,
+  viewers through it are `via = ["relay"]`: no rule for them, no relayed viewers.
+- `--audit FILE`: a JSON line for each sign-in (and refusal), each session's start and end (who,
+  from where, over what, which rule, its recording) and each pairing. Never a token or a secret.
+- `--record DIR`: each session's video as it was sent (and its sound) in an MP4 that plays in any
+  player.
+
+The page shows who you're signed in as, "view only" and "● recorded". Links with a token and paired
+devices keep working when you give them (`--token`, `--pair on`). Setting it up with a real provider:
+[docs/verification/identity.md](docs/verification/identity.md).
+
 ## How it works
 
 See [ARCHITECTURE.md](ARCHITECTURE.md): the protocol, the three transport tiers (QUIC/WebTransport,
@@ -107,6 +181,9 @@ and how Rein embeds it.
 cargo build --workspace
 cargo test --workspace
 ```
+
+The Android app: `clients/android/build-core.sh` (the core, with cargo-ndk), then `./gradlew
+assembleDebug` there; see [docs/verification/android-client.md](docs/verification/android-client.md).
 
 ## License
 

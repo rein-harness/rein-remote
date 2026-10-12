@@ -1,0 +1,8 @@
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+.kotlin/
+# Built by build-core.sh from crates/rr-jni.
+app/src/main/jniLibs/

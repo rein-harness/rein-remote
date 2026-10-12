@@ -1,0 +1,7 @@
+# rein-remote serve --config serve.toml
+test-pattern = "640x360"
+listen = "127.0.0.1:7979"
+mdns = false
+webtransport = false
+relay = ["ws://relay-a:7990", "ws://relay-b:7990"]
+relay-secret = { file = "relay-secret" }

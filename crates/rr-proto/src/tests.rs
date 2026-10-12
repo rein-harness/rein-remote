@@ -19,11 +19,47 @@ fn hello(codecs: &[(Codec, bool)]) -> Hello {
         audio: true,
         input: INPUT_POINTER | INPUT_KEYBOARD | INPUT_TOUCH,
         refresh_mhz: 120_000,
+        features: FEATURE_VIDEO_DATAGRAMS,
+    }
+}
+
+fn offer() -> DirectOffer {
+    DirectOffer {
+        candidates: vec![
+            "203.0.113.7:7979".parse().unwrap(),
+            "192.168.1.20:7979".parse().unwrap(),
+            "[2001:db8::5]:7979".parse().unwrap(),
+        ],
+        cert_sha256: vec![0xab; 32],
+        ticket: "0123456789abcdef".into(),
+    }
+}
+
+fn access() -> Access {
+    Access {
+        user: "alice@example.com".into(),
+        flags: ACCESS_VIEW_ONLY | ACCESS_RECORDED,
+        seconds_left: 3600,
     }
 }
 
 #[test]
 fn every_message_round_trips() {
+    round_trip(Message::Access(access()));
+    round_trip(Message::Notice(Notice {
+        code: NOTICE_TIME_LIMIT,
+        text: "the session's hour is up".into(),
+    }));
+    round_trip(Message::Input(Input::Paste { text: "pasted ✓".into() }));
+    round_trip(Message::DirectOffer(offer()));
+    round_trip(Message::DirectOffer(DirectOffer {
+        candidates: vec![],
+        cert_sha256: vec![],
+        ticket: String::new(),
+    }));
+    round_trip(Message::DirectAnswer(DirectAnswer {
+        candidates: vec!["198.51.100.2:50000".parse().unwrap()],
+    }));
     round_trip(Message::Hello(hello(&[(Codec::H264, true), (Codec::Av1, false)])));
     round_trip(Message::Config(Config {
         codec: Codec::H265,
@@ -102,6 +138,7 @@ fn every_message_round_trips() {
         received_us: 10,
         decoded_us: 12,
         lost: 1,
+        loss_permille: 25,
     }));
     round_trip(Message::KeyframeRequest);
     round_trip(Message::Clipboard { text: "copied".into() });
@@ -181,6 +218,25 @@ fn unknown_kinds_are_skipped_and_bad_frames_refused() {
 }
 
 #[test]
+fn a_peer_from_before_direct_paths_skips_the_offer() {
+    // A viewer built before DirectOffer existed reads it as a kind it doesn't know: skipped by its
+    // length, and the next frame reads. (A host offers only to a viewer that said FEATURE_DIRECT.)
+    let mut stream = Message::DirectOffer(offer()).encode();
+    stream[0] = 250; // as an unknown kind
+    let n = stream.len();
+    stream.extend(Message::Ping { id: 1, sent_us: 2 }.encode());
+    assert_eq!(Message::decode(&stream).unwrap(), (None, n));
+    assert_eq!(Message::decode(&stream[n..]).unwrap().0, Some(Message::Ping { id: 1, sent_us: 2 }));
+    // An address of a family this build doesn't know is refused, not misread.
+    let mut bad = Message::DirectAnswer(DirectAnswer {
+        candidates: vec!["1.2.3.4:5".parse().unwrap()],
+    })
+    .encode();
+    bad[HEADER_LEN + 1] = 9;
+    assert!(matches!(Message::decode(&bad), Err(Error::Malformed(_))));
+}
+
+#[test]
 fn versions_and_codecs_are_negotiated() {
     let server = hello(&[(Codec::H265, true), (Codec::H264, true), (Codec::Vp9, false)]);
     // A phone that decodes H.264 in hardware, VP9 only in software: H.264 wins over VP9.
@@ -252,6 +308,16 @@ fn a_newer_peers_messages_still_read() {
             down: true,
             key: "a".into(),
         }),
+        Message::DirectOffer(offer()),
+        Message::DirectAnswer(DirectAnswer {
+            candidates: offer().candidates,
+        }),
+        Message::Access(access()),
+        Message::Notice(Notice {
+            code: 99,
+            text: "a newer reason".into(),
+        }),
+        Message::Input(Input::Paste { text: "x".into() }),
         Message::Cursor(Cursor {
             x: 1,
             y: 2,
@@ -302,19 +368,57 @@ fn an_older_peers_messages_get_defaults_for_fields_added_since() {
     r.u32().unwrap();
     r.u64().unwrap();
     assert_eq!(r.or_u32(0).unwrap(), 42);
-    // Hello version 0 had no refresh rate: it reads as unknown.
+    // Hello version 0 had no refresh rate nor features: they read as unknown and none.
     let mut v0 = Message::Hello(hello(&[(Codec::H264, true)])).encode();
-    v0.truncate(v0.len() - 4);
+    v0.truncate(v0.len() - 8);
     v0[1] = 0;
     let len = (v0.len() - HEADER_LEN) as u32;
     v0[3..7].copy_from_slice(&len.to_le_bytes());
     let Ok((Some(Message::Hello(read)), _)) = Message::decode(&v0) else {
         panic!()
     };
-    assert_eq!((read.refresh_mhz, read.max_fps), (0, 120));
+    assert_eq!((read.refresh_mhz, read.features, read.max_fps), (0, 0, 120));
     // Every kind has a version this build writes, in the header.
-    for m in [Message::KeyframeRequest, Message::Resize { width: 1, height: 1 }] {
+    for m in [
+        Message::KeyframeRequest,
+        Message::Resize { width: 1, height: 1 },
+        Message::DirectOffer(offer()),
+        Message::DirectAnswer(DirectAnswer { candidates: vec![] }),
+        Message::Access(access()),
+        Message::Notice(Notice { code: 1, text: String::new() }),
+    ] {
         let f = m.encode();
         assert_eq!(Header::read(&f).unwrap().version, version::of(f[0]));
     }
+}
+
+#[test]
+fn feature_bits_are_distinct() {
+    // Two features on the same bit would each be taken for the other.
+    let bits = [FEATURE_VIDEO_DATAGRAMS, FEATURE_DIRECT, FEATURE_AUDIO_DATAGRAMS, FEATURE_PASTE];
+    for (i, a) in bits.iter().enumerate() {
+        assert_eq!(a.count_ones(), 1);
+        for b in &bits[i + 1..] {
+            assert_eq!(a & b, 0);
+        }
+    }
+}
+
+#[test]
+fn a_peer_from_before_access_skips_it_and_pastes_read_as_skipped_input() {
+    // An older reader (one that knows kinds up to 14) skips Access and Notice by their length: here
+    // simulated by a frame of an unknown kind with the same body, then the next frame still reads.
+    let mut both = Message::Access(access()).encode();
+    both[0] = 200;
+    let ping = Message::Ping { id: 1, sent_us: 2 }.encode();
+    both.extend_from_slice(&ping);
+    let (m, used) = Message::decode(&both).unwrap();
+    assert_eq!(m, None);
+    assert_eq!(Message::decode(&both[used..]).unwrap().0, Some(Message::Ping { id: 1, sent_us: 2 }));
+    // A paste is input kind 9: a server from before it skips it as an input kind it doesn't know.
+    let paste = Message::Input(Input::Paste { text: "hi".into() }).encode();
+    assert_eq!(paste[HEADER_LEN], 9);
+    // The access bits are distinct.
+    let bits = [ACCESS_VIEW_ONLY, ACCESS_NO_CLIPBOARD, ACCESS_NO_AUDIO, ACCESS_RECORDED];
+    assert_eq!(bits.iter().fold(0, |a, b| a | b).count_ones(), 4);
 }

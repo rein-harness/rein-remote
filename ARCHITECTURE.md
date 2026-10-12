@@ -39,7 +39,8 @@ status table says what works today.
 | Crate / folder | What it is |
 |---|---|
 | `crates/rr-proto` | The protocol: message types, binary framing, versioning. No I/O, no platform code; compiles to WebAssembly, so the web client shares it. |
-| `crates/rr-server` | The server, binary `rein-remote`: capture, encode, transport, input injection, pairing. One binary per platform. |
+| `crates/rr-client` | The native client core (no UI, no decoding): connects over QUIC/WebTransport, the WebSocket or a relay (then direct through NAT), pairs and signs in, finds servers by mDNS, and yields the stream as events. The desktop and mobile apps build on it; `rein-remote connect` uses it to measure. |
+| `crates/rr-server` | The server, binary `rein-remote`: capture, encode, transport, input injection, pairing, the relay. One binary per platform. |
 | `clients/web` | The web client: WebCodecs decode (hardware), WebAudio, input, the protocol from `rr-proto` as WebAssembly. Embeddable with one `<script>` and a `<rein-remote>` element. |
 | `clients/native` | Desktop clients (Windows, macOS, Linux), sharing a Rust core with platform decode and presentation. Later: iOS/iPadOS (Swift, VideoToolbox) and Android (Kotlin, MediaCodec) on the same core. |
 | `relay/` | The relay and rendezvous server, for connections that can't go direct. Self-hostable, one binary. |
@@ -91,7 +92,40 @@ Three tiers, picked automatically, fastest first:
    Video as unreliable datagrams (a late frame is a dropped frame, never a delay); input, control and
    clipboard on reliable streams.
 2. **Relay.** When no direct path exists (symmetric NAT, strict firewalls), traffic goes through a
-   relay, still QUIC or WebTransport. Self-hostable; a deployment can run several.
+   relay (a WebSocket there today), sealed end to end with a key the relay never sees. Self-hostable;
+   a deployment can run several.
+
+### Through NAT: from the relay to a direct path
+
+A session always starts on the relay, and moves off it when it can:
+
+1. The relay also listens on UDP, on its own port. For a room it has open, it answers "what address
+   do you see me from?" (rr-proto's `punch`: a probe that names the room by a hash, answered with the
+   address it came from and never with more bytes than the probe).
+2. `serve --relay` binds its WebTransport socket itself and asks the relay from that socket before
+   QUIC takes it. That gives it its address beyond its NAT. From then on, a clone of the socket sends
+   a keepalive to the relay every 15 s so the NAT keeps the mapping. The keepalive is never answered:
+   an answer would land on a socket QUIC owns.
+3. A native viewer says `FEATURE_DIRECT` in its Hello. Inside the sealed session, the host sends a
+   `DirectOffer`: its candidates (the address the relay saw, then its own networks' addresses), its
+   WebTransport certificate's SHA-256, and a ticket its gate accepts once. The relay can't read or
+   change any of it.
+4. The viewer learns its own outside address the same way, from the UDP socket it will use for QUIC,
+   and answers with a `DirectAnswer` holding its candidates.
+5. Both send punch packets to each other's candidates for a few seconds. The host sends from a clone
+   of its QUIC socket. Each NAT then takes the other side's packets as answers to its own. Punch and
+   keepalive packets are too small for QUIC to answer when they land on a QUIC socket.
+6. The viewer opens WebTransport straight to the host's candidates, all at once, from the same
+   socket. It accepts only the certificate with the offered hash, and signs in with the ticket. On
+   success it says Hello there, and the relayed session closes. On failure it stays on the relay.
+
+This works through the NATs most homes and phones have, which keep one outside port per socket
+whoever it talks to. Through a NAT that gives each destination its own port (symmetric NATs, some
+carrier-grade NATs), the address the relay saw isn't one the other side can reach, so the session
+stays relayed. The same happens when UDP is blocked between the two, or when the relay's UDP port
+isn't reachable (an HTTPS proxy in front of it passes only TCP). **Browsers can't punch**, because a
+page has no UDP socket of its own, so they stay on the relay. `tests/nat/run.sh` checks all of this
+between two NAT routers in Docker; docs/verification/nat-hole-punching.md is for real NATs.
 3. **WebSocket over HTTPS.** Through anything that passes web traffic: a corporate proxy, a reverse
    proxy in front of a server (Caddy, nginx, Cloudflare), Tailscale Serve. Reliable and ordered, so
    the server drops video frames itself when the connection backs up (keyframe-and-skip). This is
