@@ -101,7 +101,7 @@ default), X11 (Xorg, or Xwayland for an X11 app's window).
 3. `node tools/listen.mjs http://127.0.0.1:7979/ --seconds 5`: expect `audioPerSecond` 100 (the
    monitor sends silence too), `packetSpacingMs.p50` 10, `loud_packets` climbing and `level_db`
    above -60 while it plays, about -120 when it doesn't.
-4. In Chrome or Firefox (Firefox has WebCodecs' AudioDecoder from version 130), open
+4. In Chrome or Firefox (a browser with WebCodecs' AudioDecoder; a page without it gets the picture only), open
    `http://127.0.0.1:7979/`, click once, listen.
 5. Without libpulse (`sudo apt remove libpulse0` in a throwaway VM, or a container without it): the
    server runs as before, and the first viewer gets `rein-remote: no sound (libpulse-simple isn't

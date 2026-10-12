@@ -613,11 +613,11 @@ function makeSound(stats, measure, parent, sync = true) {
      * When to draw a frame captured at `captureUs` (performance.now ms), or undefined for now: while
      * sound plays (something louder than -50 dBFS in the last 5 s) and the shared offset is longer
      * than the picture's own, the picture waits, to SYNC_SLACK before its sound (sound a touch late
-     * is what people notice least) and 60 ms at most.
+     * is what people notice least) and 100 ms at most.
      */
     presentAt(captureUs) {
       if (!sync || offsetUs === undefined || ctx.state !== 'running' || performance.now() - loudAt > 5000) return (a.holdMs = 0), undefined;
-      const wait = Math.min((captureUs + offsetUs - SYNC_SLACK_US - localUs()) / 1000, 60);
+      const wait = Math.min((captureUs + offsetUs - SYNC_SLACK_US - localUs()) / 1000, 100);
       a.holdMs = Math.max(0, +wait.toFixed(1));
       return wait > 0.5 ? performance.now() + wait : undefined;
     },

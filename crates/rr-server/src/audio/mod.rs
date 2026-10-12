@@ -180,6 +180,10 @@ impl Audio {
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     eprintln!("rein-remote: the sound stopped");
+                    // Its listeners get no more (the next one to come starts it again).
+                    let mut st = self.state.lock().unwrap();
+                    st.running = false;
+                    st.listeners.clear();
                     break;
                 }
             };
@@ -215,10 +219,9 @@ impl Audio {
                 alone_since = None;
             }
         }
+        // (`running` went false under the lock above: a listener that comes now starts a new capture,
+        // which this one stopping doesn't touch.)
         drop(capture);
-        let mut st = self.state.lock().unwrap();
-        st.running = false;
-        st.listeners.clear();
     }
 }
 
