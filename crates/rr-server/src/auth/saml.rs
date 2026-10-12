@@ -173,8 +173,8 @@ mod tests {
     use super::*;
     use base64::Engine;
     use samael::idp::response_builder::ResponseAttribute;
+    use samael::idp::sp_extractor::RequiredAttribute;
     use samael::idp::{CertificateParams, IdentityProvider, KeyType, Rsa};
-    use samael::metadata::RequiredAttribute;
 
     const ACS: &str = "https://rr.example/sso/saml/acs";
     const SP: &str = "https://rr.example/sso/saml/metadata";
@@ -223,8 +223,9 @@ mod tests {
         let r = s.login("/?measure").unwrap();
         let to = r.headers[0].strip_prefix("Location: ").unwrap();
         assert!(to.starts_with("https://idp.example/sso?SAMLRequest="), "{to}");
+        // The request just made (others the test left unanswered are older).
         let p = s.pending.lock().unwrap();
-        p.keys().next().unwrap().clone()
+        p.iter().max_by_key(|(_, (_, at))| *at).map(|(k, _)| k.clone()).unwrap()
     }
 
     #[test]

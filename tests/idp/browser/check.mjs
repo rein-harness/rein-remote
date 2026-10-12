@@ -29,6 +29,9 @@ async function visit(proto, user, type) {
   const ctx = await browser.createBrowserContext();
   const page = await ctx.newPage();
   await page.setViewport({width: 1100, height: 760});
+  // Keycloak in a small VM: pages can take a while.
+  page.setDefaultNavigationTimeout(120000);
+  page.setDefaultTimeout(120000);
   page.on('pageerror', (e) => log(user, 'pageerror', e.message));
   const tag = `${proto}-${user}`;
   try {

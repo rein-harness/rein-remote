@@ -563,7 +563,9 @@ mod tests {
                 let decode = std::process::Command::new("ffmpeg")
                     .args(["-v", "error", "-xerror", "-i"])
                     .arg(&path)
-                    .args(["-f", "null", "-"])
+                    // Frames are timed by when they were captured (a still screen sends none): passed
+                    // through as they are, not converted to a constant rate.
+                    .args(["-fps_mode", "passthrough", "-f", "null", "-"])
                     .output()
                     .unwrap();
                 assert!(decode.status.success(), "{}", String::from_utf8_lossy(&decode.stderr));
