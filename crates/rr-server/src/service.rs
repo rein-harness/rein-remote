@@ -375,6 +375,17 @@ fn carry_out(p: &Plan) -> Result<(), String> {
             .args(&s.argv[1..])
             .output()
             .map_err(|e| format!("{}: {e}", s.argv[0]))?;
+        if !out.status.success() && s.may_fail {
+            eprintln!(
+                "rein-remote: `{}`: {}",
+                s.argv.join(" "),
+                String::from_utf8_lossy(&out.stderr)
+                    .trim()
+                    .lines()
+                    .next()
+                    .unwrap_or("failed (nothing to stop?)")
+            );
+        }
         if !out.status.success() && !s.may_fail {
             return Err(format!(
                 "`{}` failed ({}): {}{}",
