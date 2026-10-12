@@ -101,25 +101,33 @@ struct DecodedFrame {
 /// Decodes the stream with VideoToolbox (hardware on a device), frames out in decode order (no
 /// B-frames: the server never sends them). On an error it asks for a keyframe and skips frames until
 /// one comes, as the web client does.
+///
+/// Two locks: `lock` for the decoder itself, held while calling into VideoToolbox (only the session's
+/// event thread decodes); `counts` for what VideoToolbox's callback touches. The callback never takes
+/// `lock`: VideoToolbox holds its own lock while it calls back, and decoding waits on that one.
 final class VideoDecoder {
+    private let lock = NSLock()
     private var session: VTDecompressionSession?
     private var format: CMVideoFormatDescription?
     private var sets: [Data] = []
     private var hevc = false
     private var waitKey = true
-    /// Frames skipped while waiting for a keyframe, since the last feedback.
-    private(set) var lost: UInt16 = 0
     private var resetPending = false
+
+    private let counts = NSLock()
+    /// Frames skipped since the last feedback.
+    private var lost: UInt16 = 0
     /// Frames handed to VideoToolbox and not out yet. A decoder that falls behind (the first frames,
     /// while it starts; a slow device) would show everything late: past `maxInFlight`, frames are
     /// skipped until a keyframe, which is asked for.
     private var inFlight = 0
     /// Which decoder a callback came from (one made again leaves the old one's frames uncounted).
     private var generation = 0
+    /// A frame failed in the callback: the decoder starts over at the next keyframe.
+    private var failedInCallback = false
+    private var _errors = 0
     static let maxInFlight = 3
     static let lateUs: UInt64 = 100_000
-    private(set) var skippedBehind = 0
-    private let lock = NSRecursiveLock()
 
     /// A frame decoded (on VideoToolbox's thread).
     var onFrame: ((DecodedFrame) -> Void)?
@@ -127,7 +135,7 @@ final class VideoDecoder {
     var onNeedKeyframe: (() -> Void)?
     /// What's decoding (shown in the stats).
     private(set) var description = ""
-    private(set) var errors = 0
+    var errors: Int { counts.lock(); defer { counts.unlock() }; return _errors }
 
     /// The stream (re)started: the next frame must be a keyframe.
     func configure(codec: Codec?) {
@@ -138,31 +146,46 @@ final class VideoDecoder {
         description = hevc ? "HEVC" : "H.264"
     }
 
+    /// Frames lost since asked last (for feedback).
     func takeLost() -> UInt16 {
-        lock.lock()
-        defer { lock.unlock() }
+        counts.lock()
+        defer { counts.unlock() }
         let l = lost
         lost = 0
         return l
     }
 
+    private func count(lost n: UInt16 = 0, inFlight d: Int = 0) {
+        counts.lock()
+        lost &+= n
+        inFlight += d
+        counts.unlock()
+    }
+
     func decode(frame: UInt32, keyframe: Bool, timestampUs: UInt64, receivedUs: UInt64, data: Data) {
         lock.lock()
         defer { lock.unlock() }
+        counts.lock()
+        let busy = inFlight
+        if failedInCallback {
+            failedInCallback = false
+            waitKey = true
+            resetPending = true
+        }
+        counts.unlock()
         if waitKey && !keyframe {
-            lost &+= 1
+            count(lost: 1)
             return
         }
         // Or frames that waited too long to get here (the decoder held this thread: its first frame
         // can take half a second). A keyframe is always taken: it's where the decoder starts over.
         let late = Core.nowUs() &- receivedUs > Self.lateUs
-        if (inFlight >= Self.maxInFlight || late) && !keyframe {
-            skippedBehind += 1
-            lost &+= 1
+        if (busy >= Self.maxInFlight || late) && !keyframe {
+            count(lost: 1)
             if !waitKey {
                 waitKey = true
                 NSLog("rein-remote: video: the decoder is behind (%d frames in it, this one %.0f ms late): skipping to a keyframe",
-                      inFlight, Double(Core.nowUs() &- receivedUs) / 1000)
+                      busy, Double(Core.nowUs() &- receivedUs) / 1000)
                 onNeedKeyframe?()
             }
             return
@@ -189,34 +212,45 @@ final class VideoDecoder {
         let body = AnnexB.lengthPrefixed(units.filter { !AnnexB.isParameterSet(AnnexB.type($0, hevc: hevc), hevc: hevc) })
         guard let sample = Self.sample(body, format: format) else { return fail("no sample buffer") }
         let flags: VTDecodeFrameFlags = [._EnableAsynchronousDecompression]
+        counts.lock()
         inFlight += 1
         let gen = generation
+        counts.unlock()
         let status = VTDecompressionSessionDecodeFrame(session, sampleBuffer: sample, flags: flags, infoFlagsOut: nil) {
             [weak self] status, _, image, _, _ in
             guard let self else { return }
-            self.lock.lock()
-            if gen == self.generation { self.inFlight -= 1 }
-            self.lock.unlock()
+            self.counts.lock()
+            let current = gen == self.generation
+            if current { self.inFlight -= 1 }
+            if status != noErr || image == nil {
+                self._errors += 1
+                if current { self.failedInCallback = true }
+            }
+            self.counts.unlock()
             guard status == noErr, let image else {
-                self.lock.lock()
-                self.fail("decode error \(status)")
-                self.lock.unlock()
+                NSLog("rein-remote: video: decode error %d; asking for a keyframe", status)
+                if current { self.onNeedKeyframe?() }
                 return
             }
             self.onFrame?(DecodedFrame(image: image, frame: frame, timestampUs: timestampUs, receivedUs: receivedUs, decodedUs: Core.nowUs()))
         }
         if status != noErr {
-            inFlight -= 1
+            count(inFlight: -1)
             fail("decode error \(status)")
+            return
         }
+        // Out now: the server never reorders frames, but a decoder may hold them for a reordering it
+        // can't rule out (HEVC does), which would hold the picture back.
+        VTDecompressionSessionFinishDelayedFrames(session)
     }
 
-    /// Called with the lock held (possibly from VideoToolbox's own callback: the decoder is made
-    /// again at the next keyframe, not here).
+    /// With `lock` held, on the decoding thread: the decoder is made again at the next keyframe.
     private func fail(_ why: String) {
-        errors += 1
-        NSLog("rein-remote: video: %@; asking for a keyframe", why)
+        counts.lock()
+        _errors += 1
         if !waitKey { lost &+= 1 }
+        counts.unlock()
+        NSLog("rein-remote: video: %@; asking for a keyframe", why)
         waitKey = true
         resetPending = true
         onNeedKeyframe?()
@@ -227,8 +261,10 @@ final class VideoDecoder {
             VTDecompressionSessionInvalidate(s)
             session = nil
         }
+        counts.lock()
         inFlight = 0
         generation += 1
+        counts.unlock()
         guard let format else { return }
         let attrs: [CFString: Any] = [
             kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
@@ -268,11 +304,13 @@ final class VideoDecoder {
 
     func close() {
         lock.lock()
-        defer { lock.unlock() }
-        if let s = session {
+        let s = session
+        session = nil
+        lock.unlock()
+        // (Outside the lock: frames still coming out take it.)
+        if let s {
             VTDecompressionSessionWaitForAsynchronousFrames(s)
             VTDecompressionSessionInvalidate(s)
         }
-        session = nil
     }
 }

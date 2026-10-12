@@ -103,6 +103,12 @@ struct PairLink: Equatable {
     let code: String?
     let id: String?
 
+    init(url: String, code: String?, id: String?) {
+        self.url = url
+        self.code = code
+        self.id = id
+    }
+
     init?(_ text: String) {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let comps = URLComponents(string: t), let scheme = comps.scheme, ["http", "https", "ws", "wss"].contains(scheme.lowercased()),

@@ -42,6 +42,12 @@ impl Default for RrOptions {
     }
 }
 
+pub const RR_BUTTON_LEFT: u8 = 0;
+pub const RR_BUTTON_RIGHT: u8 = 1;
+pub const RR_BUTTON_MIDDLE: u8 = 2;
+pub const RR_BUTTON_BACK: u8 = 3;
+pub const RR_BUTTON_FORWARD: u8 = 4;
+
 pub const RR_EVENT_HELLO: u32 = 1;
 pub const RR_EVENT_CONFIG: u32 = 2;
 pub const RR_EVENT_VIDEO: u32 = 3;

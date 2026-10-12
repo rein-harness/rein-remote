@@ -112,6 +112,7 @@ final class StreamController: ObservableObject {
         o.refreshMhz = UInt32(await UIScreen.main.maximumFramesPerSecond * 1000)
         // HEVC where this device decodes it in hardware; H.264 always.
         if VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC) && !o.codecs.contains(.h265) { o.codecs.append(.h265) }
+        o.hardware = VTIsHardwareDecodeSupported(kCMVideoCodecType_H264)
         let name = await UIDevice.current.name
         let opts = o
         let s = try await Task.detached(priority: .userInitiated) {

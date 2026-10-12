@@ -20,7 +20,7 @@ struct Target: Identifiable, Hashable {
 }
 
 /// Launch arguments, for tests and measuring (`-RRConnect URL [-RRPair CODE] [-RRMeasure YES]
-/// [-RRSelfTest YES] [-RRSeconds N] [-RRAudio NO] [-RRWebTransport NO]`).
+/// [-RRSelfTest YES] [-RRSeconds N] [-RRAudio NO] [-RRWebTransport NO] [-RRHEVC YES]`).
 enum Launch {
     static let d = UserDefaults.standard
     static var connect: String? { d.string(forKey: "RRConnect") }
@@ -30,6 +30,8 @@ enum Launch {
     static var seconds: Double { d.object(forKey: "RRSeconds") == nil ? 10 : d.double(forKey: "RRSeconds") }
     static var audio: Bool { d.object(forKey: "RRAudio") == nil ? true : d.bool(forKey: "RRAudio") }
     static var webtransport: Bool { d.object(forKey: "RRWebTransport") == nil ? true : d.bool(forKey: "RRWebTransport") }
+    /// `-RRHEVC YES`: offer HEVC even where it isn't decoded in hardware (the simulator).
+    static var hevc: Bool { d.bool(forKey: "RRHEVC") }
 }
 
 struct RootView: View {
@@ -233,6 +235,7 @@ struct StreamScreen: View {
             var o = ConnectOptions()
             o.audio = Launch.audio
             o.webtransport = Launch.webtransport
+            if Launch.hevc { o.codecs = [.h265, .h264] }
             do {
                 try await c.connect(target: target.url, pairCode: target.pairCode, options: o)
                 if Launch.selfTest { selfTest = await SelfTest.run(c, seconds: Launch.seconds) }
