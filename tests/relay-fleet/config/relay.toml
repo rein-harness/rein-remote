@@ -1,0 +1,5 @@
+# rein-remote relay --config relay.toml
+listen = "0.0.0.0:7990"
+# Prometheus scrapes it inside this network only (by default it's 127.0.0.1:7991).
+metrics-listen = "0.0.0.0:7991"
+secret = { file = "relay-secret" }

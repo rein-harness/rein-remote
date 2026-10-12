@@ -95,6 +95,42 @@ The relay can't read what it passes: the machine makes a key and puts it in the 
 end with AES-256-GCM (keys per session and direction, from HKDF). A wrong key or an altered message
 is refused. The viewer's page needs HTTPS (or localhost) for the browser's crypto.
 
+Several relays (a fleet): give `--relay` once per relay (or `--relay A,B`). The machine opens its room
+on every one and keeps it open; the link names the one that answered fastest, and the others after
+`#` (`&alt=`), where a native viewer tries them in turn. Or put them behind one name (a load balancer
+checking each relay's `/healthz`): any of them has the room. See
+[docs/verification/relay-fleet.md](docs/verification/relay-fleet.md).
+
+### Health and metrics
+
+- `GET /healthz`: alive, as JSON (`status`, `version`, `uptime_s`, `sessions`, …). On `serve` it needs
+  the token like `/stats`; on a relay it's on its port for anyone (no room or key in it).
+- `GET /metrics`: Prometheus's text format (viewers, sessions, frames and bytes sent, each relay's
+  health, round trip and registrations; on a relay: hosts waiting, sessions, bytes relayed,
+  rendezvous answered, requests refused). On `serve`, with the token, best as a bearer
+  (`Authorization: Bearer TOKEN`, Prometheus's `authorization: {credentials_file: …}`) so it's not in a
+  URL. On a relay, on its own address: `--metrics-listen` (default `127.0.0.1:7991`, this machine only;
+  a port alone is 127.0.0.1's; `off`).
+
+### Config by file, and running as a service
+
+```sh
+rein-remote serve --config serve.toml            # each key a flag: listen = "0.0.0.0:7979", fps = 60, relay = [...]
+rein-remote install-service --config serve.toml  # started with your session (systemd --user, a LaunchAgent, a task at logon)
+rein-remote install-service relay --config relay.toml --system   # a relay with the machine (systemd, a LaunchDaemon, a Windows service)
+rein-remote install-service … --print            # what it would install, nothing changed
+rein-remote uninstall-service [relay] [--system]
+```
+
+Secrets stay out of the service's command line: `token = { file = "/etc/rein-remote/token" }`. The
+command line wins over the file. See [docs/verification/service-install.md](docs/verification/service-install.md).
+
+### Signed binaries
+
+Releases are signed when the repository has the certificates (macOS: Developer ID and notarized;
+Windows: Authenticode, timestamped), and `SHA256SUMS` is signed with cosign (Sigstore,
+keyless). To check a download: [docs/verification/signing.md](docs/verification/signing.md).
+
 ## How it works
 
 See [ARCHITECTURE.md](ARCHITECTURE.md): the protocol, the three transport tiers (QUIC/WebTransport,

@@ -42,8 +42,9 @@ pub struct Options {
     pub token: Option<String>,
     /// WebTransport (QUIC) next to the WebSocket, on the same port number over UDP.
     pub webtransport: bool,
-    /// A relay to connect out to (ws:// or wss://), the room there, and the relay's secret for hosts.
-    pub relay: Option<(String, String, Option<String>)>,
+    /// Relays to connect out to (ws:// or wss://; more than one: a fleet, the room open on each), the
+    /// room there, and the relays' secret for hosts.
+    pub relay: Option<(Vec<String>, String, Option<String>)>,
     /// The end-to-end key for sessions through the relay (in the viewer's link, after #).
     pub e2e_key: [u8; 32],
     /// HTTPS on the page's port: a certificate and its key (PEM files). With `auto`, a real one for
@@ -96,6 +97,7 @@ fn now_us() -> u64 {
 }
 
 pub fn run(source: Box<dyn Source>, opts: Options) -> Result<(), String> {
+    crate::metrics::start();
     let tailnet_name = if opts.listen == "auto" { crate::links::magic_dns() } else { None };
     // "auto": every interface, the first free port from 7979.
     let listener = if opts.listen == "auto" {
@@ -171,15 +173,16 @@ pub fn run(source: Box<dyn Source>, opts: Options) -> Result<(), String> {
     let opts = Arc::new(opts);
     // Through a relay: connected out to it first (its room open), so it answers this machine's probe.
     let direct: Arc<OnceLock<Direct>> = Arc::default();
-    if let Some((relay, room, secret)) = opts.relay.clone() {
-        let (source, stats, opts, direct) = (source.clone(), stats.clone(), opts.clone(), direct.clone());
-        let page = relay.replacen("ws", "http", 1);
-        eprintln!(
-            "rein-remote: through the relay: open {}/?room={room}#k={}",
-            page.trim_end_matches('/'),
-            rr_client::e2e::b64url(&opts.e2e_key)
-        );
-        std::thread::spawn(move || through_relay(&relay, &room, secret.as_deref(), source, stats, &opts, &direct));
+    // Several relays: the fastest to answer first (the link names it, and its UDP tells this machine
+    // its address beyond NAT), and the room open on every one.
+    let ranked = opts.relay.as_ref().map(|(relays, ..)| crate::fleet::rank(relays));
+    if let (Some((_, room, secret)), Some(ranked)) = (opts.relay.clone(), ranked.clone()) {
+        eprintln!("rein-remote: through the relay: open {}", crate::fleet::link(&ranked, &room, &opts.e2e_key));
+        for relay in ranked.clone() {
+            let (source, stats, opts, direct, room, secret) = (source.clone(), stats.clone(), opts.clone(), direct.clone(), room.clone(), secret.clone());
+            std::thread::spawn(move || through_relay(&relay, &room, secret.as_deref(), source, stats, &opts, &direct));
+        }
+        crate::fleet::watch(ranked);
     }
     // WebTransport on the same port over UDP: the page connects with it when the browser can.
     let wt: Arc<Option<(u16, Option<[u8; 32]>)>> = Arc::new(match (opts.webtransport, listener.local_addr()) {
@@ -187,7 +190,11 @@ pub fn run(source: Box<dyn Source>, opts: Options) -> Result<(), String> {
             let (source, stats, o) = (source.clone(), stats.clone(), opts.clone());
             let started = UdpSocket::bind(at).map_err(|e| e.to_string()).and_then(|udp| {
                 // Through a relay: this socket's address beyond NAT, learned before QUIC takes it.
-                let relayed = opts.relay.as_ref().map(|(relay, room, _)| beyond_nat(&udp, relay, room));
+                let relayed = opts
+                    .relay
+                    .as_ref()
+                    .zip(ranked.as_ref())
+                    .map(|((_, room, _), ranked)| beyond_nat(&udp, &ranked[0], room));
                 let punch = udp.try_clone().ok();
                 let hash = crate::link::webtransport(udp, gate.clone(), opts.tls.clone(), move |link| {
                     if let Err(e) = session(link, source.clone(), stats.clone(), &o, None) {
@@ -286,10 +293,20 @@ fn through_relay(
         relay.trim_end_matches('/'),
         secret.map(|s| format!("&secret={s}")).unwrap_or_default()
     );
+    // Said once, then again only after the relay was lost (not after each viewer).
+    let mut lost = false;
     loop {
         match tungstenite::connect(&url) {
             Ok((ws, _)) => {
                 use crate::link::Sock;
+                crate::metrics::relay_update(relay, |r| {
+                    r.registered = true;
+                    r.registrations += 1;
+                });
+                if lost {
+                    eprintln!("rein-remote: back in the room on the relay {}", crate::metrics::relay_name(relay));
+                    lost = false;
+                }
                 let _ = ws.get_ref().tcp().set_nodelay(true);
                 let _ = socket2::SockRef::from(ws.get_ref().tcp()).set_send_buffer_size((opts.bitrate_kbps as usize * 1000 / 8 / 20).max(64 * 1024));
                 // It may wait a long time for a viewer: TCP keepalive finds a relay that went quietly
@@ -307,13 +324,22 @@ fn through_relay(
                         continue;
                     }
                 };
-                if let Err(e) = session(Box::new(link), source.clone(), stats.clone(), opts, Some(direct)) {
+                let ended = session(Box::new(link), source.clone(), stats.clone(), opts, Some(direct));
+                crate::metrics::relay_update(relay, |r| r.registered = false);
+                if let Err(e) = ended {
+                    // The relay may be gone (it says so when this machine is back in its room).
                     eprintln!("rein-remote: {e}");
+                    lost = true;
                 }
             }
             Err(e) => {
-                eprintln!("rein-remote: the relay ({relay}): {e}");
-                std::thread::sleep(Duration::from_secs(4));
+                crate::metrics::relay_update(relay, |r| r.registered = false);
+                // Said once while it's gone, not every few seconds.
+                if !lost {
+                    eprintln!("rein-remote: the relay ({}): {e}; trying again every 2 s", crate::metrics::relay_name(relay));
+                }
+                lost = true;
+                std::thread::sleep(Duration::from_secs(2));
             }
         }
         std::thread::sleep(Duration::from_millis(500));
@@ -337,8 +363,9 @@ fn handle(
     let path = target.split(['?', '#']).next().unwrap_or("/").to_string();
     let upgrade = req.to_ascii_lowercase().contains("upgrade: websocket");
     let query = target.split_once('?').map_or("", |(_, q)| q.split('#').next().unwrap_or(""));
-    // The token or a paired device's ticket (compared in full, not stopping at the first difference).
-    let token_ok = gate.allows(query);
+    // The token or a paired device's ticket (compared in full, not stopping at the first difference),
+    // or the token as a bearer (a metrics scraper: kept out of the URL).
+    let token_ok = gate.allows(query) || crate::metrics::bearer(&req).is_some_and(|t| gate.token_is(t));
     // Pairing and signing in: small forms, answered here.
     let method = req.split_whitespace().next().unwrap_or("GET").to_string();
     if path.starts_with("/pair/") || path.starts_with("/auth") {
@@ -355,7 +382,7 @@ fn handle(
             return conn.write_all(resp.as_bytes()).map_err(|e| e.to_string());
         }
     }
-    if (path.starts_with("/stream") || path == "/stats") && !token_ok {
+    if (path.starts_with("/stream") || matches!(path.as_str(), "/stats" | "/metrics" | "/healthz")) && !token_ok {
         let _ = conn.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         return Ok(());
     }
@@ -375,6 +402,8 @@ fn handle(
             ("200 OK", kind, body.to_string())
         }
         "/stats" => ("200 OK", "application/json", stats_json(&stats.lock().unwrap(), opts.audio.as_deref())),
+        "/healthz" => ("200 OK", "application/json", crate::metrics::serve_healthz()),
+        "/metrics" => ("200 OK", "text/plain; version=0.0.4; charset=utf-8", crate::metrics::serve_prometheus()),
         // Where WebTransport is, and its certificate's SHA-256 when the browser has to be given it
         // (a self-signed one; a real certificate needs nothing).
         "/info" => ("200 OK", "application/json", {
@@ -457,6 +486,11 @@ fn send_frame(
         timestamp_us: e.tag,
         data: e.data,
     }))?;
+    crate::metrics::FRAMES.inc();
+    crate::metrics::VIDEO_BYTES.add(len);
+    if e.keyframe {
+        crate::metrics::KEYFRAMES.inc();
+    }
     let mut s = stats.lock().unwrap();
     s.frames += 1;
     s.bytes += len;
@@ -656,6 +690,12 @@ fn session(
     // datagrams of its own when it takes them (a lost packet is a gap, never a wait), else in order.
     let audio = opts.audio.as_ref().filter(|_| client.audio).map(|a| a.listen());
     let audio_datagrams = audio.is_some() && client.features & FEATURE_AUDIO_DATAGRAMS != 0 && link.use_audio_datagrams();
+    crate::metrics::SESSIONS.inc();
+    let _viewer = if direct.is_some() {
+        crate::metrics::VIEWERS_RELAYED.hold()
+    } else {
+        crate::metrics::VIEWERS_DIRECT.hold()
+    };
     eprintln!(
         "rein-remote: {} connected ({:?} {ew}×{eh} at {fps} fps{refresh}{}{})",
         client.name,
@@ -681,6 +721,7 @@ fn session(
             cert_sha256: d.cert.to_vec(),
             ticket,
         }))?;
+        crate::metrics::DIRECT_OFFERS.inc();
         eprintln!("rein-remote: offered {} a direct path ({})", client.name, addrs(&d.candidates));
     }
 
@@ -782,6 +823,7 @@ fn session(
                                 // this NAT then lets the viewer's QUIC in, as an answer to them.
                                 if let (Some(d), Some(tag)) = (direct, punch_tag) {
                                     let to: Vec<SocketAddr> = a.candidates.into_iter().filter(SocketAddr::is_ipv4).collect();
+                                    crate::metrics::DIRECT_ANSWERS.inc();
                                     eprintln!("rein-remote: punching toward the viewer ({})", addrs(&to));
                                     if let Ok(sock) = d.socket.try_clone() {
                                         std::thread::spawn(move || rr_client::direct::punch(&sock, &to, tag, Duration::from_secs(5)));
@@ -840,6 +882,7 @@ fn session(
                     backed_up = true;
                 }
                 adapt.backed_up();
+                crate::metrics::SKIPPED_BACKED_UP.inc();
                 stats.lock().unwrap().skipped_backed_up += 1;
             } else {
                 backed_up = false;

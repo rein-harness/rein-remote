@@ -1,0 +1,35 @@
+# A relay fleet behind one name, in Docker (tests/relay-fleet/run.sh drives it):
+#
+#   viewer ──► lb:7990 (haproxy: /healthz checks, retries elsewhere) ──► relay-a:7990
+#                                                                   └──► relay-b:7990
+#   host (serve --relay ws://relay-a:7990 --relay ws://relay-b:7990): its room open on both
+#
+# Everything from config files (config/), the relays' secret from a file of its own. Needs the image
+# from build.sh (rr-fleet) and haproxy's.
+name: rr-fleet
+x-rr: &rr
+  image: rr-fleet
+  volumes: ["./config:/etc/rein-remote:ro"]
+  networks: [fleet]
+services:
+  relay-a:
+    <<: *rr
+    command: ["rein-remote", "relay", "--config", "/etc/rein-remote/relay.toml"]
+  relay-b:
+    <<: *rr
+    command: ["rein-remote", "relay", "--config", "/etc/rein-remote/relay.toml"]
+  lb:
+    image: haproxy:3.0-alpine
+    volumes: ["./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro"]
+    networks: [fleet]
+    depends_on: [relay-a, relay-b]
+  host:
+    <<: *rr
+    command: ["rein-remote", "serve", "--config", "/etc/rein-remote/serve.toml"]
+    depends_on: [relay-a, relay-b]
+  # A viewer to `exec rein-remote connect LINK …` in.
+  viewer:
+    <<: *rr
+    command: ["sleep", "infinity"]
+networks:
+  fleet: {}

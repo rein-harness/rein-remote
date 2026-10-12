@@ -1,6 +1,9 @@
 name: Release
 # A tag like v0.1.0 builds rein-remote (and the desktop viewer, rein-remote-viewer) for every platform and publishes a GitHub release with the
-# archives and SHA256SUMS (what Rein checks before installing one). Unsigned for now (ROADMAP phase 6).
+# archives and SHA256SUMS (what Rein checks before installing one). Signed where the repository has the
+# secrets for it (docs/verification/signing.md): macOS with a Developer ID and notarized, Windows with
+# Authenticode, timestamped; without them, those steps are skipped and the build is as before. SHA256SUMS
+# is signed with cosign, keyless (Sigstore, this workflow's GitHub identity: no secret needed).
 on:
   push:
     tags: ['v*']
@@ -15,11 +18,16 @@ jobs:
       - name: Release (a draft until every build is in)
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --title "rein-remote $GITHUB_REF_NAME" --notes "Builds for macOS, Linux and Windows. Check them against SHA256SUMS."
+        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --title "rein-remote $GITHUB_REF_NAME" --notes "Builds for macOS, Linux and Windows. Check them against SHA256SUMS, and SHA256SUMS against its signature (SHA256SUMS.sigstore.json, docs/verification/signing.md)."
   build:
     needs: create
     permissions:
       contents: write
+    # Whether each signing secret is there (true/false only: the secrets themselves go to their step alone,
+    # not to the build, where every dependency's build script runs).
+    env:
+      HAS_MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE != '' }}
+      HAS_WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE != '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -40,6 +48,25 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq libudev-dev > /dev/null
       - name: Build
         run: cargo build --release -p rr-server -p rr-viewer --target ${{ matrix.target }}
+      # Only with the secrets (else skipped: an unsigned build, as before).
+      - name: Sign and notarize (macOS, Developer ID)
+        if: runner.os == 'macOS' && env.HAS_MACOS_CERTIFICATE == 'true'
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: sh tools/sign/macos.sh target/${{ matrix.target }}/release/rein-remote target/${{ matrix.target }}/release/rein-remote-viewer
+      - name: Sign (Windows, Authenticode)
+        if: runner.os == 'Windows' && env.HAS_WINDOWS_CERTIFICATE == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
+        run: ./tools/sign/windows.ps1 target/${{ matrix.target }}/release/rein-remote.exe target/${{ matrix.target }}/release/rein-remote-viewer.exe
       - name: Package and upload
         shell: bash
         env:
@@ -63,8 +90,14 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # cosign, keyless: a certificate for this workflow's identity from Sigstore.
+      id-token: write
     steps:
-      - name: SHA256SUMS, then publish
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+      - name: SHA256SUMS
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -73,7 +106,19 @@ jobs:
           sha256sum * > ../SHA256SUMS
           cd .. && cat SHA256SUMS
           gh release upload "$GITHUB_REF_NAME" SHA256SUMS --repo "$GITHUB_REPOSITORY"
-          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+      # SHA256SUMS.sigstore.json: the checksums (so every archive) signed by this workflow. Sigstore out
+      # of reach doesn't hold the release up: it's published without the bundle, and says so.
+      - name: Sign SHA256SUMS (cosign, keyless)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sh tools/sign/cosign.sh SHA256SUMS
+          gh release upload "$GITHUB_REF_NAME" SHA256SUMS.sigstore.json --repo "$GITHUB_REPOSITORY"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
   # npm: the web client, the server's front package and one package per platform binary, from the
   # archives just published. Only when the repository has an NPM_TOKEN secret.
   npm:
