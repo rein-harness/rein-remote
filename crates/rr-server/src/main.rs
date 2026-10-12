@@ -4,7 +4,10 @@
 //!   rein-remote serve --display :20        # a virtual display (Xvfb, Xvnc)
 //!   rein-remote serve --test-pattern       # a moving pattern, no display needed
 //!   rein-remote serve --window Simulator   # one app's window (macOS), by app name, title or id
+//!   rein-remote serve --app Safari         # one app, all its windows (macOS)
+//!   rein-remote serve --display 2          # a display (macOS: its number in `displays`; Linux: :N)
 //!   rein-remote windows [--json]           # the windows it can show
+//!   rein-remote displays                   # the displays (macOS)
 //!   rein-remote selftest --window Notepad --type hi   # capture works, and typing changes what's seen
 //!   rein-remote serve --listen 0.0.0.0:7979 --fps 60 --bitrate 8000   # --fps auto (the default): the viewer's display rate
 //!   rein-remote serve --listen 127.0.0.1:0 --token T   # a free port (printed), the stream needs ?token=T
@@ -27,7 +30,7 @@ use capture::{Source, TestPattern};
 
 fn usage() -> ! {
     eprintln!(
-        "rein-remote {}\n\nusage:\n  rein-remote serve [--display :N | --window APP|TITLE|ID | --vnc HOST:PORT [--vnc-password P] | --pipe WxH | --test-pattern [WxH]] [--listen ADDR] [--fps auto|N] [--codec h264|h265|auto] [--bitrate KBPS] [--token T] [--webtransport on|off] [--tls-cert PEM --tls-key PEM] [--tailscale-cert on|off] [--relay ws(s)://HOST:PORT [--room CODE] [--relay-secret S]]\n  rein-remote relay [--listen ADDR] [--secret S]\n  rein-remote windows [--json]\n  rein-remote selftest [--window Q | --display :N | --test-pattern] [--type TEXT]\n  rein-remote --version",
+        "rein-remote {}\n\nusage:\n  rein-remote serve [--display :N | --window APP|TITLE|ID | --app NAME | --vnc HOST:PORT [--vnc-password P] | --pipe WxH | --test-pattern [WxH]] [--listen ADDR] [--fps auto|N] [--codec h264|h265|auto] [--bitrate KBPS] [--token T] [--webtransport on|off] [--tls-cert PEM --tls-key PEM] [--tailscale-cert on|off] [--relay ws(s)://HOST:PORT [--room CODE] [--relay-secret S]]\n  rein-remote relay [--listen ADDR] [--secret S]\n  rein-remote windows [--json]\n  rein-remote displays\n  rein-remote selftest [--window Q | --display :N | --test-pattern] [--type TEXT]\n  rein-remote --version",
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(2);
@@ -38,6 +41,13 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("--version") | Some("-V") => println!("rein-remote {}", env!("CARGO_PKG_VERSION")),
         Some("windows") => match list_windows(args.get(1).map(String::as_str) == Some("--json")) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("rein-remote: {e}");
+                std::process::exit(1);
+            }
+        },
+        Some("displays") => match list_displays() {
             Ok(()) => {}
             Err(e) => {
                 eprintln!("rein-remote: {e}");
@@ -98,6 +108,7 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
     let (mut tls_cert, mut tls_key) = (None, None);
     let mut display: Option<String> = None;
     let mut window: Option<String> = None;
+    let mut app: Option<String> = None;
     let mut vnc: Option<String> = None;
     let mut pipe: Option<(usize, usize)> = None;
     let mut vnc_password = std::env::var("REIN_REMOTE_VNC_PASSWORD").ok();
@@ -126,6 +137,7 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
             "--bitrate" => opts.bitrate_kbps = val()?.parse().map_err(|_| "--bitrate is kbit/s")?,
             "--display" => display = Some(val()?),
             "--window" => window = Some(val()?),
+            "--app" => app = Some(val()?),
             "--vnc" => vnc = Some(val()?),
             "--pipe" => {
                 let v = val()?;
@@ -183,6 +195,7 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
         (None, _) if pipe.is_some() => Box::new(capture::pipe::Pipe::open(pipe.unwrap().0, pipe.unwrap().1)),
         (None, _) if vnc.is_some() => Box::new(capture::vnc::Vnc::open(vnc.as_deref().unwrap(), vnc_password.as_deref())?),
         (None, Some(q)) => open_window(&q)?,
+        (None, None) if app.is_some() => open_app(app.as_deref().unwrap())?,
         (None, None) => open_display(display.as_deref())?,
     };
     serve::run(source, opts)
@@ -292,9 +305,37 @@ fn open_display(display: Option<&str>) -> Result<Box<dyn Source>, String> {
     Ok(Box::new(capture::x11::X11::open(display)?))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn open_display(display: Option<&str>) -> Result<Box<dyn Source>, String> {
+    Ok(Box::new(capture::mac::MacWindow::open_display(display)?))
+}
+
+#[cfg(target_os = "macos")]
+fn open_app(query: &str) -> Result<Box<dyn Source>, String> {
+    Ok(Box::new(capture::mac::MacWindow::open_app(query)?))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_app(_query: &str) -> Result<Box<dyn Source>, String> {
+    Err("--app is for macOS (elsewhere, --window shows one of an app's windows)".into())
+}
+
+#[cfg(windows)]
 fn open_display(_display: Option<&str>) -> Result<Box<dyn Source>, String> {
-    Err("screen capture on this platform comes in phase 3 (see ROADMAP.md); use --test-pattern to try the stream".into())
+    Err("the whole screen on Windows isn't in yet: --window shows any app's window".into())
+}
+
+#[cfg(target_os = "macos")]
+fn list_displays() -> Result<(), String> {
+    for d in capture::mac::displays()? {
+        println!("{:>3}  id {}  {}×{}{}", d.n, d.id, d.width, d.height, if d.main { "  (main)" } else { "" });
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn list_displays() -> Result<(), String> {
+    Err("`displays` is for macOS (on Linux, --display :N picks an X display)".into())
 }
 
 /// Capture without a client (for CI and for checking a machine): the source gives a frame, and with
@@ -302,12 +343,13 @@ fn open_display(_display: Option<&str>) -> Result<Box<dyn Source>, String> {
 fn selftest(args: &[String]) -> Result<String, String> {
     use std::time::{Duration, Instant};
     let mut it = args.iter();
-    let (mut window, mut display, mut pattern, mut text) = (None, None, false, None);
+    let (mut window, mut display, mut pattern, mut text, mut app) = (None, None, false, None, None);
     while let Some(a) = it.next() {
         let mut val = || it.next().cloned().ok_or_else(|| format!("{a} needs a value"));
         match a.as_str() {
             "--window" => window = Some(val()?),
             "--display" => display = Some(val()?),
+            "--app" => app = Some(val()?),
             "--test-pattern" => pattern = true,
             "--type" => text = Some(val()?),
             _ => usage(),
@@ -316,6 +358,7 @@ fn selftest(args: &[String]) -> Result<String, String> {
     let mut src: Box<dyn Source> = match (pattern, window) {
         (true, _) => Box::new(TestPattern::new(320, 240)),
         (false, Some(q)) => open_window(&q)?,
+        (false, None) if app.is_some() => open_app(app.as_deref().unwrap())?,
         (false, None) => open_display(display.as_deref())?,
     };
     let (w, h) = src.size();
