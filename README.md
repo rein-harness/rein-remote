@@ -31,7 +31,8 @@ Early: the design is done and being built one verified piece at a time
 | Packages (npm): `@rein-harness/remote`, `@rein-harness/remote-server` | working: the web client, and the server per platform (`npx rein-remote`), checked against Rein's contract in CI on all three (phase 2) |
 | Rein previews | working: a Rein web UI chat shows a native Linux app through Rein Remote, from a phone, through a reverse proxy (phase 2) |
 | Client: Windows / macOS / Linux | todo (phase 5) |
-| Client: iOS / iPadOS / Android | todo (phase 5) |
+| Client: iOS / iPadOS | todo (phase 5) |
+| Client: Android (`clients/android`, Kotlin on the Rust core) | in the emulator: MediaCodec decode, sound, touch gestures, keyboards, gamepads, pairing, WebTransport; a real phone still to verify ([docs/verification/android-client.md](docs/verification/android-client.md)) (phase 5) |
 | Transport: WebSocket | working, with keyframe-and-skip when the link backs up (phase 1) |
 | Transport: WebTransport (QUIC) | working: a stream per frame, self-signed certificate by hash, falls back to the WebSocket by itself (phase 4) |
 | Transport: relay (behind NAT, no open ports) | working: `rein-remote relay` (self-hosted), `serve --relay`; NAT hole punching todo (phase 4) |
@@ -107,6 +108,9 @@ and how Rein embeds it.
 cargo build --workspace
 cargo test --workspace
 ```
+
+The Android app: `clients/android/build-core.sh` (the core, with cargo-ndk), then `./gradlew
+assembleDebug` there; see [docs/verification/android-client.md](docs/verification/android-client.md).
 
 ## License
 

@@ -302,8 +302,17 @@ class PatternTests {
             for ((x, y) in listOf(300 + d to 200, 300 - d to 200, 300 to 200 + d, 300 to 200 - d)) px[y * w + x] = 0xffff0000.toInt()
         }
         val after = Pixels(px, w, h)
-        assertTrue(Pattern.crossRedness(before, 300, 200) < Pattern.CROSS_THRESHOLD)
+        assertTrue(Pattern.crossRedness(before, 300, 200) < 5)
         assertTrue(Pattern.crossRedness(after, 300, 200) > Pattern.CROSS_THRESHOLD)
+        // At half size, blurred: arms 10 long, half red.
+        val half = before.argb.copyOf()
+        for (d in 0 until 10) {
+            for ((x, y) in listOf(300 + d to 200, 300 to 200 + d)) {
+                val p = half[y * w + x]
+                half[y * w + x] = (0xff shl 24) or (((((p shr 16) and 0xff) + 255) / 2) shl 16) or ((((p shr 8) and 0xff) / 2) shl 8) or ((p and 0xff) / 2)
+            }
+        }
+        assertTrue(Pattern.crossRedness(Pixels(half, w, h), 300, 200) > Pattern.CROSS_THRESHOLD)
     }
 
     @Test

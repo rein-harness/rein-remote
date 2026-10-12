@@ -32,6 +32,8 @@ class StreamMetrics {
     val network = Window(2000)
     @Volatile var barcodeMisses = 0
     @Volatile var audioPackets = 0
+    @Volatile var audioDecoded = 0
+    @Volatile var audioHeadMs = 0L
     @Volatile var audioPlayed = 0
     @Volatile var audioDropped = 0
     @Volatile var decoder = ""
@@ -305,6 +307,8 @@ class StreamController(private val context: Context, val view: StreamView) : Sur
         m.decoder = decoder.description
         m.errors = decoder.errors
         audio?.let {
+            m.audioDecoded = it.decoded
+            m.audioHeadMs = it.headMs
             m.audioPlayed = it.played
             m.audioDropped = it.dropped
         }
@@ -322,7 +326,7 @@ class StreamController(private val context: Context, val view: StreamView) : Sur
         val g95 = m.glass.pct(0.95)
         if (g != null && g95 != null) lines.add("glass to glass ${"%.0f".format(g)} ms (p95 ${"%.0f".format(g95)})")
         m.network.pct(0.5)?.let { lines.add("capture to arrival ${"%.0f".format(it)} ms") }
-        if (audio != null) lines.add("sound: ${m.audioPlayed} played, ${m.audioDropped} dropped${audio?.failed?.let { " ($it)" } ?: ""}")
+        if (audio != null) lines.add("sound: ${m.audioDecoded} decoded, ${m.audioPlayed} played, ${m.audioDropped} dropped${audio?.failed?.let { " ($it)" } ?: ""}")
         if (gamepads.connected > 0) {
             val p = gamepads.lastState ?: GamepadState()
             val sent = if (serverInput and 8 != 0) "sent" else "not sent: the server takes no gamepads"
@@ -355,11 +359,11 @@ object SelfTest {
             return report("FAIL no video (${c.m.frames} frames, ${c.state})", emptyMap())
         }
         val tap = c.input!!
-        val (w, h) = c.m.width to c.m.height
         val cross = mutableListOf<String>()
         var crossOk = true
         for ((fx, fy) in listOf(0.25 to 0.3, 0.75 to 0.6, 0.5 to 0.45)) {
-            val (x, y) = (w * fx).toInt() to (h * fy).toInt()
+            // At the stream's size now (the server may have scaled the picture since).
+            val (x, y) = (c.m.width * fx).toInt() to (c.m.height * fy).toInt()
             val before = c.crossNow(x, y) ?: 0.0
             val sent = SystemClock.uptimeMillis()
             tap.pointerMove(x, y)
@@ -397,6 +401,8 @@ object SelfTest {
             "frames_lost" to "${m.framesLost}",
             "decoder_errors" to "${m.errors}",
             "audio_packets" to "${m.audioPackets}",
+            "audio_decoded" to "${m.audioDecoded}",
+            "audio_played_ms" to "${m.audioHeadMs}",
             "audio_played" to "${m.audioPlayed}",
             "audio_dropped" to "${m.audioDropped}",
             "cross" to cross.joinToString("; "),

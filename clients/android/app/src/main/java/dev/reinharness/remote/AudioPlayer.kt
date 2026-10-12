@@ -23,9 +23,15 @@ class AudioPlayer {
     @Volatile private var running = true
     @Volatile var packets = 0
         private set
+    /** Packets Opus decoded (whether or not they were then played). */
+    @Volatile var decoded = 0
+        private set
     @Volatile var played = 0
         private set
     @Volatile var dropped = 0
+        private set
+    /** How much the device has played (ms): the AudioTrack's playback head. */
+    @Volatile var headMs = 0L
         private set
     @Volatile var failed: String? = null
         private set
@@ -83,8 +89,11 @@ class AudioPlayer {
                     val outIdx = codec.dequeueOutputBuffer(info, 5_000)
                     if (outIdx < 0) break
                     val out = codec.getOutputBuffer(outIdx)!!
+                    if (info.size > 0) decoded++
                     // Frames not yet played: drop this one when they're more than the queue may hold.
-                    val queuedMs = (written - track.playbackHeadPosition.toLong()) * 1000 / RATE
+                    val head = track.playbackHeadPosition.toLong()
+                    headMs = head * 1000 / RATE
+                    val queuedMs = (written - head) * 1000 / RATE
                     if (info.size > 0 && queuedMs <= MAX_QUEUED_MS) {
                         out.position(info.offset)
                         out.limit(info.offset + info.size)

@@ -115,17 +115,21 @@ object Pattern {
     fun flashing(px: Pixels, streamW: Int, streamH: Int): Boolean =
         px.at(streamW / 12, streamH / 12)?.let { luma(it) > 200 } ?: false
 
-    /** Redness above which the cross is taken to be there. */
-    const val CROSS_THRESHOLD = 40.0
+    /**
+     * Redness above which the cross is taken to be there: the background reads 0 to 5, the cross 40
+     * to 60 at full size and 20 to 35 in a picture the server scaled to half (its 1-pixel arms blurred).
+     */
+    const val CROSS_THRESHOLD = 15.0
 
     /**
-     * How red the pattern's cross is around (x, y): its arms are 1 pixel wide and 20 long, red over a
-     * gradient whose own red is low. Samples along the right and lower arms against the same points 6
+     * How red the pattern's cross is around (x, y): its arms are 1 pixel wide and 20 long (fewer in a
+     * scaled picture), red over a gradient whose own red is low. Samples along the right and lower
+     * arms, near enough to the middle for a picture scaled to a third, against the same points 6
      * pixels off the arm.
      */
     fun crossRedness(px: Pixels, x: Int, y: Int): Double {
         val diffs = ArrayList<Int>()
-        for (d in 6..16 step 2) {
+        for (d in 2..9) {
             val on1 = px.at(x + d, y)
             val off1 = px.at(x + d, y + 6)
             if (on1 != null && off1 != null) diffs.add(red(on1) - red(off1))

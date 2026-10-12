@@ -46,6 +46,16 @@ class StreamTests {
         return until()
     }
 
+    /** The screen on and unlocked: a fresh emulator starts with the keyguard over everything. */
+    @org.junit.Before
+    fun wake() {
+        val ui = InstrumentationRegistry.getInstrumentation().uiAutomation
+        for (c in listOf("input keyevent KEYCODE_WAKEUP", "wm dismiss-keyguard", "settings put system screen_off_timeout 1800000")) {
+            ui.executeShellCommand(c).close()
+        }
+        Thread.sleep(500)
+    }
+
     private fun report(line: String) {
         Log.i(TAG, "android test: $line")
         println("android test: $line")
@@ -84,7 +94,8 @@ class StreamTests {
             assertTrue("frames", waitFor(30_000) { c.m.frames >= 30 })
             val view = c.view
             val loc = IntArray(2)
-            val (sx, sy) = 900 to 500
+            // Where to tap: in the stream's pixels at its size now (the server may have scaled it).
+            val (sx, sy) = (c.m.width * 0.7).toInt() to (c.m.height * 0.7).toInt()
             var x = 0f
             var y = 0f
             s.onActivity {
