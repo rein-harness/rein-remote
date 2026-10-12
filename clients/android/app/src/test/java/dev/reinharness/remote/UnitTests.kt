@@ -266,6 +266,23 @@ class PatternTests {
     }
 
     @Test
+    fun readsAScaledDownBarcode() {
+        // The server's picture at half size: blocks of 12.
+        val (w, h) = 640 to 360
+        val ms = 0x12345678L
+        val px = IntArray(w * h) { 0xff3c3c3c.toInt() }
+        for (k in 0 until 34) {
+            val on = k == 0 || (k > 1 && (ms shr (33 - k)) and 1L == 1L)
+            for (y in h - 12 until h) for (x in k * 12 until k * 12 + 12) px[y * w + x] = if (on) -1 else 0xff000000.toInt()
+        }
+        val f = Pixels(px, w, h)
+        assertNull(Pattern.barcodeMs(f, w, h))
+        assertEquals(ms to 12, Pattern.readBarcode(f, w, h, ms + 30))
+        // A reading far from the server's clock is no reading.
+        assertNull(Pattern.readBarcode(f, w, h, ms + 60_000))
+    }
+
+    @Test
     fun readsTheBarcodeFromTheBottomStripAlone() {
         val f = frame(123456789L)
         val strip = Pixels(f.argb.copyOfRange(1280 * 696, 1280 * 720), 1280, 24, 0, 696)

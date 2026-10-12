@@ -62,6 +62,8 @@ class VideoDecoder {
     private var sets: List<ByteArray> = emptyList()
     private var waitKey = true
     private var reset = false
+    /** When a keyframe was last asked for while waiting (Unix µs). */
+    private var askedUs = 0L
     /** Which decoder a callback came from (one made again leaves the old one's callbacks ignored). */
     @Volatile private var generation = 0
     private val inputs = LinkedBlockingQueue<Int>()
@@ -121,16 +123,25 @@ class VideoDecoder {
         return l
     }
 
-    private fun skip(why: String?, keyframeNeeded: Boolean) {
+    /** With [lock] held: [v] is dropped; the decoder starts again at a keyframe, asked for once (again, when it was one). */
+    private fun skip(v: RemoteEvent.Video, why: String) {
         lost++
-        if (keyframeNeeded && !waitKey) {
+        if (!waitKey || v.keyframe) {
             waitKey = true
-            if (why != null) Log.i(TAG, "video: $why: skipping to a keyframe")
+            askedUs = Native.nowUs()
+            Log.i(TAG, "video: $why: skipping to a keyframe")
             onNeedKeyframe?.invoke()
         }
     }
 
-    fun decode(v: RemoteEvent.Video) = synchronized(lock) {
+    fun decode(v: RemoteEvent.Video) {
+        val t0 = android.os.SystemClock.elapsedRealtime()
+        decodeLocked(v)
+        val ms = android.os.SystemClock.elapsedRealtime() - t0
+        if (ms > 50) Log.i(TAG, "video: frame ${v.frame}${if (v.keyframe) " (keyframe)" else ""} took $ms ms to hand to the decoder")
+    }
+
+    private fun decodeLocked(v: RemoteEvent.Video) = synchronized(lock) {
         val s = surface
         if (s == null) {
             lost++
@@ -144,6 +155,12 @@ class VideoDecoder {
         }
         if (waitKey && !v.keyframe) {
             lost++
+            // Still none a second after asking (the ask or the keyframe lost): ask again.
+            val now = Native.nowUs()
+            if (now - askedUs > 1_000_000) {
+                askedUs = now
+                onNeedKeyframe?.invoke()
+            }
             return
         }
         val busy = synchronized(meta) { inFlight }
@@ -151,7 +168,7 @@ class VideoDecoder {
         // keyframe (which is always taken: it's where the decoder starts over).
         val late = Native.nowUs() - v.receivedUs > LATE_US
         if (!v.keyframe && (late || busy >= MAX_IN_FLIGHT)) {
-            skip(if (late) "a frame ${(Native.nowUs() - v.receivedUs) / 1000} ms late" else "$busy frames in the decoder", true)
+            skip(v, if (late) "a frame ${(Native.nowUs() - v.receivedUs) / 1000} ms late" else "$busy frames in the decoder")
             return
         }
         val hevc = codecType == Codec.H265
@@ -166,9 +183,10 @@ class VideoDecoder {
             }
         }
         val c = codec ?: return fail("no decoder")
-        val idx = inputs.poll(INPUT_WAIT_MS, TimeUnit.MILLISECONDS)
+        // A keyframe waits longer: a decoder just made can take a while to offer its first buffers.
+        val idx = inputs.poll(if (v.keyframe) KEYFRAME_INPUT_WAIT_MS else INPUT_WAIT_MS, TimeUnit.MILLISECONDS)
         if (idx == null) {
-            skip("no input buffer free", true)
+            skip(v, "no input buffer free")
             return
         }
         try {
@@ -306,5 +324,6 @@ class VideoDecoder {
         const val MAX_IN_FLIGHT = 4
         const val LATE_US = 100_000L
         const val INPUT_WAIT_MS = 30L
+        const val KEYFRAME_INPUT_WAIT_MS = 500L
     }
 }

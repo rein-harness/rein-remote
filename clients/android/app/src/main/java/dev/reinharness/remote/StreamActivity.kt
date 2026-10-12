@@ -39,7 +39,7 @@ object Core {
  *
  * Extras (also for tests and measuring, `adb shell am start -n dev.reinharness.remote/.StreamActivity
  * -e url URL …`): url, name, pair (a pairing code), measure, selftest, seconds, audio, webtransport,
- * hevc (offer HEVC even where it's decoded in software).
+ * hevc (offer HEVC even where it's decoded in software), decoder (one by name: c2.android.avc.decoder).
  */
 class StreamActivity : Activity(), InputManager.InputDeviceListener {
     lateinit var controller: StreamController
@@ -68,6 +68,8 @@ class StreamActivity : Activity(), InputManager.InputDeviceListener {
         view = StreamView(this)
         controller = StreamController(this, view)
         controller.measure = measure
+        // A decoder by name (MediaCodecList's), in place of the best one.
+        controller.decoder.prefer = x.getStringExtra("decoder")
         val root = FrameLayout(this)
         root.addView(view, FrameLayout.LayoutParams(-1, -1))
         val bar = LinearLayout(this).apply {

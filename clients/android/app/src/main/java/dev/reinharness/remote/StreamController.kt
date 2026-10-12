@@ -207,7 +207,7 @@ class StreamController(private val context: Context, val view: StreamView) : Sur
     /** Copies the screen's buffer back: the barcode's strip, and the place the pointer was sent. */
     private fun copy() {
         val (w, h) = m.width to m.height
-        if (w < Pattern.BLOCK * 34 || h < Pattern.BLOCK || Build.VERSION.SDK_INT < 24 || !view.video.holder.surface.isValid) {
+        if (w < Pattern.BLOCKS.last() * 34 || h < Pattern.BLOCK || Build.VERSION.SDK_INT < 24 || !view.video.holder.surface.isValid) {
             copying = false
             return
         }
@@ -226,18 +226,19 @@ class StreamController(private val context: Context, val view: StreamView) : Sur
     }
 
     private fun readStrip(b: Bitmap, w: Int, h: Int, seenUs: Long) {
+        val off = clockOffsetUs ?: return
         val px = IntArray(w * Pattern.BLOCK)
         b.getPixels(px, 0, w, 0, 0, w, Pattern.BLOCK)
-        val ms = Pattern.barcodeMs(Pixels(px, w, Pattern.BLOCK, 0, h - Pattern.BLOCK), w, h) ?: run {
+        val serverSeenMs = (seenUs - off) / 1000
+        val (ms, _) = Pattern.readBarcode(Pixels(px, w, Pattern.BLOCK, 0, h - Pattern.BLOCK), w, h, serverSeenMs) ?: run {
             m.barcodeMisses++
             return
         }
-        val off = clockOffsetUs ?: return
         // On the server's clock: when it was handed to the display, and when it was seen there.
         val handedUs = synchronized(handed) { handed[ms] ?: handed[(ms + 1) and 0xffffffffL] ?: handed[(ms - 1) and 0xffffffffL] }
         if (handedUs != null) Pattern.since(ms, (handedUs - off) / 1000)?.let { m.glass.add(it.toDouble()) }
         else m.barcodeMisses++
-        Pattern.since(ms, (seenUs - off) / 1000)?.let { m.glassSeen.add(it.toDouble()) }
+        Pattern.since(ms, serverSeenMs)?.let { m.glassSeen.add(it.toDouble()) }
     }
 
     private fun copyCross(w: Int, h: Int) {

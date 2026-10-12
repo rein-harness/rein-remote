@@ -76,17 +76,33 @@ object Pattern {
     private fun red(p: Int): Int = ((p shr 16) and 0xff) - (((p shr 8) and 0xff) + (p and 0xff)) / 2
 
     /**
-     * The barcode's capture time (ms, Unix time mod 2³²), if [px] has one: blocks of 24×24 along the
-     * bottom of a stream [streamH] high, white, black, then 32 bits high first.
+     * The barcode's capture time (ms, Unix time mod 2³²), if [px] has one: blocks of [block]×[block]
+     * along the bottom of a stream [streamH] high, white, black, then 32 bits high first. The pattern
+     * draws 24-pixel blocks; a picture the server scaled down has smaller ones.
      */
-    fun barcodeMs(px: Pixels, streamW: Int, streamH: Int): Long? {
-        if (streamW < 34 * BLOCK || streamH < BLOCK) return null
-        val y = streamH - BLOCK / 2
-        fun bit(k: Int): Boolean? = px.at(k * BLOCK + BLOCK / 2, y)?.let { luma(it) > 128 }
+    fun barcodeMs(px: Pixels, streamW: Int, streamH: Int, block: Int = BLOCK): Long? {
+        if (streamW < 34 * block || streamH < block) return null
+        val y = streamH - block / 2
+        fun bit(k: Int): Boolean? = px.at(k * block + block / 2, y)?.let { luma(it) > 128 }
         if (bit(0) != true || bit(1) != false) return null
         var ms = 0L
         for (k in 2 until 34) ms = (ms shl 1) or (if (bit(k) ?: return null) 1L else 0L)
         return ms
+    }
+
+    /** Block sizes to try: the pattern's own, then as the server scales a picture down (¾, ⅔, ½, ⅓, ¼). */
+    val BLOCKS = intArrayOf(24, 18, 16, 12, 8, 6)
+
+    /**
+     * The barcode at whichever scale reads as a time within 10 s of [serverNowMs] (the server's clock
+     * now, ms): the capture time, and the block size it was read at.
+     */
+    fun readBarcode(px: Pixels, streamW: Int, streamH: Int, serverNowMs: Long): Pair<Long, Int>? {
+        for (b in BLOCKS) {
+            val ms = barcodeMs(px, streamW, streamH, b) ?: continue
+            if (since(ms, serverNowMs) != null) return ms to b
+        }
+        return null
     }
 
     /** Milliseconds from capture time [barcodeMs] (server clock, mod 2³²) to [serverNowMs]; null when far apart. */

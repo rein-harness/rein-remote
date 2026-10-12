@@ -19,8 +19,12 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
+            // Signed with the debug key, for measuring and CI only (a debuggable build checks every
+            // JNI call and runs slower): `-Prr.testBuildType=release`. Nothing here is published.
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
+    testBuildType = (project.findProperty("rr.testBuildType") as String?) ?: "debug"
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -44,6 +48,7 @@ tasks.configureEach {
 
 dependencies {
     testImplementation("junit:junit:4.13.2")
+    androidTestImplementation("androidx.test:core:1.6.1")
     androidTestImplementation("androidx.test:runner:1.6.2")
     androidTestImplementation("androidx.test:rules:1.6.1")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
