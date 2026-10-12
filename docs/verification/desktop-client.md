@@ -58,12 +58,16 @@ $rr = ".\target\release\rein-remote.exe"; $v = ".\target\release\rein-remote-vie
 Linux (bash), with Rust, and libudev's headers for gamepads:
 
 ```sh
-sudo apt-get install -y libudev-dev vainfo      # Fedora: systemd-devel libva-utils
+sudo apt-get install -y libudev-dev libxkbcommon-x11-0 vainfo   # Fedora: systemd-devel libxkbcommon-x11 libva-utils
 git clone https://github.com/rein-harness/rein-remote && cd rein-remote
 git checkout phase-5-desktop
 cargo build --release -p rr-server -p rr-viewer
 rr=./target/release/rein-remote; v=./target/release/rein-remote-viewer
 ```
+
+At run time on Linux the viewer loads libxkbcommon-x11 (X11 keyboards), libudev (gamepads) and,
+for hardware decoding, libva and libva-drm (`libva2 libva-drm2` and the GPU's VA driver:
+`intel-media-va-driver` or `mesa-va-drivers`).
 
 Write down the machine: OS and version, GPU and driver (Windows: Device Manager; Linux: `vainfo`'s
 "Driver version" line), CPU, display and its refresh rate.

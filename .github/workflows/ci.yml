@@ -18,10 +18,11 @@ jobs:
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
       - name: Format
         run: cargo fmt --all --check
-      # The viewer's gamepads (gilrs) read devices through libudev on Linux.
+      # The viewer's gamepads (gilrs) read devices through libudev on Linux; its window's keyboard
+      # needs libxkbcommon-x11 (loaded at run time).
       - name: Linux packages
         if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq libudev-dev > /dev/null
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libudev-dev libxkbcommon-x11-0 > /dev/null
       - name: Lint
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
@@ -179,7 +180,10 @@ jobs:
             if out=$($v "$url" --headless --frames 10 --seconds 8 --decoder hardware 2>&1); then echo "VA-API decoded without a GPU?"; exit 1; fi
             echo "$out"; echo "$out" | grep -q "VA-API"
           fi
-          $v "$url" --measure --seconds 5 || { [ "$RUNNER_OS" = macOS ] && echo "no window on this runner"; }
+          if ! $v "$url" --measure --seconds 5; then
+            [ "$RUNNER_OS" = macOS ] || exit 1
+            echo "no window on this runner"
+          fi
           kill %1 || true
   wasm:
     runs-on: ubuntu-latest
