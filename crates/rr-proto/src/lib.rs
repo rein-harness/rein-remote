@@ -200,13 +200,10 @@ pub enum Input {
     Touch {
         points: Vec<(u8, u16, u16)>,
     },
-    /// A gamepad's state: buttons as a bit set, then sticks and triggers.
-    ///
-    /// Bit `i` of `buttons` is button `i` of the W3C "standard gamepad" layout: 0 A (bottom face), 1 B
-    /// (right), 2 X (left), 3 Y (top), 4 left shoulder, 5 right shoulder, 6 left trigger, 7 right
-    /// trigger, 8 back/select/view, 9 start/menu, 10 left stick press, 11 right stick press, 12 up,
-    /// 13 down, 14 left, 15 right (the d-pad), 16 home/guide. Sticks from -32767 to 32767, positive
-    /// right and down; triggers 0 (released) to 255 (fully pressed). `pad` tells gamepads apart.
+    /// A gamepad's whole state, sent when any of it changes: `buttons` as a bit set of
+    /// [`gamepad`]'s `BUTTON_*`, the sticks (−32768 left/up … 32767 right/down), the triggers
+    /// (0 released … 255 fully pressed). `pad` tells a client's pads apart (0, 1…); a pad unplugged
+    /// is sent once more at rest, so nothing stays held.
     Gamepad {
         pad: u8,
         buttons: u32,
@@ -217,6 +214,33 @@ pub enum Input {
         lt: u8,
         rt: u8,
     },
+}
+
+/// What a gamepad's `buttons` bits mean: bit `n` is button `n` of the W3C Gamepad API's standard
+/// layout (an Xbox-style pad: A at the bottom of the four), so a browser's `gamepad.buttons[n]`
+/// maps straight to it. The triggers are also sent as analog values (`lt`, `rt`); their bits say
+/// they're pressed past half way. New buttons get new bits; a reader ignores bits it doesn't know.
+pub mod gamepad {
+    pub const BUTTON_SOUTH: u32 = 1 << 0;
+    pub const BUTTON_EAST: u32 = 1 << 1;
+    pub const BUTTON_WEST: u32 = 1 << 2;
+    pub const BUTTON_NORTH: u32 = 1 << 3;
+    pub const BUTTON_LEFT_BUMPER: u32 = 1 << 4;
+    pub const BUTTON_RIGHT_BUMPER: u32 = 1 << 5;
+    pub const BUTTON_LEFT_TRIGGER: u32 = 1 << 6;
+    pub const BUTTON_RIGHT_TRIGGER: u32 = 1 << 7;
+    /// Back / Select / View.
+    pub const BUTTON_SELECT: u32 = 1 << 8;
+    /// Start / Menu.
+    pub const BUTTON_START: u32 = 1 << 9;
+    pub const BUTTON_LEFT_STICK: u32 = 1 << 10;
+    pub const BUTTON_RIGHT_STICK: u32 = 1 << 11;
+    pub const BUTTON_UP: u32 = 1 << 12;
+    pub const BUTTON_DOWN: u32 = 1 << 13;
+    pub const BUTTON_LEFT: u32 = 1 << 14;
+    pub const BUTTON_RIGHT: u32 = 1 << 15;
+    /// The logo button (Xbox, PS, Home).
+    pub const BUTTON_GUIDE: u32 = 1 << 16;
 }
 
 /// What arrived and when: drives the bitrate, frame rate and resolution.

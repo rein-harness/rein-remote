@@ -22,6 +22,21 @@ pub struct Found {
     pub https: bool,
 }
 
+impl Found {
+    /// The link to connect to it (no token: a paired client signs in with its key).
+    pub fn link(&self) -> Result<String, String> {
+        // A link-local IPv6 address needs its interface named to be reached (which a URL can't say
+        // portably): any other first.
+        let link_local = |a: &&std::net::IpAddr| matches!(a, std::net::IpAddr::V6(v) if (v.segments()[0] & 0xffc0) == 0xfe80);
+        let addr = self.addrs.iter().find(|a| !link_local(a)).or(self.addrs.first()).ok_or("it gave no address")?;
+        let host = if addr.is_ipv6() { format!("[{addr}]") } else { addr.to_string() };
+        // Plain HTTP: the same port serves it next to HTTPS, and a real certificate is for the
+        // machine's name, not the address found here. (A self-signed WebTransport certificate is
+        // checked by its hash, so that works by address; with a real one, the WebSocket is used.)
+        Ok(format!("http://{host}:{}/", self.port))
+    }
+}
+
 /// Saying where this server is, for as long as it's kept.
 pub struct Advert {
     daemon: ServiceDaemon,
@@ -108,6 +123,8 @@ pub fn discover(wait: Duration) -> Result<Vec<Found>, String> {
                                 o.addrs.push(a);
                             }
                         }
+                        // Answers come per interface: the best address first again.
+                        o.addrs.sort_by_key(|a| (rank(a), *a));
                     }
                     None => out.push(f),
                 }

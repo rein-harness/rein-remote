@@ -38,7 +38,7 @@ enum Pattern {
     }
 
     /// Redness above which the cross is taken to be there.
-    static let crossThreshold = 20.0
+    static let crossThreshold = 12.0
 
     /// How red (Cr above its surroundings) the pattern's cross is around (x, y): its arms are 1 pixel
     /// wide and 20 long, red over a gradient whose own red is low. Samples along the right and lower

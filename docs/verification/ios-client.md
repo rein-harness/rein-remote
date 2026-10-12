@@ -55,13 +55,15 @@ The same self-test runs from the app itself, for a device: launch arguments `-RR
 on the screen and in the device's log.
 
 Measured on one Mac (Apple silicon, 8 GB, other work running), the iOS 26.5 simulator, the test
-pattern at 1280×720 and 60 fps, 8–10 s each:
+pattern at 1280×720 and 60 fps, 8–10 s each (the relay and the direct path on the same Mac: every
+step of punching runs, through no NAT):
 
 | Device, path | fps | Glass to glass p50 / p95 | Decode p50 / p95 | Input to cross seen | Sound against picture |
 |---|---|---|---|---|---|
 | iPhone 17, H.264, WebTransport datagrams | 60.0 | 9 ms / 15 ms | 1.5 ms / 4.4 ms | 51–54 ms | 15–22 ms |
 | iPhone 17, HEVC (`--codec h265`), datagrams | 60.0 | 9 ms / 17 ms | 1.5 ms / 3.5 ms | 53 ms | 19 ms |
 | iPhone 17, H.264, WebSocket | 60.0 | 17–18 ms / 22–40 ms | 2–3 ms / 5–22 ms | 53–55 ms | 13–18 ms |
+| iPhone 17, through a relay (`serve --relay`), then the direct path it punched | 60.0 | 12 ms / 28 ms | 2.4 ms / 4.3 ms | 51–54 ms | 20 ms |
 | iPad Pro 11-inch (M5), H.264, datagrams | 45 | 20 ms / 101 ms | 1.4 ms / 10 ms | 51–54 ms | 14 ms |
 
 Glass to glass is the test pattern's barcode (its capture time) read from each decoded frame as it
@@ -148,12 +150,18 @@ item what happened.
 9. **The pointer on iPad** (a Magic Trackpad, a mouse, or a Magic Keyboard's trackpad): moving
    without clicking moves the remote pointer (drawn by the app, in the server's shape: the arrow,
    the I-beam over text); a click clicks; a two-finger click (or a mouse's right button) right-clicks;
-   two fingers on the trackpad (or the wheel) scroll; click and drag selects.
-10. **A gamepad** (an Xbox, PlayStation or MFi controller, paired in Settings > Bluetooth): with the
-    speedometer on, a line `gamepads: 1 · buttons 0x… · left x,y` changes as buttons and sticks
-    move (A is 0x1, the d-pad right 0x8000; up on the left stick is negative). No server injects
-    gamepads yet, so it says `not sent: the server takes no gamepads`; a server that does takes them
-    in the W3C standard layout (rr-proto's `Input::Gamepad`).
+   two fingers on the trackpad (or the wheel) scroll; click and drag selects. (Scrolling comes from
+   a pan gesture that takes only scroll events: if clicks work but scrolling doesn't, that's the
+   first place to look, in StreamView.swift.)
+10. **A gamepad** (an Xbox, PlayStation or MFi controller, paired in Settings > Bluetooth), against a
+    Windows or Linux server set up to play gamepads (ViGEmBus, or write access to `/dev/uinput`: see
+    [desktop-client.md](desktop-client.md), section 5; a Mac server can't, and says so in its Hello).
+    With the speedometer on, a line `gamepads: 1 · buttons 0x… · left x,y · sent` changes as buttons
+    and sticks move (A is 0x1, the d-pad right 0x8000; up on the left stick is negative). The server
+    prints `gamepad 0: a virtual Xbox 360 controller (…)` on the first press; `joy.cpl` (Windows) or
+    `evtest` (Linux) shows every button, both sticks (up is up), the triggers and the d-pad following
+    the pad. Switch the pad off mid-press: nothing stays pressed. Against a Mac server the line says
+    `not sent: the server takes no gamepads`.
 11. **Sound**: with the test pattern, a beep each second with the white flash in the top left, heard
     from the speaker together with the flash (the overlay counts packets played and dropped; the
     self-test's `av_sync_ms_p50`, on a device whose clock agrees, says how far apart). With a real
