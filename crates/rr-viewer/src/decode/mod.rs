@@ -106,6 +106,18 @@ pub fn capabilities(prefer: Prefer) -> Vec<CodecCap> {
     caps
 }
 
+/// Why there's no hardware decoder here (when `capabilities` found none).
+pub fn no_hardware_why() -> String {
+    #[cfg(target_os = "macos")]
+    return "VideoToolbox decodes neither H.264 nor HEVC in hardware on this Mac".into();
+    #[cfg(windows)]
+    return "the GPU lists no DXVA decoder for H.264 or HEVC (Media Foundation; RR_DECODER=mediafoundation uses its software decoder)".into();
+    #[cfg(target_os = "linux")]
+    return format!("VA-API: {}", vaapi::probe().err().unwrap_or_else(|| "no H.264 decoder".into()));
+    #[allow(unreachable_code)]
+    "no hardware decoder on this platform".into()
+}
+
 /// Whether the hardware decodes `codec` here (asked of the system, without opening a decoder for
 /// a stream).
 fn hardware_decodes(codec: Codec) -> bool {

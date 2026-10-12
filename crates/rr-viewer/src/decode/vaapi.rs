@@ -397,8 +397,13 @@ fn open_display() -> Result<Display, String> {
 
 /// Whether this machine's GPU decodes `codec` through VA-API (asked once).
 pub fn supported(codec: Codec) -> bool {
-    static PROBE: OnceLock<bool> = OnceLock::new();
-    codec == Codec::H264 && *PROBE.get_or_init(|| open_display().is_ok())
+    codec == Codec::H264 && probe().is_ok()
+}
+
+/// Whether there's a VA-API device that decodes H.264, and why not (asked once).
+pub fn probe() -> Result<(), String> {
+    static PROBE: OnceLock<Result<(), String>> = OnceLock::new();
+    PROBE.get_or_init(|| open_display().map(|_| ())).clone()
 }
 
 /// What the GPU decodes into: its surfaces (one per reference it may keep, the picture being

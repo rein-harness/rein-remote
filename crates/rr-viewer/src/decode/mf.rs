@@ -128,7 +128,8 @@ pub fn supported(codec: Codec) -> bool {
         )
     });
     match codec {
-        Codec::H264 => h264,
+        // Forced (a test where there's no GPU): taken as the hardware path it stands in for.
+        Codec::H264 => h264 || forced(),
         Codec::H265 => hevc,
         _ => false,
     }

@@ -113,6 +113,9 @@ fn parse(args: &[String]) -> Result<Args, String> {
         }
     }
     a.client.codecs = decode::capabilities(a.prefer);
+    if a.client.codecs.is_empty() {
+        return Err(format!("--decoder hardware, but there's none: {}", decode::no_hardware_why()));
+    }
     if a.headless && a.target.is_none() {
         return Err("--headless needs a server (a link it printed, or its name on this network)".into());
     }
