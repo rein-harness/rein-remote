@@ -1,7 +1,8 @@
 //! The connection a session runs over. A WebSocket (TCP: works through any proxy, Rein's web UI
 //! uses it) or WebTransport (QUIC, over UDP: each video frame on a stream of its own, so a late one
-//! doesn't hold up the ones after it, and no head-of-line blocking on a lossy link). The session loop
-//! is the same for both.
+//! doesn't hold up the ones after it, and no head-of-line blocking on a lossy link; or, for a client
+//! that takes them, video as datagrams with forward error correction, so a lost packet costs no
+//! retransmission at all). The session loop is the same for both.
 
 use rr_proto::Message;
 use std::io::ErrorKind;
@@ -39,6 +40,13 @@ pub trait Link {
         self.wait(d);
         self.recv()
     }
+    /// Video from now on as datagrams with forward error correction (the client said it takes
+    /// them). False: this link has no datagrams, video goes as before.
+    fn use_datagrams(&mut self) -> bool {
+        false
+    }
+    /// The share of parity shards to send with each frame's data shards (0.0–1.0).
+    fn set_parity(&mut self, _parity: f32) {}
 }
 
 // ---- WebSocket ----
@@ -118,6 +126,8 @@ impl<S: Sock> Link for WsLink<S> {
 pub enum Out {
     Control(Vec<u8>),
     Frame(Vec<u8>),
+    /// A frame as datagrams (data and parity shards).
+    Datagrams(Vec<Vec<u8>>),
 }
 
 pub struct WtLink {
@@ -127,6 +137,13 @@ pub struct WtLink {
     in_flight: Arc<AtomicUsize>,
     pending: Option<Vec<u8>>,
     closed: bool,
+    /// Video as datagrams: on, the parity share, the next frame's number, and the most a datagram
+    /// may be (QUIC's path MTU, set by the connection's task).
+    datagrams: bool,
+    parity: f32,
+    seq: u32,
+    datagram_seq: u16,
+    max_datagram: Arc<AtomicUsize>,
 }
 
 /// Frames that may be on their way at once before the link counts as backed up.
@@ -134,7 +151,12 @@ const MAX_IN_FLIGHT: usize = 3;
 
 impl Link for WtLink {
     fn send_bytes(&mut self, bytes: Vec<u8>, video: bool) -> Result<(), String> {
-        let out = if video {
+        let out = if video && self.datagrams {
+            self.in_flight.fetch_add(1, Ordering::SeqCst);
+            self.seq = self.seq.wrapping_add(1);
+            let max = self.max_datagram.load(Ordering::Relaxed).clamp(200, 1400);
+            Out::Datagrams(rr_proto::fec::split(self.seq, &bytes, max, self.parity, &mut self.datagram_seq))
+        } else if video {
             self.in_flight.fetch_add(1, Ordering::SeqCst);
             Out::Frame(bytes)
         } else {
@@ -167,6 +189,16 @@ impl Link for WtLink {
             Err(mpsc::RecvTimeoutError::Disconnected) => self.closed = true,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
+    }
+
+    fn use_datagrams(&mut self) -> bool {
+        // Zero: the connection has no datagrams (the peer didn't offer them).
+        self.datagrams = self.max_datagram.load(Ordering::Relaxed) > 0;
+        self.datagrams
+    }
+
+    fn set_parity(&mut self, parity: f32) {
+        self.parity = parity.clamp(0.0, 1.0);
     }
 }
 
@@ -241,12 +273,18 @@ where
                     let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Out>();
                     let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>();
                     let in_flight = Arc::new(AtomicUsize::new(0));
+                    let max_datagram = Arc::new(AtomicUsize::new(conn.max_datagram_size().unwrap_or(0)));
                     let link = WtLink {
                         out: out_tx,
                         inbox: in_rx,
                         in_flight: in_flight.clone(),
                         pending: None,
                         closed: false,
+                        datagrams: false,
+                        parity: 0.1,
+                        seq: 0,
+                        datagram_seq: 0,
+                        max_datagram: max_datagram.clone(),
                     };
                     std::thread::spawn(move || session(Box::new(link)));
                     // From the client: whole protocol frames, from however the stream cut them.
@@ -272,6 +310,16 @@ where
                                 if ctl_tx.write_all(&b).await.is_err() {
                                     break;
                                 }
+                            }
+                            Out::Datagrams(list) => {
+                                // Each at once: QUIC drops what it can't send (a late datagram is no use).
+                                for d in list {
+                                    let _ = conn.send_datagram(d);
+                                }
+                                if let Some(m) = conn.max_datagram_size() {
+                                    max_datagram.store(m, Ordering::Relaxed);
+                                }
+                                in_flight.fetch_sub(1, Ordering::SeqCst);
                             }
                             Out::Frame(b) => {
                                 let (conn, in_flight) = (conn.clone(), in_flight.clone());

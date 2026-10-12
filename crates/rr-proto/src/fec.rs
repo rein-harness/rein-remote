@@ -9,13 +9,14 @@
 //!
 //! Each datagram: magic (1), version (1), frame sequence (u32), block (u8), blocks in the frame
 //! (u8), shard (u8), data shards `k` (u8), parity shards `m` (u8), the block's length in bytes (u24),
-//! then the shard. Little-endian, like the rest of the protocol.
+//! the datagram's own sequence number (u16, one more each datagram: the receiver counts the gaps for
+//! the loss rate, as RTP does), then the shard. Little-endian, like the rest of the protocol.
 
 use std::collections::BTreeMap;
 
 pub const MAGIC: u8 = 0xD7;
 pub const VERSION: u8 = 0;
-pub const HEADER_LEN: usize = 14;
+pub const HEADER_LEN: usize = 16;
 /// Shards in one block at most (data and parity): GF(2^8) has 256 elements, one is kept apart.
 pub const MAX_SHARDS: usize = 255;
 
@@ -168,6 +169,8 @@ pub struct Shard {
     pub m: u8,
     /// The block's length in bytes (its last data shard is padded to the shard size).
     pub len: u32,
+    /// This datagram's number in the sender's sequence (wraps).
+    pub seq: u16,
 }
 
 impl Shard {
@@ -183,6 +186,7 @@ impl Shard {
             k: d[9],
             m: d[10],
             len: u32::from_le_bytes([d[11], d[12], d[13], 0]),
+            seq: u16::from_le_bytes([d[14], d[15]]),
         };
         let ok = s.k > 0 && (s.k as usize + s.m as usize) <= MAX_SHARDS && s.index < s.k.saturating_add(s.m) && s.block < s.blocks;
         ok.then_some((s, &d[HEADER_LEN..]))
@@ -193,18 +197,24 @@ impl Shard {
         out.extend_from_slice(&self.frame.to_le_bytes());
         out.extend_from_slice(&[self.block, self.blocks, self.index, self.k, self.m]);
         out.extend_from_slice(&self.len.to_le_bytes()[..3]);
+        out.extend_from_slice(&self.seq.to_le_bytes());
     }
 }
 
 /// `frame` (a whole protocol frame, e.g. a Video message) as datagrams of at most `max_datagram`
 /// bytes, with parity for `parity` (0.0–1.0) of the data shards, at least one when it's above 0.
-pub fn split(frame_seq: u32, frame: &[u8], max_datagram: usize, parity: f32) -> Vec<Vec<u8>> {
+/// `next` is the sender's running datagram number.
+pub fn split(frame_seq: u32, frame: &[u8], max_datagram: usize, parity: f32, next: &mut u16) -> Vec<Vec<u8>> {
     let shard_max = max_datagram.saturating_sub(HEADER_LEN).max(16);
     let parity = parity.clamp(0.0, 1.0);
     // Blocks of at most this many data shards, so data and parity fit in 255.
     let k_max = ((MAX_SHARDS as f32) / (1.0 + parity)).floor().max(1.0) as usize;
     let block_bytes = (k_max * shard_max).min((1 << 24) - 1);
-    let blocks: Vec<&[u8]> = if frame.is_empty() { vec![&[][..]] } else { frame.chunks(block_bytes).collect() };
+    let blocks: Vec<&[u8]> = if frame.is_empty() {
+        vec![&[][..]]
+    } else {
+        frame.chunks(block_bytes).collect()
+    };
     let n = blocks.len().min(255);
     let mut out = Vec::new();
     for (b, block) in blocks.iter().take(n).enumerate() {
@@ -230,8 +240,10 @@ pub fn split(frame_seq: u32, frame: &[u8], max_datagram: usize, parity: f32) -> 
                 k: k as u8,
                 m: m as u8,
                 len: block.len() as u32,
+                seq: *next,
             }
             .write(&mut d);
+            *next = next.wrapping_add(1);
             d.extend_from_slice(s);
             out.push(d);
         }
@@ -255,6 +267,9 @@ pub struct Reassembler {
     done_up_to: Option<u32>,
     pub lost: u64,
     pub recovered: u64,
+    /// Datagrams that came, and the sequence span they cover (first and highest), since `loss()`.
+    received: u32,
+    span: Option<(u16, u16)>,
 }
 
 impl Reassembler {
@@ -265,12 +280,32 @@ impl Reassembler {
             done_up_to: None,
             lost: 0,
             recovered: 0,
+            received: 0,
+            span: None,
         }
+    }
+
+    /// Of the datagrams sent since the last call (by their sequence numbers), the share that never
+    /// came, in thousandths.
+    pub fn loss_permille(&mut self) -> u16 {
+        let Some((first, last)) = self.span.take() else { return 0 };
+        let expected = last.wrapping_sub(first) as u32 + 1;
+        let got = std::mem::take(&mut self.received).min(expected);
+        ((expected - got) * 1000 / expected) as u16
     }
 
     /// One datagram in; the frame it completes, if it does.
     pub fn push(&mut self, datagram: &[u8]) -> Option<(u32, Vec<u8>)> {
         let (h, body) = Shard::read(datagram)?;
+        self.received += 1;
+        self.span = Some(match self.span {
+            None => (h.seq, h.seq),
+            // Datagrams can come out of order: the span grows either way.
+            Some((first, last)) => (
+                if (h.seq.wrapping_sub(first) as i16) < 0 { h.seq } else { first },
+                if h.seq.wrapping_sub(last) as i16 > 0 { h.seq } else { last },
+            ),
+        });
         if self.done_up_to.is_some_and(|d| h.frame.wrapping_sub(d) as i32 <= 0) {
             return None; // late: a newer frame is already out
         }
@@ -278,7 +313,10 @@ impl Reassembler {
             blocks: h.blocks,
             shards: BTreeMap::new(),
         });
-        let entry = p.shards.entry(h.block).or_insert_with(|| (vec![None; h.k as usize + h.m as usize], h.k, h.len, None));
+        let entry = p
+            .shards
+            .entry(h.block)
+            .or_insert_with(|| (vec![None; h.k as usize + h.m as usize], h.k, h.len, None));
         if entry.3.is_none() && (h.index as usize) < entry.0.len() {
             entry.0[h.index as usize] = Some(body.to_vec());
             let k = entry.1 as usize;
@@ -361,7 +399,7 @@ mod tests {
     fn frames_survive_losses_up_to_their_parity_in_any_order() {
         for (len, parity) in [(1, 0.2), (1000, 0.2), (37_000, 0.1), (400_000, 0.25), (900_000, 0.05)] {
             let f = frame(len, 7);
-            let mut d = split(42, &f, 1200, parity);
+            let mut d = split(42, &f, 1200, parity, &mut 0);
             assert!(d.iter().all(|x| x.len() <= 1200));
             // Lose one shard in each block where there's parity, then deliver backwards.
             let mut seen = std::collections::HashSet::new();
@@ -379,8 +417,9 @@ mod tests {
     #[test]
     fn a_frame_short_of_shards_is_given_up_when_a_newer_one_completes() {
         let mut r = Reassembler::new(4);
-        let a = split(1, &frame(5000, 1), 1000, 0.0);
-        let b = split(2, &frame(3000, 2), 1000, 0.0);
+        let mut n = 0;
+        let a = split(1, &frame(5000, 1), 1000, 0.0, &mut n);
+        let b = split(2, &frame(3000, 2), 1000, 0.0, &mut n);
         for d in &a[1..] {
             assert!(r.push(d).is_none());
         }
@@ -395,7 +434,64 @@ mod tests {
     fn garbage_is_ignored() {
         let mut r = Reassembler::new(4);
         assert!(r.push(&[]).is_none());
-        assert!(r.push(&[MAGIC, VERSION, 0, 0, 0, 0, 0, 1, 9, 0, 0, 0, 0, 0]).is_none()); // k = 0
+        assert!(r.push(&[MAGIC, VERSION, 0, 0, 0, 0, 0, 1, 9, 0, 0, 0, 0, 0, 0, 0]).is_none()); // k = 0
         assert!(r.push(&[1, 2, 3]).is_none());
+    }
+
+    #[test]
+    fn loss_is_counted_from_the_sequence_gaps() {
+        let mut r = Reassembler::new(8);
+        let mut n = 65_530; // wraps on the way
+        let mut all = Vec::new();
+        for f in 0..10 {
+            all.extend(split(f, &frame(3000, f as u8), 1000, 0.5, &mut n));
+        }
+        // Every tenth lost, the rest backwards.
+        for (i, d) in all.iter().enumerate().rev() {
+            if i % 10 != 3 {
+                r.push(d);
+            }
+        }
+        assert_eq!(r.loss_permille(), 100);
+        assert_eq!(r.loss_permille(), 0, "counted afresh after each call");
+    }
+
+    /// The datagrams of a few frames, some lost, as the web client's test reads them
+    /// (clients/web/test/fec-vectors.json): the same bytes must rebuild the same frames there.
+    fn vectors() -> String {
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let mut n = 65_000u16;
+        let mut cases = Vec::new();
+        for (f, (len, parity, drop_every)) in [(1usize, 0.2f32, 0usize), (2500, 0.3, 3), (12_000, 0.1, 17), (70_000, 0.05, 40)]
+            .into_iter()
+            .enumerate()
+        {
+            let data = frame(len, f as u8);
+            let mut ds = split(f as u32 + 1, &data, 1200, parity, &mut n);
+            if drop_every > 0 {
+                let mut i = 0;
+                ds.retain(|_| {
+                    i += 1;
+                    i % drop_every != 0
+                });
+            }
+            ds.reverse();
+            let list: Vec<String> = ds.iter().map(|d| format!("\"{}\"", hex(d))).collect();
+            cases.push(format!("{{\"frame\":\"{}\",\"datagrams\":[{}]}}", hex(&data), list.join(",")));
+        }
+        format!("[{}]\n", cases.join(",\n"))
+    }
+
+    #[test]
+    fn the_web_clients_vectors_are_current() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../clients/web/test/fec-vectors.json");
+        let want = vectors();
+        if std::env::var_os("RR_WRITE_VECTORS").is_some() {
+            std::fs::write(path, &want).unwrap();
+        }
+        assert!(
+            std::fs::read_to_string(path).is_ok_and(|have| have == want),
+            "run with RR_WRITE_VECTORS=1 to update {path}"
+        );
     }
 }

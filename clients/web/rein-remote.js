@@ -97,6 +97,141 @@ function avcCodec(data) {
   return 'avc1.42e01f';
 }
 
+// ---- video as datagrams: forward error correction (the same scheme as crates/rr-proto/src/fec.rs) ----
+
+const FEC_MAGIC = 0xd7, FEC_HEADER = 16;
+const GF_EXP = new Uint8Array(512), GF_LOG = new Uint8Array(256);
+for (let i = 0, x = 1; i < 255; i++) {
+  GF_EXP[i] = x;
+  GF_LOG[x] = i;
+  x <<= 1;
+  if (x & 0x100) x ^= 0x11d;
+}
+for (let i = 255; i < 512; i++) GF_EXP[i] = GF_EXP[i - 255];
+const gfMul = (a, b) => (a && b ? GF_EXP[GF_LOG[a] + GF_LOG[b]] : 0);
+const gfInv = (a) => GF_EXP[255 - GF_LOG[a]];
+const cauchy = (j, i, k) => gfInv(((k + j) & 255) ^ i);
+function mulAdd(dst, c, src) {
+  if (!c) return;
+  const lc = GF_LOG[c];
+  for (let i = 0; i < dst.length; i++) if (src[i]) dst[i] ^= GF_EXP[lc + GF_LOG[src[i]]];
+}
+
+/** The k data shards from any k of the k + m (missing: undefined), or null when too few came. */
+export function fecReconstruct(shards, k) {
+  const have = [];
+  for (let i = 0; i < shards.length && have.length < k; i++) if (shards[i]) have.push(i);
+  if (have.length < k) return null;
+  let missing = false;
+  for (let i = 0; i < k; i++) if (!shards[i]) missing = true;
+  if (!missing) return shards.slice(0, k);
+  // Invert the k×k matrix of the shards that came (identity rows for data, Cauchy rows for parity).
+  const a = have.map((r) => Uint8Array.from({length: k}, (_, c) => (r < k ? +(r === c) : cauchy(r - k, c, k))));
+  const inv = Array.from({length: k}, (_, r) => Uint8Array.from({length: k}, (_, c) => +(r === c)));
+  for (let col = 0; col < k; col++) {
+    let p = col;
+    while (p < k && !a[p][col]) p++;
+    if (p === k) return null;
+    [a[col], a[p]] = [a[p], a[col]];
+    [inv[col], inv[p]] = [inv[p], inv[col]];
+    const f = gfInv(a[col][col]);
+    for (let c = 0; c < k; c++) (a[col][c] = gfMul(a[col][c], f)), (inv[col][c] = gfMul(inv[col][c], f));
+    for (let r = 0; r < k; r++) {
+      const g = a[r][col];
+      if (r !== col && g) mulAdd(a[r], g, a[col]), mulAdd(inv[r], g, inv[col]);
+    }
+  }
+  const len = shards[have[0]].length;
+  const out = [];
+  for (let i = 0; i < k; i++) {
+    if (shards[i]) out.push(shards[i]);
+    else {
+      const d = new Uint8Array(len);
+      have.forEach((r, j) => mulAdd(d, inv[i][j], shards[r]));
+      out.push(d);
+    }
+  }
+  return out;
+}
+
+/**
+ * Frames put back together from datagrams in any order, lost shards rebuilt from parity. A frame not
+ * whole once a newer one is, or `window` frames behind the newest, is given up (lost). Counts the
+ * gaps in the datagrams' sequence numbers, for the loss the server sets its parity by.
+ */
+export class FecReassembler {
+  constructor(window = 8) {
+    this.window = window;
+    this.partial = new Map(); // frame → {blocks, got: Map(block → {shards, k, len, data})}
+    this.doneUpTo = undefined;
+    this.lost = 0;
+    this.recovered = 0;
+    this.received = 0;
+    this.span = null; // [first, highest] datagram sequence since the last lossPermille()
+  }
+  push(d) {
+    if (d.length < FEC_HEADER || d[0] !== FEC_MAGIC || d[1] !== 0) return null;
+    const v = new DataView(d.buffer, d.byteOffset, d.byteLength);
+    const frame = v.getUint32(2, true), block = d[6], blocks = d[7], index = d[8], k = d[9], m = d[10];
+    const len = d[11] | (d[12] << 8) | (d[13] << 16);
+    const seq = v.getUint16(14, true);
+    if (!k || k + m > 255 || index >= k + m || block >= blocks) return null;
+    this.received++;
+    // Datagrams can come out of order: the span grows either way.
+    if (!this.span) this.span = [seq, seq];
+    else if ((((seq - this.span[1]) << 16) >> 16) > 0) this.span[1] = seq;
+    else if ((((seq - this.span[0]) << 16) >> 16) < 0) this.span[0] = seq;
+    if (this.doneUpTo !== undefined && ((frame - this.doneUpTo) | 0) <= 0) return null; // late
+    let p = this.partial.get(frame);
+    if (!p) this.partial.set(frame, (p = {blocks, got: new Map(), shards: 0}));
+    let b = p.got.get(block);
+    if (!b) p.got.set(block, (b = {shards: new Array(k + m), k, n: k + m, len, data: null, count: 0}));
+    if (!b.data && !b.shards[index]) {
+      b.shards[index] = d.subarray(FEC_HEADER);
+      b.count++;
+      if (b.count >= k) {
+        const missing = b.shards.slice(0, k).some((x) => !x);
+        const data = fecReconstruct(b.shards, k);
+        if (data) {
+          if (missing) this.recovered++;
+          const whole = new Uint8Array(data.reduce((n, x) => n + x.length, 0));
+          let at = 0;
+          for (const x of data) whole.set(x, at), (at += x.length);
+          b.data = whole.subarray(0, len);
+          b.shards = null;
+        }
+      }
+    }
+    // Give up on frames too far behind the newest.
+    let newest = frame;
+    for (const f of this.partial.keys()) if (((f - newest) | 0) > 0) newest = f;
+    for (const [f, q] of this.partial) if (f !== frame && ((newest - f) | 0) > this.window) this.drop(f, q);
+    const whole = p.got.size === p.blocks && [...p.got.values()].every((x) => x.data);
+    if (!whole) return null;
+    this.partial.delete(frame);
+    for (const [f, q] of this.partial) if (((frame - f) | 0) > 0) this.drop(f, q);
+    this.doneUpTo = frame;
+    const parts = [...p.got.entries()].sort((x, y) => x[0] - y[0]).map(([, x]) => x.data);
+    const out = new Uint8Array(parts.reduce((n, x) => n + x.length, 0));
+    let at = 0;
+    for (const x of parts) out.set(x, at), (at += x.length);
+    return out;
+  }
+  drop(f) {
+    this.partial.delete(f);
+    this.lost++;
+  }
+  /** Of the datagrams sent since the last call (by their sequence numbers), the share that never came, in thousandths. */
+  lossPermille() {
+    if (!this.span) return 0;
+    const expected = ((this.span[1] - this.span[0]) & 0xffff) + 1;
+    const got = Math.min(this.received, expected);
+    this.span = null;
+    this.received = 0;
+    return Math.floor(((expected - got) * 1000) / expected);
+  }
+}
+
 // ---- video on plain HTTP: Media Source ----
 
 /*
@@ -306,6 +441,18 @@ function openLink(url, wt) {
         buf = joined.slice(at);
       }
     })();
+    // Video as datagrams (with parity), when the server sends it so: put back together here.
+    link.fec = new FecReassembler(8);
+    (async () => {
+      const reader = t.datagrams?.readable.getReader();
+      if (!reader) return;
+      for (;;) {
+        const {value, done} = await reader.read().catch(() => ({done: true}));
+        if (done) return;
+        const frame = link.fec.push(value);
+        if (frame) link.ondata(frame);
+      }
+    })();
     // Video: one stream a frame, read whole.
     (async () => {
       const streams = t.incomingUnidirectionalStreams.getReader();
@@ -432,7 +579,9 @@ export function connect(url, canvas, opts = {}) {
     // Hello version 1: this display's refresh rate, measured, so the server paces to it.
     stats.refreshHz = (await refresh) / 1000;
     w.u32(await refresh);
-    return w.frame(K.HELLO, 1);
+    // Hello version 2: video as datagrams with parity, over WebTransport.
+    w.u32(link.fec && opts.datagrams !== false ? 1 : 0);
+    return w.frame(K.HELLO, 2);
   };
 
   const makeDecoder = () => {
@@ -470,8 +619,11 @@ export function connect(url, canvas, opts = {}) {
         // Feedback: what arrived and when it was on screen (drives the server's rate control).
         const w = new W();
         w.u32(n); w.u64(received ?? nowUs()); w.u64(nowUs()); w.u16(lost);
+        // Version 1: the share of datagrams lost (the server sends parity for it).
+        w.u16(link.fec ? link.fec.lossPermille() : 0);
+        if (link.fec) (stats.fecRecovered = link.fec.recovered), (stats.fecLost = link.fec.lost);
         lost = 0;
-        send(w.frame(K.FEEDBACK));
+        send(w.frame(K.FEEDBACK, 1));
       },
       error: (e) => {
         stats.error = String(e.message ?? e);

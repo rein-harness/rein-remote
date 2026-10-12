@@ -4,7 +4,7 @@
 
 use crate::capture::Source;
 use crate::link::{E2eLink, Link, Recv, WsLink};
-use rr_proto::{Codec, Config, Cursor, Hello, Message, Video, INPUT_KEYBOARD, INPUT_POINTER, INPUT_TOUCH, VERSION_MAX, VERSION_MIN};
+use rr_proto::{Codec, Config, Cursor, Hello, Message, Video, FEATURE_VIDEO_DATAGRAMS, INPUT_KEYBOARD, INPUT_POINTER, INPUT_TOUCH, VERSION_MAX, VERSION_MIN};
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -303,6 +303,12 @@ fn send_frame(
     Ok(())
 }
 
+/// Parity shards per data shard for a datagram loss rate: enough that a frame very rarely loses more
+/// than its parity covers (3× the loss rate, at least 10%, at most half).
+pub fn parity_for(loss: f32) -> f32 {
+    (loss * 3.0).clamp(0.1, 0.5)
+}
+
 /// The most frames a second a stream runs at, and what software encoding holds.
 pub const MAX_FPS: u32 = 240;
 pub const SOFTWARE_FPS: u32 = 60;
@@ -370,6 +376,7 @@ fn session(mut link: Box<dyn Link + Send>, source: Arc<Mutex<Box<dyn Source>>>, 
         audio: false,
         input: INPUT_POINTER | INPUT_KEYBOARD | INPUT_TOUCH,
         refresh_mhz: 0,
+        features: 0,
     };
     link.send(&Message::Hello(hello.clone()))?;
     link.flushed()?;
@@ -415,7 +422,16 @@ fn session(mut link: Box<dyn Link + Send>, source: Arc<Mutex<Box<dyn Source>>>, 
         0 => String::new(),
         r => format!(", its display {:.1} Hz", r as f64 / 1000.0),
     };
-    eprintln!("rein-remote: {} connected ({:?} {ew}×{eh} at {fps} fps{refresh})", client.name, codec);
+    // Video as datagrams with forward error correction, when the client takes them and the link has
+    // them: a lost packet then costs nothing (parity rebuilds it), not a retransmission.
+    let datagrams = client.features & FEATURE_VIDEO_DATAGRAMS != 0 && link.use_datagrams();
+    let mut loss = 0.0f32;
+    eprintln!(
+        "rein-remote: {} connected ({:?} {ew}×{eh} at {fps} fps{refresh}{})",
+        client.name,
+        codec,
+        if datagrams { ", video as datagrams" } else { "" }
+    );
 
     let mut frame_time = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
     let mut adapt = crate::adapt::Adapt::new(opts.bitrate_kbps, fps);
@@ -448,6 +464,11 @@ fn session(mut link: Box<dyn Link + Send>, source: Arc<Mutex<Box<dyn Source>>>, 
                             }
                             Some(Message::KeyframeRequest) => enc.keyframe(),
                             Some(Message::Feedback(f)) => {
+                                if datagrams {
+                                    // Parity for the loss seen lately: three times the loss rate, at least a tenth.
+                                    loss = loss * 0.9 + (f.loss_permille as f32 / 1000.0) * 0.1;
+                                    link.set_parity(parity_for(loss));
+                                }
                                 if let Some(&(_, at_us, sent)) = captured.iter().find(|(n, _, _)| *n == f.frame) {
                                     // The frame's round trip on this machine's clock alone (the client's can
                                     // be offset and drift, as a VM's does): queuing shows as it growing.

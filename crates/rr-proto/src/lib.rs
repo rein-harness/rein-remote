@@ -82,7 +82,13 @@ pub struct Hello {
     /// The client's display refresh rate as it measured it, in millihertz (59940 for 59.94 Hz); 0
     /// when unknown (a server, or a client older than Hello version 1). The server paces to it.
     pub refresh_mhz: u32,
+    /// Bit set of `FEATURE_*` (Hello version 2; 0 from older peers).
+    pub features: u32,
 }
+
+/// A client that takes video as datagrams with forward error correction (see [`fec`]), when the
+/// transport has datagrams (WebTransport, QUIC).
+pub const FEATURE_VIDEO_DATAGRAMS: u32 = 1;
 
 pub const INPUT_POINTER: u8 = 1;
 pub const INPUT_KEYBOARD: u8 = 2;
@@ -202,6 +208,10 @@ pub struct Feedback {
     pub decoded_us: u64,
     /// Frames lost since the last feedback.
     pub lost: u16,
+    /// Of the datagrams the client expected since the last feedback, the share that never came, in
+    /// thousandths (Feedback version 1; 0 from older clients, or without datagrams). It sets how much
+    /// parity goes with the video.
+    pub loss_permille: u16,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -238,14 +248,15 @@ pub mod kind {
 
 /// Each message's version, written in its frame header: raised when a field is added at the end.
 pub mod version {
-    /// 1: `refresh_mhz`.
-    pub const HELLO: u8 = 1;
+    /// 1: `refresh_mhz`. 2: `features`.
+    pub const HELLO: u8 = 2;
     pub const CONFIG: u8 = 0;
     pub const VIDEO: u8 = 0;
     pub const AUDIO: u8 = 0;
     pub const CURSOR: u8 = 0;
     pub const INPUT: u8 = 0;
-    pub const FEEDBACK: u8 = 0;
+    /// 1: `loss_permille`.
+    pub const FEEDBACK: u8 = 1;
     pub const KEYFRAME_REQUEST: u8 = 0;
     pub const CLIPBOARD: u8 = 0;
     pub const RESIZE: u8 = 0;
@@ -357,6 +368,7 @@ impl Message {
                 w.u8(h.audio as u8);
                 w.u8(h.input);
                 w.u32(h.refresh_mhz);
+                w.u32(h.features);
                 (kind::HELLO, 0)
             }
             Message::Config(c) => {
@@ -463,6 +475,7 @@ impl Message {
                 w.u64(f.received_us);
                 w.u64(f.decoded_us);
                 w.u16(f.lost);
+                w.u16(f.loss_permille);
                 (kind::FEEDBACK, 0)
             }
             Message::KeyframeRequest => (kind::KEYFRAME_REQUEST, 0),
@@ -520,6 +533,7 @@ impl Message {
                     audio: r.u8()? != 0,
                     input: r.u8()?,
                     refresh_mhz: r.or_u32(0)?,
+                    features: r.or_u32(0)?,
                 }))
             }
             kind::CONFIG => Some(Message::Config(Config {
@@ -602,6 +616,7 @@ impl Message {
                 received_us: r.u64()?,
                 decoded_us: r.u64()?,
                 lost: r.u16()?,
+                loss_permille: r.or_u16(0)?,
             })),
             kind::KEYFRAME_REQUEST => Some(Message::KeyframeRequest),
             kind::CLIPBOARD => Some(Message::Clipboard { text: r.str()? }),

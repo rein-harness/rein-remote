@@ -127,6 +127,7 @@ console.log(
       mbit: +((((b?.bytes ?? 0) - (a?.bytes ?? 0)) * 8) / dt / 1e6).toFixed(2),
       glassMs: glass.length ? {p50: pct(glass, 0.5), p95: pct(glass, 0.95), samples: glass.length} : null,
       error: b?.error || undefined,
+      fec: b?.fecRecovered !== undefined ? {recovered: b.fecRecovered, lost: b.fecLost} : undefined,
       server,
     },
     null,
