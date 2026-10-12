@@ -1,0 +1,38 @@
+# The machine Rein runs on: Ubuntu 24.04 (arm64 here), Rein's web UI behind Caddy, Rein Remote built
+# from source, TigerVNC's Xvnc + xterm (the native Linux app). Build context: ctx/ (copies of the repos).
+
+# ---- rein-remote for Linux, from a copy of ~/projects/rein-remote ----
+FROM ubuntu:24.04 AS rr
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential curl ca-certificates pkg-config cmake nasm git \
+ && rm -rf /var/lib/apt/lists/*
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+ENV PATH=/root/.cargo/bin:$PATH
+WORKDIR /src
+COPY rein-remote/ /src/
+RUN \
+    cargo build --release -p rr-server && cp target/release/rein-remote /rein-remote && /rein-remote --version
+
+# ---- Rein, from a copy of ~/projects/rein-harness ----
+FROM node:22-bookworm AS rein
+WORKDIR /rein
+COPY rein-harness/package.json rein-harness/package-lock.json /rein/
+RUN npm ci --no-audit --no-fund
+COPY rein-harness/ /rein/
+RUN npm run build && npm prune --omit=dev --no-audit --no-fund && ls dist/cli.js webui/index.html
+
+# ---- runtime ----
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      tigervnc-standalone-server tigervnc-tools xterm xvfb x11vnc x11-utils xdotool fonts-dejavu-core \
+      caddy curl ca-certificates iproute2 procps git jq \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=node:22-bookworm-slim /usr/local/bin/node /usr/local/bin/node
+COPY --from=rein /rein /opt/rein
+RUN printf '#!/bin/sh\nexec /usr/local/bin/node /opt/rein/dist/cli.js "$@"\n' > /usr/local/bin/rein && chmod +x /usr/local/bin/rein
+# Where Rein's remoteBinary() looks first (no reinRemote setting, no REIN_HOME): ~/.rein/bin/rein-remote.
+COPY --from=rr /rein-remote /root/.rein/bin/rein-remote
+COPY host/ /p2/
+RUN chmod +x /p2/*.sh
+ENTRYPOINT ["/p2/start-host.sh"]

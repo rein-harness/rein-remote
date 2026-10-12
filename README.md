@@ -27,6 +27,8 @@ Early: the design is done and being built one verified piece at a time
 | Server: macOS (any app's window, ScreenCaptureKit) | working: capture only when it changes, mouse (raises the window, like Remote Desktop), keys and text even while it's behind others (phase 3) |
 | Server: Windows | todo (phase 3) |
 | Client: web (WebCodecs, embeddable `<rein-remote>`) | working: decode (hardware when there is), mouse, wheel, keyboard, touch gestures and the device's on-screen keyboard (phase 1) |
+| Packages (npm): `@rein-harness/remote`, `@rein-harness/remote-server` | working: the web client, and the server per platform (`npx rein-remote`), checked against Rein's contract in CI on all three (phase 2) |
+| Rein previews | working: a Rein web UI chat shows a native Linux app through Rein Remote, from a phone, through a reverse proxy (phase 2) |
 | Client: Windows / macOS / Linux | todo (phase 5) |
 | Client: iOS / iPadOS / Android | todo (phase 5) |
 | Transport: WebSocket | working, with keyframe-and-skip when the link backs up (phase 1) |

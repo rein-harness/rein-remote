@@ -1,0 +1,14 @@
+{
+	local_certs
+	skip_install_trust
+	admin off
+}
+# The only address the phone can reach. Rein itself listens on 127.0.0.1:9333 in this container.
+https://rein.test:8443 {
+	tls internal
+	log {
+		output file /p2/logs/caddy-access.log
+		format json
+	}
+	reverse_proxy 127.0.0.1:9333
+}

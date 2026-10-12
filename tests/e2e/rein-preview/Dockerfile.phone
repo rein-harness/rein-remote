@@ -1,0 +1,8 @@
+# The phone: headless Chromium (Debian's, built with H.264) driven by puppeteer-core. It reaches the
+# Rein machine only through Caddy (https://rein.test:8443).
+FROM node:22-bookworm
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends chromium fonts-dejavu-core && rm -rf /var/lib/apt/lists/*
+WORKDIR /phone
+RUN npm init -y >/dev/null && npm install --no-audit --no-fund puppeteer-core@23.11.1
+COPY phone/ /phone/

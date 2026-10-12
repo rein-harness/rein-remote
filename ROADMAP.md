@@ -44,6 +44,20 @@ has been verified.
 - Rein uses it for native-app and window previews (falls back to its current frames path).
 - **Verified:** a Rein web UI chat shows a native Linux app through Rein Remote, from a phone-size
   browser, through a reverse proxy.
+- **Status:** verified. The packages: `@rein-harness/remote` (the web client, with its types) and
+  `@rein-harness/remote-server` (`npx rein-remote …`, `binaryPath()` for programs), which depends on
+  one package per platform binary (optional dependencies: npm installs only the machine's own),
+  built by `npm/build.mjs`, packed, installed and checked against Rein's contract (`npm/contract.mjs`:
+  the port line on stderr, the token, `/rein-remote.js`, Hello/Config/keyframe, `--pipe`'s JPEGs in
+  and JSON input out, `windows --json`) in CI on Linux, macOS and Windows; `release.yml` publishes
+  them on a version tag. Rein's previews, end to end in Docker (`tests/e2e/rein-preview`): Rein's web
+  UI behind Caddy over HTTPS, a 390×844 phone-size Chromium (DPR 3, touch) that can reach only the
+  proxy; a chat's preview of an xterm on a VNC display streamed through Rein Remote on its first
+  open, a tap and the phone's keyboard ran a command in it, `/preview :2` streamed the same way, a
+  password-protected display fell back to Rein's frames, and the page never received rein-remote's
+  token, port or a VNC password. (This found three bugs in Rein, fixed in rein-harness#678.) In that
+  VM (4 shared cores, software decoding at DPR 3) the phone showed 2–26 fps: CPU-bound there, a lower
+  bound, not the stream's.
 
 ## Phase 3 — macOS and Windows servers
 
