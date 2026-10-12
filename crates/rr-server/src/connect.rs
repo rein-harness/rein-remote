@@ -234,11 +234,16 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let s = session.stats();
     phases.last_mut().unwrap().update(&s);
     session.close();
+    // From the start (the link opened) to the first frame: how long a viewer waits for a picture.
+    let first_frame_ms = phases
+        .iter()
+        .find_map(|p| p.first_frame)
+        .map_or("null".to_string(), |t| format!("{:.0}", (t - started).as_secs_f64() * 1000.0));
     let phases: Vec<&Phase> = phases.iter().filter(|p| p.frames > 0).collect();
     if json {
         let notes: Vec<String> = notes.iter().map(|n| format!("\"{}\"", n.replace('\\', "\\\\").replace('"', "\\\""))).collect();
         println!(
-            r#"{{"target":"{}","transport":"{}","phases":[{}],"notes":[{}],"closed":{}}}"#,
+            r#"{{"target":"{}","transport":"{}","first_frame_ms":{first_frame_ms},"phases":[{}],"notes":[{}],"closed":{}}}"#,
             rr_client::redact(&target).replace('"', ""),
             s.transport,
             phases.iter().map(|p| p.json()).collect::<Vec<_>>().join(","),

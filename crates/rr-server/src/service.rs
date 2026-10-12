@@ -46,6 +46,8 @@ pub struct Spec {
     pub system: bool,
     /// The user's home (user-scope files go under it) and id (launchd's `gui/UID`).
     pub home: PathBuf,
+    /// Where systemd looks for the user's units: `$XDG_CONFIG_HOME`, else `~/.config`.
+    pub config_home: PathBuf,
     pub uid: u32,
 }
 
@@ -183,6 +185,9 @@ pub fn launchd_plist(s: &Spec) -> String {
 	</dict>
 	<key>ThrottleInterval</key>
 	<integer>5</integer>
+	<!-- 077: its log (serve's links carry its token) is its owner's alone. -->
+	<key>Umask</key>
+	<integer>63</integer>
 {session}	<key>StandardErrorPath</key>
 	<string>{}</string>
 	<key>StandardOutPath</key>
@@ -196,28 +201,27 @@ pub fn launchd_plist(s: &Spec) -> String {
     )
 }
 
+/// `dir/rest` with `/` (the paths here are Linux's and macOS's, whatever OS writes them out).
+fn under(dir: &Path, rest: &str) -> PathBuf {
+    PathBuf::from(format!("{}/{rest}", dir.display().to_string().trim_end_matches('/')))
+}
+
 /// Where launchd writes what the service says (macOS).
 fn log_path(s: &Spec) -> PathBuf {
     if s.system {
-        PathBuf::from("/Library/Logs").join(format!("{}.log", s.name))
+        PathBuf::from(format!("/Library/Logs/{}.log", s.name))
     } else {
-        s.home.join("Library/Logs").join(format!("{}.log", s.name))
+        under(&s.home, &format!("Library/Logs/{}.log", s.name))
     }
 }
 
 /// Where the unit file goes.
 pub fn unit_path(s: &Spec, os: Os) -> Option<PathBuf> {
     match (os, s.system) {
-        (Os::Linux, true) => Some(PathBuf::from("/etc/systemd/system").join(format!("{}.service", s.name))),
-        (Os::Linux, false) => Some(
-            std::env::var_os("XDG_CONFIG_HOME")
-                .filter(|v| !v.is_empty())
-                .map_or_else(|| s.home.join(".config"), PathBuf::from)
-                .join("systemd/user")
-                .join(format!("{}.service", s.name)),
-        ),
-        (Os::Mac, true) => Some(PathBuf::from("/Library/LaunchDaemons").join(format!("{}.plist", s.label()))),
-        (Os::Mac, false) => Some(s.home.join("Library/LaunchAgents").join(format!("{}.plist", s.label()))),
+        (Os::Linux, true) => Some(PathBuf::from(format!("/etc/systemd/system/{}.service", s.name))),
+        (Os::Linux, false) => Some(under(&s.config_home, &format!("systemd/user/{}.service", s.name))),
+        (Os::Mac, true) => Some(PathBuf::from(format!("/Library/LaunchDaemons/{}.plist", s.label()))),
+        (Os::Mac, false) => Some(under(&s.home, &format!("Library/LaunchAgents/{}.plist", s.label()))),
         (Os::Windows, _) => None,
     }
 }
@@ -447,6 +451,9 @@ pub fn run(args: &[String], install: bool) -> Result<(), String> {
         exe: plain(exe.canonicalize().unwrap_or(exe)),
         config,
         system,
+        config_home: std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|v| !v.is_empty())
+            .map_or_else(|| home().join(".config"), PathBuf::from),
         home: home(),
         uid: uid(),
     };
@@ -538,6 +545,12 @@ pub mod windows {
         use std::os::windows::io::IntoRawHandle;
         let dir = std::path::PathBuf::from(std::env::var_os("ProgramData").unwrap_or_else(|| "C:\\ProgramData".into())).join("rein-remote");
         let _ = std::fs::create_dir_all(&dir);
+        // The log may hold serve's links (they carry its token): SYSTEM's and Administrators' only,
+        // not the read access ProgramData gives every user.
+        let _ = std::process::Command::new("icacls")
+            .arg(&dir)
+            .args(["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"])
+            .output();
         if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(format!("{name}.log"))) {
             let h = f.into_raw_handle();
             unsafe {
@@ -584,6 +597,7 @@ mod tests {
             config: Some(PathBuf::from("/etc/rein-remote/serve 100%.toml")),
             system,
             home: PathBuf::from("/home/me"),
+            config_home: PathBuf::from("/home/me/.config"),
             uid: 501,
         }
     }

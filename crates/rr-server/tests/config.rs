@@ -74,7 +74,7 @@ fn install_service_prints_what_it_would_install() {
     let text = String::from_utf8_lossy(&out.stdout);
     let cfg_s = cfg.canonicalize().unwrap().display().to_string().trim_start_matches(r"\\?\").to_string();
     if cfg!(target_os = "linux") {
-        assert!(text.contains("/systemd/user/rein-remote-relay.service\n[Unit]"), "{text}");
+        assert!(text.contains("/systemd/user/rein-remote-relay.service\n# Written by"), "{text}");
         assert!(text.contains(&format!(" relay --config {cfg_s}\n")), "{text}");
         assert!(text.contains("$ systemctl --user enable --now rein-remote-relay.service"), "{text}");
     } else if cfg!(target_os = "macos") {
