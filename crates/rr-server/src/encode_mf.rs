@@ -517,7 +517,6 @@ impl MediaFoundation {
             let _ = mft.GetStreamIDs(std::slice::from_mut(&mut input_id), std::slice::from_mut(&mut output_id));
             let info = mft.GetOutputStreamInfo(output_id)?;
             let provides_samples = info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0) as u32 != 0;
-            mft.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0)?;
             mft.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
             mft.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
             let mut enc = Self {
@@ -882,17 +881,22 @@ mod tests {
 
     /// The first H.264 encoder Media Foundation has here (a GPU's on a machine with one; Microsoft's
     /// software one on CI), or why there's none.
+    /// One that's there and doesn't start is a failure, not a skip.
     fn open(w: usize, h: usize, kbps: u32) -> Option<MediaFoundation> {
-        match MediaFoundation::new(Codec::H264, w, h, 30.0, kbps, false) {
-            Ok(e) => {
-                println!("encoder: {}", e.name);
-                Some(e)
+        match candidates(false) {
+            Ok(list) if !list.is_empty() => {}
+            Ok(_) => {
+                println!("skipped: Media Foundation has no H.264 encoder on this machine");
+                return None;
             }
             Err(e) => {
-                println!("skipped: no Media Foundation H.264 encoder on this machine ({e})");
-                None
+                println!("skipped: {e}");
+                return None;
             }
         }
+        let e = MediaFoundation::new(Codec::H264, w, h, 30.0, kbps, false).unwrap();
+        println!("encoder: {}", e.name);
+        Some(e)
     }
 
     /// One frame in, waited for: the frame out.
