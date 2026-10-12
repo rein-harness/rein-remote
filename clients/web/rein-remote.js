@@ -8,7 +8,11 @@
 //
 // or, embedded: <rein-remote src="wss://host/stream"></rein-remote>
 
-const K = {HELLO: 1, CONFIG: 2, VIDEO: 3, AUDIO: 4, CURSOR: 5, INPUT: 6, FEEDBACK: 7, KEYFRAME_REQUEST: 8, CLIPBOARD: 9, RESIZE: 10, PING: 11, PONG: 12};
+const K = {HELLO: 1, CONFIG: 2, VIDEO: 3, AUDIO: 4, CURSOR: 5, INPUT: 6, FEEDBACK: 7, KEYFRAME_REQUEST: 8, CLIPBOARD: 9, RESIZE: 10, PING: 11, PONG: 12, ACCESS: 15, NOTICE: 16};
+// The server's Hello features this client uses: it takes a paste as a paste (so a policy can turn the clipboard off).
+const FEATURE_PASTE = 8;
+// Access flags: what this viewer may do, as the server's policy decided.
+const ACCESS_VIEW_ONLY = 1, ACCESS_NO_CLIPBOARD = 2, ACCESS_NO_AUDIO = 4, ACCESS_RECORDED = 8;
 const HEADER = 7;
 const FLAG_KEYFRAME = 1;
 const CODECS = {1: 'h264', 2: 'h265', 3: 'av1', 4: 'vp9', 5: 'vp8'};
@@ -821,7 +825,9 @@ export function connect(url, canvas, opts = {}) {
   // Through a relay, sealed end to end: the key is in the page's address after # (never sent to a server).
   const e2eKey = opts.e2eKey ?? (typeof location !== 'undefined' ? new URLSearchParams(location.hash.slice(1)).get('k') : null);
   const link = e2eKey ? sealed(openLink(url, opts.webtransport), e2eKey) : openLink(url, opts.webtransport);
-  const stats = {frames: 0, keyframes: 0, bytes: 0, decoder: '', rttMs: 0, state: 'connecting', error: '', glassMs: [], refreshHz: 0, fps: 0, audio: null};
+  const stats = {frames: 0, keyframes: 0, bytes: 0, decoder: '', rttMs: 0, state: 'connecting', error: '', glassMs: [], refreshHz: 0, fps: 0, audio: null, access: null};
+  // The server's Hello features (0 until it says, and from an older server).
+  let serverFeatures = 0;
   // Sound, unless turned off (`audio: false`) or the browser can't play it.
   const soundOk = opts.audio === false ? Promise.resolve(false) : canPlaySound();
   // Sound and picture in time (the picture waits for the sound while it plays); `sync: false` (or
@@ -995,7 +1001,21 @@ export function connect(url, canvas, opts = {}) {
     for (const f of frames(bytes)) {
       const r = new R(f.body);
       try {
-        if (f.kind === K.CONFIG) {
+        if (f.kind === K.HELLO) {
+          r.u16(); r.u16(); r.str();
+          const n = r.u8();
+          for (let i = 0; i < n; i++) (r.u8(), r.u8());
+          r.u16(); r.u16(); r.u16(); r.u8(); r.u8();
+          if (f.version >= 2) (r.u32(), (serverFeatures = r.u32()));
+        } else if (f.kind === K.ACCESS) {
+          // What the server lets this viewer do (it enforces it whatever this page does).
+          const user = r.str(), flags = r.u32(), secondsLeft = r.u32();
+          stats.access = {user, viewOnly: !!(flags & ACCESS_VIEW_ONLY), clipboard: !(flags & ACCESS_NO_CLIPBOARD), audio: !(flags & ACCESS_NO_AUDIO), recorded: !!(flags & ACCESS_RECORDED), secondsLeft};
+        } else if (f.kind === K.NOTICE) {
+          // Why the server is about to end the session (a time limit, a refusal).
+          r.u16();
+          stats.error = r.str();
+        } else if (f.kind === K.CONFIG) {
           config = {codec: CODECS[r.u8()], width: r.u16(), height: r.u16(), fps: r.u16(), bitrateKbps: r.u32()};
           stats.state = 'streaming';
           codec = undefined;
@@ -1230,7 +1250,8 @@ export function connect(url, canvas, opts = {}) {
   canvas.addEventListener('keyup', (e) => key(e, false));
   canvas.addEventListener('paste', (e) => {
     const text = e.clipboardData?.getData('text');
-    if (text) (e.preventDefault(), input((w) => (w.u8(6), w.str(text))));
+    // A paste, to a server that tells it apart from typing; else as typed text (an older server).
+    if (text) (e.preventDefault(), input((w) => (w.u8(serverFeatures & FEATURE_PASTE ? 9 : 6), w.str(text))));
   });
 
   // The device's own keyboard (a phone, a tablet): a hidden text field takes the typing. Text goes as
