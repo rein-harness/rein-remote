@@ -99,12 +99,23 @@ pub fn encode(v: &str) -> String {
 trait Stream: Read + Write {}
 impl<T: Read + Write> Stream for T {}
 
-/// TLS checked against the system's roots.
-pub fn tls_config() -> Arc<rustls::ClientConfig> {
+/// The roots a real certificate is checked against: the system's. On iOS, where an app can't read
+/// the system's (no file holds them), Mozilla's (webpki-roots), which the system's match.
+pub fn root_store() -> rustls::RootCertStore {
     let mut roots = rustls::RootCertStore::empty();
     for c in rustls_native_certs::load_native_certs().certs {
         let _ = roots.add(c);
     }
+    #[cfg(target_os = "ios")]
+    if roots.is_empty() {
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+    roots
+}
+
+/// TLS checked against the system's roots.
+pub fn tls_config() -> Arc<rustls::ClientConfig> {
+    let roots = root_store();
     let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
         .with_safe_default_protocol_versions()
         .expect("TLS 1.2 and 1.3")

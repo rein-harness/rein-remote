@@ -82,3 +82,7 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 windows-capture = "2.0.1"
+
+[dev-dependencies]
+# The C ABI the apps link, tested against this server (tests/ffi.rs).
+rr-ffi = {path = "../rr-ffi"}

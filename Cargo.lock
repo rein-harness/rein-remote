@@ -2384,7 +2384,16 @@ dependencies = [
  "sha2 0.10.9",
  "tokio",
  "tungstenite",
+ "webpki-roots",
  "wtransport",
+]
+
+[[package]]
+name = "rr-ffi"
+version = "0.1.1"
+dependencies = [
+ "rr-client",
+ "rr-proto",
 ]
 
 [[package]]
@@ -2423,6 +2432,7 @@ dependencies = [
  "p256",
  "qrcode",
  "rr-client",
+ "rr-ffi",
  "rr-proto",
  "rustls",
  "rustls-pemfile",
@@ -3397,6 +3407,15 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

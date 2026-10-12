@@ -195,3 +195,34 @@ jobs:
         run: rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown && rustup default stable
       - name: The protocol for the web client
         run: cargo build -p rr-proto --target wasm32-unknown-unknown --release
+  # The iOS and iPadOS app: the Rust core as an XCFramework, the app for the simulator, and its tests
+  # there: units, then the whole way against a server on the runner (decoded with VideoToolbox, the
+  # pointer seen coming back in the video, a tap through UIKit).
+  ios:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust
+        run: rustup toolchain install stable --profile minimal --target aarch64-apple-ios-sim && rustup default stable
+      - name: The server to test against
+        run: cargo build --release -p rr-server
+      - name: The core as an XCFramework (the simulator)
+        run: clients/ios/build-core.sh sim
+      - name: The Xcode project
+        run: brew install xcodegen && cd clients/ios && xcodegen
+      - name: Build and test in the simulator
+        run: |
+          # Full size throughout (a busy runner would have the server lower it, and the cross with it).
+          RR_ADAPT=off ./target/release/rein-remote serve --test-pattern 1280x720 --listen 127.0.0.1:7979 --token ci --mdns off 2> serve.log &
+          sleep 2
+          udid=$(clients/ios/simulator.sh)
+          echo "simulator $udid"
+          cd clients/ios
+          TEST_RUNNER_RR_URL='http://127.0.0.1:7979/?token=ci' xcodebuild test -project ReinRemote.xcodeproj -scheme ReinRemote \
+            -destination "id=$udid" -derivedDataPath DerivedData | tee xcodebuild.log | grep -E "Test Case|selftest:|ui test:|error:|\*\* "
+          test "${PIPESTATUS[0]}" -eq 0
+      - name: The server's log
+        if: always()
+        run: |
+          grep -v '^rein-remote: {' serve.log || true

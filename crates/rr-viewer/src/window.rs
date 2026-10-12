@@ -230,6 +230,7 @@ impl App {
             auto_feedback: o.auto_feedback,
             keyframe_on_loss: o.keyframe_on_loss,
             input: o.input,
+            audio: o.audio,
         }
     }
 
