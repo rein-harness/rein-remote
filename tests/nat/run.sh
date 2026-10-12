@@ -27,6 +27,10 @@ DELAY_NAT=${DELAY_NAT:-15ms}
 DELAY_RELAY=${DELAY_RELAY:-20ms}
 OUT=${OUT:-$here/out}
 IMAGE=${IMAGE:-rr-punch}
+# What the host shows: the test pattern (a little motion), or SOURCE='--test-pattern 960x540 --motion full'
+# (every pixel changing every frame: megabits a second, so loss and parity show).
+SOURCE=${SOURCE:---test-pattern 1280x720}
+# RR_ADAPT=off holds the bitrate and frame rate (to compare paths, not the rate controller's moves).
 mkdir -p "$OUT"
 
 say() { printf '\n== %s\n' "$*" >&2; }
@@ -76,7 +80,7 @@ x rr-punch-viewer ip route replace default via 10.10.2.2
 say "relay, then the host behind NAT A"
 docker exec -d rr-punch-relay sh -c 'rein-remote relay --listen 0.0.0.0:7990 > /tmp/relay.log 2>&1'
 sleep 1
-docker exec -d rr-punch-host sh -c 'rein-remote serve --test-pattern 1280x720 --listen 0.0.0.0:7979 --mdns off --pair off --relay ws://198.51.100.10:7990 > /tmp/serve.log 2>&1'
+docker exec -d -e RR_ADAPT="${RR_ADAPT:-}" rr-punch-host sh -c "rein-remote serve $SOURCE --listen 0.0.0.0:7979 --mdns off --pair off --relay ws://198.51.100.10:7990 > /tmp/serve.log 2>&1"
 link=""
 for _ in $(seq 1 60); do
   link=$(x rr-punch-host sh -c "grep -o 'http://198.51.100.10:7990/?room=[^ ]*' /tmp/serve.log" 2> /dev/null || true)

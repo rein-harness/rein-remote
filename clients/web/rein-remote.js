@@ -168,6 +168,7 @@ export class FecReassembler {
     this.recovered = 0;
     this.received = 0;
     this.span = null; // [first, highest] datagram sequence since the last lossPermille()
+    this.counted = undefined; // the highest it counted up to: the next count starts just after it
   }
   push(d) {
     if (d.length < FEC_HEADER || d[0] !== FEC_MAGIC || d[1] !== 0) return null;
@@ -224,9 +225,17 @@ export class FecReassembler {
   /** Of the datagrams sent since the last call (by their sequence numbers), the share that never came, in thousandths. */
   lossPermille() {
     if (!this.span) return 0;
-    const expected = ((this.span[1] - this.span[0]) & 0xffff) + 1;
-    const got = Math.min(this.received, expected);
+    const [first, last] = this.span;
     this.span = null;
+    // From just after the last count, so a datagram lost between two (one frame, one datagram) counts.
+    let from = first;
+    if (this.counted !== undefined) {
+      if ((((last - this.counted) << 16) >> 16) <= 0) return (this.received = 0); // only late ones
+      from = (this.counted + 1) & 0xffff;
+    }
+    this.counted = last;
+    const expected = ((last - from) & 0xffff) + 1;
+    const got = Math.min(this.received, expected);
     this.received = 0;
     return Math.floor(((expected - got) * 1000) / expected);
   }

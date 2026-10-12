@@ -280,6 +280,10 @@ pub struct Reassembler {
     /// Datagrams that came, and the sequence span they cover (first and highest), since `loss()`.
     received: u32,
     span: Option<(u16, u16)>,
+    /// The highest sequence number the last `loss_permille` counted up to: the next count starts just
+    /// after it, so a datagram lost between two counts (a client counts each frame, often one
+    /// datagram) is still missed.
+    counted: Option<u16>,
 }
 
 impl Reassembler {
@@ -294,6 +298,7 @@ impl Reassembler {
             received_total: 0,
             received: 0,
             span: None,
+            counted: None,
         }
     }
 
@@ -301,6 +306,16 @@ impl Reassembler {
     /// came, in thousandths.
     pub fn loss_permille(&mut self) -> u16 {
         let Some((first, last)) = self.span.take() else { return 0 };
+        let first = match self.counted {
+            Some(c) if (last.wrapping_sub(c) as i16) > 0 => c.wrapping_add(1),
+            // Only late ones since (already counted as missing): nothing new.
+            Some(_) => {
+                self.received = 0;
+                return 0;
+            }
+            None => first,
+        };
+        self.counted = Some(last);
         let expected = last.wrapping_sub(first) as u32 + 1;
         let got = std::mem::take(&mut self.received).min(expected);
         self.expected_total += expected as u64;
@@ -470,6 +485,26 @@ mod tests {
         }
         assert_eq!(r.loss_permille(), 100);
         assert_eq!(r.loss_permille(), 0, "counted afresh after each call");
+    }
+
+    #[test]
+    fn loss_between_two_counts_is_counted() {
+        // Frames of one datagram each, counted after each frame (as a client's feedback does): a lost
+        // one falls between two counts, and still counts.
+        let mut r = Reassembler::new(8);
+        let mut n = 65_500;
+        let mut per_call = Vec::new();
+        for f in 0..100u32 {
+            let d = split(f, &frame(100, f as u8), 1200, 0.0, &mut n);
+            if f % 10 != 5 {
+                for x in &d {
+                    r.push(x);
+                }
+                per_call.push(r.loss_permille());
+            }
+        }
+        assert_eq!(per_call.iter().filter(|&&l| l == 500).count(), 10, "the count after each loss: 1 of 2");
+        assert_eq!((r.expected_total, r.received_total), (100, 90), "all told");
     }
 
     /// The datagrams of a few frames, some lost, as the web client's test reads them
