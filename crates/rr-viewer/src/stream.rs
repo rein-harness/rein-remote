@@ -66,6 +66,8 @@ pub fn run(session: Session, shared: Arc<Shared>, opts: Options, stop: impl Fn()
     let mut waiting_key = true;
     let mut last_ask = Instant::now() - Duration::from_secs(1);
     let mut lost_reported = 0u64;
+    // Decode errors in a row (a hardware decoder that keeps failing gives way to software).
+    let mut failures = 0u32;
     let set = |f: &mut dyn FnMut(&mut Status)| {
         f(&mut shared.status.lock().unwrap());
         update(Update::Status);
@@ -138,6 +140,7 @@ pub fn run(session: Session, shared: Arc<Shared>, opts: Options, stop: impl Fn()
                 }
                 match result {
                     Ok(true) => {
+                        failures = 0;
                         let decoded_us = now_us();
                         pic.frame = frame;
                         pic.received_us = received_us;
@@ -171,6 +174,26 @@ pub fn run(session: Session, shared: Arc<Shared>, opts: Options, stop: impl Fn()
                     Err(e) => {
                         shared.spare.lock().unwrap().push(pic);
                         waiting_key = true;
+                        // A hardware decoder that fails keyframe after keyframe can't take this
+                        // stream: software from here on, when there's one for it.
+                        failures += 1;
+                        if failures >= 3 && dec.hardware() && opts.prefer == Prefer::Auto {
+                            let mut notes = Vec::new();
+                            if let Some(c) = codec {
+                                if let Ok(sw) = decode::open(c, 0, 0, Prefer::Software, &mut notes) {
+                                    let note = format!("{} failed {failures} times ({e}): {} instead", dec.name(), sw.name());
+                                    eprintln!("rein-remote-viewer: {note}");
+                                    let (name, hw) = (sw.name(), sw.hardware());
+                                    *dec = sw;
+                                    failures = 0;
+                                    set(&mut |s| {
+                                        s.decoder = name.clone();
+                                        s.hardware = hw;
+                                        s.notes.push(note.clone());
+                                    });
+                                }
+                            }
+                        }
                         let ask = last_ask.elapsed() > Duration::from_millis(250);
                         if ask {
                             last_ask = Instant::now();

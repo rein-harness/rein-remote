@@ -147,14 +147,6 @@ jobs:
           cd "$RUNNER_TEMP/app" && npm init -y > /dev/null && npm install --no-audit --no-fund "$RUNNER_TEMP"/tgz/*.tgz
           npx rein-remote --version
           node "$GITHUB_WORKSPACE/npm/contract.mjs" $w
-  wasm:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Rust
-        run: rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown && rustup default stable
-      - name: The protocol for the web client
-        run: cargo build -p rr-proto --target wasm32-unknown-unknown --release
       # The desktop viewer against a test-pattern server on the runner: decoding in software and with
       # whatever the runner's hardware gives (none on Linux and Windows runners: it must say so and
       # decode in software), the pointer sent and seen in the decoded picture (the pattern draws a
@@ -173,5 +165,15 @@ jobs:
           $v "$url" --headless --frames 120 --decoder software --move 640,500
           $v "$url" --headless --frames 120 --decoder auto --move 640,500
           $v "$url" --headless --frames 60 --webtransport off --decoder software
+          # Windows: Media Foundation's decoder on the runner (no GPU: its own software decoding).
+          if [ "$RUNNER_OS" = Windows ]; then RR_DECODER=mediafoundation $v "$url" --headless --frames 120 --decoder hardware --move 640,500; fi
           $v "$url" --measure --seconds 5 || { [ "$RUNNER_OS" = macOS ] && echo "no window on this runner"; }
           kill %1 || true
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust
+        run: rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown && rustup default stable
+      - name: The protocol for the web client
+        run: cargo build -p rr-proto --target wasm32-unknown-unknown --release

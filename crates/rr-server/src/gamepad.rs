@@ -367,14 +367,20 @@ mod imp {
 
     type Client = *mut c_void;
     type Target = *mut c_void;
+    type Proc = unsafe extern "system" fn() -> isize;
+    type Alloc = unsafe extern "C" fn() -> *mut c_void;
+    type WithClient = unsafe extern "C" fn(Client) -> u32;
+    type WithTarget = unsafe extern "C" fn(Client, Target) -> u32;
+    type Free = unsafe extern "C" fn(Target);
+    type Update = unsafe extern "C" fn(Client, Target, XusbReport) -> u32;
 
     struct Api {
         client: Client,
-        target_x360_alloc: unsafe extern "C" fn() -> Target,
-        target_add: unsafe extern "C" fn(Client, Target) -> u32,
-        target_remove: unsafe extern "C" fn(Client, Target) -> u32,
-        target_free: unsafe extern "C" fn(Target),
-        target_x360_update: unsafe extern "C" fn(Client, Target, XusbReport) -> u32,
+        target_x360_alloc: Alloc,
+        target_add: WithTarget,
+        target_remove: WithTarget,
+        target_free: Free,
+        target_x360_update: Update,
     }
 
     // The client is the bus's connection, used under the lock below.
@@ -390,12 +396,12 @@ mod imp {
                     .to_string()
             })?;
             macro_rules! f {
-                ($name:literal) => {
-                    std::mem::transmute(GetProcAddress(lib, s!($name)).ok_or(concat!("ViGEmClient.dll has no ", $name))?)
+                ($name:literal as $ty:ty) => {
+                    std::mem::transmute::<Proc, $ty>(GetProcAddress(lib, s!($name)).ok_or(concat!("ViGEmClient.dll has no ", $name))?)
                 };
             }
-            let alloc: unsafe extern "C" fn() -> Client = f!("vigem_alloc");
-            let connect: unsafe extern "C" fn(Client) -> u32 = f!("vigem_connect");
+            let alloc = f!("vigem_alloc" as Alloc);
+            let connect = f!("vigem_connect" as WithClient);
             let client = alloc();
             if client.is_null() {
                 return Err("ViGEmClient: no memory".into());
@@ -408,11 +414,11 @@ mod imp {
             }
             Ok(Mutex::new(Api {
                 client,
-                target_x360_alloc: f!("vigem_target_x360_alloc"),
-                target_add: f!("vigem_target_add"),
-                target_remove: f!("vigem_target_remove"),
-                target_free: f!("vigem_target_free"),
-                target_x360_update: f!("vigem_target_x360_update"),
+                target_x360_alloc: f!("vigem_target_x360_alloc" as Alloc),
+                target_add: f!("vigem_target_add" as WithTarget),
+                target_remove: f!("vigem_target_remove" as WithTarget),
+                target_free: f!("vigem_target_free" as Free),
+                target_x360_update: f!("vigem_target_x360_update" as Update),
             }))
         })
     }
