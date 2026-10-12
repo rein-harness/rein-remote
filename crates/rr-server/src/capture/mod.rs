@@ -1,8 +1,11 @@
 //! Screen sources. Each gives frames of BGRA pixels and takes input events. Phase 1: an X11 display
 //! (Linux: a real one, or a virtual display), and a test pattern (any platform: CI, and checking a
 //! client without a display). Phase 3: macOS (ScreenCaptureKit) and Windows (Windows Graphics
-//! Capture), windows and whole displays, behind the same trait.
+//! Capture), windows and whole displays, and Linux's scanout (KMS, whose frames stay on the GPU),
+//! behind the same trait.
 
+#[cfg(target_os = "linux")]
+pub mod kms;
 #[cfg(target_os = "macos")]
 pub mod mac;
 pub mod pipe;
@@ -38,20 +41,27 @@ pub trait Source: Send {
         None
     }
     /// The latest frame as the system's own image (macOS: a CVPixelBuffer in GPU memory; Windows: a
-    /// D3D11 texture on the capture's device), for an encoder that takes it as it is: no copy through
-    /// the CPU at all. None: use `grab`.
+    /// D3D11 texture on the capture's device; Linux: the screen's DMA-BUF), for an encoder that takes
+    /// it as it is: no copy through the CPU at all. None: use `grab`.
     fn surface(&mut self) -> Option<Surface> {
         None
     }
 }
 
 /// A frame the hardware encoder reads in place, held for as long as this is: a retained
-/// CVPixelBuffer (macOS), or a referenced `ID3D11Texture2D` in BGRA (Windows).
+/// CVPixelBuffer (macOS), or a referenced `ID3D11Texture2D` in BGRA (Windows). (Linux: below.)
+#[cfg(not(target_os = "linux"))]
 #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))] // only macOS and Windows sources make one
 pub struct Surface(pub *mut std::ffi::c_void);
 
 // Retained for as long as it's held; released when dropped.
+#[cfg(not(target_os = "linux"))]
 unsafe impl Send for Surface {}
+
+/// A frame the hardware encoder reads in place: the screen's framebuffer as DMA-BUFs (Linux, KMS),
+/// its file descriptors closed when dropped.
+#[cfg(target_os = "linux")]
+pub struct Surface(pub kms::DmaBuf);
 
 #[cfg(target_os = "macos")]
 impl Drop for Surface {

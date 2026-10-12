@@ -52,7 +52,7 @@ impl I420 {
 /// Convert `bgra` (`stride` bytes a row, `w`×`h`, both even) into NV12 in `out` (`w * h * 3 / 2`
 /// bytes: the Y plane, then the U and V samples interleaved), written straight into the encoder's
 /// own buffer.
-#[cfg_attr(not(windows), allow(dead_code))] // Media Foundation's input
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))] // Media Foundation's input, and VA-API's when the GPU can't convert
 pub fn nv12(bgra: &[u8], stride: usize, w: usize, h: usize, out: &mut [u8]) {
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, 8);
     let band = ((h / 2).div_ceil(threads)) * 2;

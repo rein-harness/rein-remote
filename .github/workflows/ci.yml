@@ -52,6 +52,23 @@ jobs:
           DISPLAY=:20 ./target/release/rein-remote windows
           DISPLAY=:20 ./target/release/rein-remote selftest --window selftest --type "echo rein remote was here"
           DISPLAY=:20 ./target/release/rein-remote selftest --display :20
+      # The runner has no GPU: VA-API must say why and leave encoding to software, and the H.264 headers
+      # the VA-API encoder writes must be what a real decoder reads (a stream built from them alone, raw
+      # macroblocks, decoded by ffmpeg to exactly the pixels put in).
+      - name: VA-API without a GPU, and our H.264 headers through ffmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y -qq vainfo ffmpeg > /dev/null
+          vainfo || true
+          ./target/release/rein-remote selftest --test-pattern 1280x720 --encode /tmp/auto.h264 --frames 30
+          ffmpeg -v error -i /tmp/auto.h264 -f null -
+          if out=$(RR_ENCODER=vaapi ./target/release/rein-remote selftest --test-pattern --encode /tmp/hw.h264 --frames 3 2>&1); then
+            echo "VA-API encoded without a GPU?"; exit 1
+          fi
+          echo "$out"; echo "$out" | grep -q "VA-API"
+          RR_H264_OUT=/tmp/headers.h264 cargo test -q -p rr-server a_stream_from_these_headers_decodes
+          ffmpeg -v error -i /tmp/headers.h264 -f rawvideo -pix_fmt yuv420p /tmp/headers.yuv
+          cmp /tmp/headers.yuv /tmp/headers.h264.yuv
       - name: Selftest (macOS, test pattern; screen capture needs a permission runners can't give)
         if: runner.os == 'macOS'
         run: cargo run --release -p rr-server -- selftest --test-pattern
