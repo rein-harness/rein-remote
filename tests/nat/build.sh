@@ -7,6 +7,6 @@ set -eu
 root=$(cd "$(dirname "$0")/../.." && pwd)
 docker run --rm -v "$root":/src -w /src \
   -v rr-punch-registry:/usr/local/cargo/registry -v rr-punch-target:/target -e CARGO_TARGET_DIR=/target \
-  rust:1-bookworm sh -c 'cargo build --release -p rr-server && cp /target/release/rein-remote /src/tests/nat/rein-remote.linux'
+  rust:1-bookworm sh -c 'apt-get update -qq && apt-get install -y -qq cmake > /dev/null && cargo build --release -p rr-server && cp /target/release/rein-remote /src/tests/nat/rein-remote.linux'
 docker build -q -t rr-punch -f "$root/tests/nat/Dockerfile" "$root/tests/nat"
 rm -f "$root/tests/nat/rein-remote.linux"
