@@ -17,6 +17,17 @@ pub const INDEX: &str = include_str!("../../../clients/web/index.html");
 pub const CLIENT_JS: &str = include_str!("../../../clients/web/rein-remote.js");
 pub const PAIR_JS: &str = include_str!("../../../clients/web/pair.js");
 
+/// The web client's files (the page and the modules it imports), as every server of the page — this
+/// one and the relay — serves them: its content type and body.
+pub fn web_file(path: &str) -> Option<(&'static str, &'static str)> {
+    match path {
+        "/" | "/index.html" => Some(("text/html; charset=utf-8", INDEX)),
+        "/rein-remote.js" => Some(("text/javascript; charset=utf-8", CLIENT_JS)),
+        "/pair.js" => Some(("text/javascript; charset=utf-8", PAIR_JS)),
+        _ => None,
+    }
+}
+
 pub struct Options {
     pub listen: String,
     /// Frames a second at most; 0: the client's display refresh as it measured it (up to 240, 60 in
@@ -359,9 +370,10 @@ fn handle(
         return session(Box::new(WsLink::new(ws)), source, stats, opts, None);
     }
     let (status, kind, body) = match path.as_str() {
-        "/" | "/index.html" => ("200 OK", "text/html; charset=utf-8", INDEX.to_string()),
-        "/rein-remote.js" => ("200 OK", "text/javascript; charset=utf-8", CLIENT_JS.to_string()),
-        "/pair.js" => ("200 OK", "text/javascript; charset=utf-8", PAIR_JS.to_string()),
+        p if web_file(p).is_some() => {
+            let (kind, body) = web_file(p).unwrap();
+            ("200 OK", kind, body.to_string())
+        }
         "/stats" => ("200 OK", "application/json", stats_json(&stats.lock().unwrap(), opts.audio.as_deref())),
         // Where WebTransport is, and its certificate's SHA-256 when the browser has to be given it
         // (a self-signed one; a real certificate needs nothing).
@@ -1016,6 +1028,18 @@ mod tests {
         let (kinds, server) = session_with(Message::Hello(client_hello(true)).encode(), Sound::Off, 0.5);
         assert!(!server.audio);
         assert_eq!(count(&kinds, kind::AUDIO), 0);
+    }
+
+    #[test]
+    fn every_module_the_page_imports_is_served() {
+        // `import … from './x.js'` in the page and its modules: each must be one web_file serves (the
+        // relay serves the same), or the page doesn't load at all.
+        for (name, text) in [("index.html", INDEX), ("rein-remote.js", CLIENT_JS), ("pair.js", PAIR_JS)] {
+            for part in text.split("from './").skip(1) {
+                let file = part.split('\'').next().unwrap();
+                assert!(web_file(&format!("/{file}")).is_some(), "{name} imports ./{file}, which isn't served");
+            }
+        }
     }
 
     #[test]
