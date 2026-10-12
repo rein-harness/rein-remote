@@ -130,7 +130,7 @@ x rr-punch-host sh -c "grep -E 'offered|punching|came straight|connected' /tmp/s
 x rr-punch-host cat /tmp/serve.log > "$OUT/serve.log"
 x rr-punch-relay cat /tmp/relay.log > "$OUT/relay.log"
 
-say "summary (per path: fps, kbit/s, capture→arrival p50/p95 ms on the shared clock, rtt ms, frames lost, FEC rebuilt)"
+say "summary (per path: fps, kbit/s, capture→arrival p50/p95 ms on the shared clock, rtt ms, frames lost, FEC rebuilt, datagrams lost ‰)"
 for f in relayed direct lossy-relayed lossy-direct blocked symmetric; do
   python3 - "$OUT/$f.json" "$f" << 'EOF'
 import json, sys
@@ -139,8 +139,12 @@ try:
 except Exception as e:
     print(f"{sys.argv[2]:<14} (no result: {e})"); sys.exit()
 for p in d["phases"]:
+    if p["seconds"] < 2:
+        # The relay's first moments before the session moved: the switch, not a measurement.
+        print(f"{sys.argv[2]:<14} {p['transport']:<20} {p['seconds']:>5.1f} s (until it moved)")
+        continue
     print(f"{sys.argv[2]:<14} {p['transport']:<20} {p['seconds']:>5.1f} s {p['fps']:>5.1f} fps {p['kbps']:>6.0f} kbit/s  "
           f"latency {p['latency_same_clock_ms']['p50']:>5.1f} / {p['latency_same_clock_ms']['p95']:>5.1f}  rtt {p['rtt_ms']['p50']:>5.1f}  "
-          f"lost {p['frames_lost']}  fec {p['fec_recovered']}")
+          f"lost {p['frames_lost']}  fec {p['fec_recovered']}  dgram loss {p['datagrams_lost_permille']:.0f}‰")
 EOF
 done
