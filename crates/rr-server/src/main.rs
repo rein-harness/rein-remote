@@ -28,6 +28,7 @@ mod encode_mf;
 mod encode_vaapi;
 #[cfg(target_os = "macos")]
 mod encode_vt;
+mod gamepad;
 #[cfg(target_os = "linux")]
 mod h264;
 mod identity;

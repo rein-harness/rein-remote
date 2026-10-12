@@ -76,6 +76,20 @@ jobs:
           RR_H264_OUT=/tmp/headers.h264 cargo test -q -p rr-server a_stream_from_these_headers_decodes
           ffmpeg -v error -i /tmp/headers.h264 -f rawvideo -pix_fmt yuv420p /tmp/headers.yuv
           cmp /tmp/headers.yuv /tmp/headers.h264.yuv
+      # Gamepads on the server: a virtual Xbox 360 pad made through uinput and read back through evdev,
+      # as games read one (root: the runner's user can't open /dev/uinput or /dev/input); on Windows,
+      # what it says without ViGEmBus.
+      - name: Virtual gamepad (Linux uinput; Windows without ViGEmBus)
+        if: runner.os != 'macOS'
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo modprobe uinput
+            bin=$(cargo test -p rr-server --no-run --message-format=json 2>/dev/null | jq -r 'select(.profile.test and (.target.kind | index("bin"))) | .executable' | head -1)
+            sudo RR_UINPUT_TEST=1 "$bin" gamepad --nocapture
+          else
+            cargo test -p rr-server gamepad -- --nocapture
+          fi
       - name: Selftest (macOS, test pattern; screen capture needs a permission runners can't give)
         if: runner.os == 'macOS'
         run: cargo run --release -p rr-server -- selftest --test-pattern
