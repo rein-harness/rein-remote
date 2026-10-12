@@ -167,3 +167,121 @@ fn in_response_to(a: &Assertion) -> Option<String> {
         .iter()
         .find_map(|c| c.subject_confirmation_data.as_ref()?.in_response_to.clone())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+    use samael::idp::response_builder::ResponseAttribute;
+    use samael::idp::{CertificateParams, IdentityProvider, KeyType, Rsa};
+    use samael::metadata::RequiredAttribute;
+
+    const ACS: &str = "https://rr.example/sso/saml/acs";
+    const SP: &str = "https://rr.example/sso/saml/metadata";
+    const IDP: &str = "https://idp.example/saml";
+
+    fn idp() -> (IdentityProvider, samael::crypto::CertificateDer) {
+        let idp = IdentityProvider::generate_new(KeyType::Rsa(Rsa::Rsa2048)).unwrap();
+        let cert = idp
+            .create_certificate(&CertificateParams {
+                common_name: "idp.example",
+                issuer_name: "idp.example",
+                days_until_expiration: 3,
+            })
+            .unwrap();
+        (idp, cert)
+    }
+
+    fn metadata(cert: &samael::crypto::CertificateDer) -> std::path::PathBuf {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(cert.der_data());
+        let xml = format!(
+            r#"<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" entityID="{IDP}"><md:IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol"><md:KeyDescriptor use="signing"><ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:X509Data><ds:X509Certificate>{b64}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></md:KeyDescriptor><md:SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" Location="https://idp.example/sso"/></md:IDPSSODescriptor></md:EntityDescriptor>"#
+        );
+        let path = std::env::temp_dir().join(format!("rr-saml-{}-{}.xml", std::process::id(), crate::auth::random_hex(4)));
+        std::fs::write(&path, xml).unwrap();
+        path
+    }
+
+    /// A response from `idp` (signed with its key) to the request `id`, for `audience`.
+    fn response(idp: &IdentityProvider, cert: &samael::crypto::CertificateDer, user: &str, audience: &str, id: &str) -> String {
+        let group = |v| ResponseAttribute {
+            required_attribute: RequiredAttribute {
+                name: "groups".into(),
+                format: Some("urn:oasis:names:tc:SAML:2.0:attrname-format:basic".into()),
+            },
+            value: v,
+        };
+        let r = idp.sign_authn_response(cert, user, audience, ACS, IDP, id, &[group("rr-admins")]).unwrap();
+        base64::engine::general_purpose::STANDARD.encode(r.to_string().unwrap())
+    }
+
+    fn form(resp: &str) -> HashMap<String, String> {
+        HashMap::from([("SAMLResponse".to_string(), resp.to_string())])
+    }
+
+    fn request_id(s: &Saml) -> String {
+        let r = s.login("/?measure").unwrap();
+        let to = r.headers[0].strip_prefix("Location: ").unwrap();
+        assert!(to.starts_with("https://idp.example/sso?SAMLRequest="), "{to}");
+        let p = s.pending.lock().unwrap();
+        p.keys().next().unwrap().clone()
+    }
+
+    #[test]
+    fn a_signed_response_signs_in_once_and_anything_else_is_refused() {
+        let (key, cert) = idp();
+        let s = Saml::new(metadata(&cert).to_str().unwrap(), SP, "https://rr.example", None, "groups".into()).unwrap();
+        assert!(s.metadata().contains(ACS));
+        let id = request_id(&s);
+        let good = response(&key, &cert, "alice@corp.example", SP, &id);
+        let (p, next) = s.acs(&form(&good)).unwrap();
+        assert_eq!(
+            (p.user.as_str(), p.groups.clone(), p.via, next.as_str()),
+            ("alice@corp.example", vec!["rr-admins".to_string()], "saml", "/?measure")
+        );
+        // The same response again: its request is spent.
+        assert!(s.acs(&form(&good)).is_err());
+        // An answer to no request of ours.
+        assert!(s.acs(&form(&response(&key, &cert, "alice@corp.example", SP, "id-999"))).is_err());
+        // For another service provider.
+        let id = request_id(&s);
+        assert!(s
+            .acs(&form(&response(&key, &cert, "alice@corp.example", "https://other.example", &id)))
+            .is_err());
+        // Signed by someone else's key.
+        let (other, other_cert) = idp();
+        let id = request_id(&s);
+        assert!(s.acs(&form(&response(&other, &other_cert, "alice@corp.example", SP, &id))).is_err());
+        // Changed after signing (the user swapped).
+        let signed = String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(response(&key, &cert, "alice@corp.example", SP, &id))
+                .unwrap(),
+        )
+        .unwrap();
+        let forged = signed.replace("alice@corp.example", "admin@corp.example");
+        assert_ne!(signed, forged);
+        assert!(s.acs(&form(&base64::engine::general_purpose::STANDARD.encode(forged))).is_err());
+        // And the untouched one still signs in (the request wasn't spent by the forgery).
+        assert_eq!(
+            s.acs(&form(&base64::engine::general_purpose::STANDARD.encode(&signed))).unwrap().0.user,
+            "alice@corp.example"
+        );
+    }
+
+    #[test]
+    fn metadata_without_a_signing_certificate_is_refused() {
+        let path = std::env::temp_dir().join(format!("rr-saml-nocert-{}.xml", std::process::id()));
+        std::fs::write(
+            &path,
+            format!(
+                r#"<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" entityID="{IDP}"><md:IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol"><md:SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" Location="https://idp.example/sso"/></md:IDPSSODescriptor></md:EntityDescriptor>"#
+            ),
+        )
+        .unwrap();
+        let e = Saml::new(path.to_str().unwrap(), SP, "https://rr.example", None, "groups".into())
+            .err()
+            .unwrap();
+        assert!(e.contains("no signing certificate"), "{e}");
+    }
+}

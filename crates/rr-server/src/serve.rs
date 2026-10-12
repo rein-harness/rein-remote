@@ -174,6 +174,9 @@ pub fn run(source: Box<dyn Source>, opts: Options) -> Result<(), String> {
             }
         );
     }
+    if opts.record.is_none() && gate.policy.as_ref().is_some_and(|p| p.rules.iter().any(|r| r.record == Some(true))) {
+        eprintln!("rein-remote: the policy says to record some sessions, and there's no --record DIR: none will be");
+    }
     if opts.audit.on() {
         opts.audit.log(
             "server_start",
@@ -845,8 +848,6 @@ fn stream(
     // them: a lost packet then costs nothing (parity rebuilds it), not a retransmission.
     let datagrams = client.features & FEATURE_VIDEO_DATAGRAMS != 0 && link.use_datagrams();
     let mut loss = 0.0f32;
-    // Sound, to a client that plays it (one that doesn't say so, an older one, gets none): as
-    // datagrams of its own when it takes them (a lost packet is a gap, never a wait), else in order.
     // Recorded when the server records and the policy (or no policy) says so; with the sound when there is.
     let record_dir = opts.record.as_ref().filter(|_| perms.record.unwrap_or(true));
     let recorder = match record_dir {
@@ -870,6 +871,9 @@ fn stream(
         None => None,
     };
     let recorder = recorder.map(RecordOnDrop);
+    // Sound, to a client that plays it (one that doesn't say so, an older one, gets none) and may
+    // hear it: as datagrams of its own when it takes them (a lost packet is a gap, never a wait),
+    // else in order. Listened to for the recording too.
     let play = client.audio && perms.audio;
     let audio = opts.audio.as_ref().filter(|_| play || recorder.is_some()).map(|a| a.listen());
     let audio_datagrams = play && audio.is_some() && client.features & FEATURE_AUDIO_DATAGRAMS != 0 && link.use_audio_datagrams();
@@ -1444,9 +1448,11 @@ mod tests {
         };
         ws.send(tungstenite::Message::binary(Message::Hello(client_hello(true)).encode())).unwrap();
         let (mut said, mut frames) = (vec![], 0);
+        // `secs` from the first frame (opening an encoder can take a second or two on a busy machine).
         let start = Instant::now();
+        let mut first: Option<Instant> = None;
         let mut sent = false;
-        while start.elapsed() < Duration::from_secs_f32(secs) {
+        while first.map_or(start.elapsed() < Duration::from_secs(30), |f| f.elapsed() < Duration::from_secs_f32(secs)) {
             let Ok(m) = ws.read() else { break };
             let tungstenite::Message::Binary(b) = m else { continue };
             let mut at = 0;
@@ -1455,6 +1461,7 @@ mod tests {
                 match m {
                     Some(Message::Video(_)) => {
                         frames += 1;
+                        first.get_or_insert_with(Instant::now);
                         if !sent {
                             sent = true;
                             for ev in input {
@@ -1599,6 +1606,8 @@ max_session_minutes = 0.05
             "the session ended at its limit, saying why: {said:?}"
         );
         assert!(inputs.lock().unwrap().is_empty(), "a viewer's input never reaches the machine");
+        // Her sign-in's time is up: no more tickets (the page goes to sign in again).
+        assert_eq!(http(port, "POST", "/sso/ticket", &[("Cookie", &bob), ("Origin", origin)], "").0, 401);
 
         // Carol (no group the policy names): refused at sign-in, with the reason.
         let refused = sign_in(port, &idp, &key, "carol@corp.example", &[]).unwrap_err();

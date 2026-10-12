@@ -432,8 +432,17 @@ impl crate::pairing::Gate {
         let Some(p) = s.session(req.cookies) else {
             return Resp::json("401 Unauthorized", serde_json::json!({"error": "not signed in", "login": "/sso/login"}));
         };
-        if let Decision::Deny { reason, .. } = self.decide(&p) {
-            return Resp::json("403 Forbidden", serde_json::json!({"error": reason, "user": p.user}));
+        match self.decide(&p) {
+            Decision::Deny { reason, .. } => return Resp::json("403 Forbidden", serde_json::json!({"error": reason, "user": p.user})),
+            // The sign-in's time is up (the policy's limit counts from it): sign in again for another.
+            Decision::Allow { perms, .. } if perms.max_session.is_some_and(|m| p.since.elapsed().unwrap_or_default() >= m) => {
+                s.end_session(req.cookies);
+                return Resp::json(
+                    "401 Unauthorized",
+                    serde_json::json!({"error": "this sign-in reached its time limit: sign in again", "login": "/sso/login"}),
+                );
+            }
+            Decision::Allow { .. } => {}
         }
         let user = p.user.clone();
         Resp::json("200 OK", serde_json::json!({"ticket": self.ticket_for(p), "user": user}))
