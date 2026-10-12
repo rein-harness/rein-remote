@@ -134,6 +134,97 @@ jobs:
       - name: Selftest (macOS, test pattern; screen capture needs a permission runners can't give)
         if: runner.os == 'macOS'
         run: cargo run --release -p rr-server -- selftest --test-pattern
+      # Config by file and services: the relay installed for real, from a config file whose secret is in
+      # a file of its own (never on the service's command line), up and answering /healthz, then removed.
+      # Each OS: the user's kind (systemd --user, a LaunchAgent, a scheduled task at logon) when the
+      # runner has one, and the system's (a systemd unit, a LaunchDaemon, a Windows service).
+      - name: Service install (Linux, systemd)
+        if: runner.os == 'Linux'
+        run: |
+          b=$PWD/target/release/rein-remote d=$RUNNER_TEMP/svc
+          mkdir -p "$d" && printf 's3cret-%s\n' "$RANDOM$RANDOM" > "$d/secret" && chmod 600 "$d/secret"
+          printf 'listen = "127.0.0.1:7995"\nmetrics-listen = "127.0.0.1:7996"\nsecret = { file = "secret" }\n' > "$d/relay.toml"
+          up() { for i in $(seq 1 40); do curl -fsS http://127.0.0.1:7995/healthz && echo && return 0; sleep 0.25; done; return 1; }
+          down() { for i in $(seq 1 40); do curl -fsS -m 1 http://127.0.0.1:7995/healthz > /dev/null 2>&1 || return 0; sleep 0.25; done; return 1; }
+          no_secret() { ps -eo args | grep '[r]ein-remote relay' | tee "$d/args"; ! grep -qF "$(cat "$d/secret")" "$d/args"; }
+          $b install-service relay --config "$d/relay.toml" --print
+          sudo loginctl enable-linger "$USER" || true
+          export XDG_RUNTIME_DIR=/run/user/$(id -u)
+          for i in $(seq 1 20); do systemctl --user show-environment > /dev/null 2>&1 && break; sleep 0.5; done
+          if systemctl --user show-environment > /dev/null 2>&1; then
+            $b install-service relay --config "$d/relay.toml"
+            up
+            no_secret
+            curl -fsS http://127.0.0.1:7996/metrics | grep '^rein_remote_relay'
+            systemctl --user --no-pager status rein-remote-relay | head -4 || true
+            $b uninstall-service relay
+            down
+          else
+            echo "::warning::no systemd user manager on this runner: the user unit was printed, not installed"
+          fi
+          sudo $b install-service relay --system --config "$d/relay.toml"
+          up
+          no_secret
+          systemctl --no-pager status rein-remote-relay | head -4 || true
+          sudo $b uninstall-service relay --system
+          down
+          test ! -e /etc/systemd/system/rein-remote-relay.service
+      - name: Service install (macOS, launchd)
+        if: runner.os == 'macOS'
+        run: |
+          b=$PWD/target/release/rein-remote d=$RUNNER_TEMP/svc
+          mkdir -p "$d" && printf 's3cret-%s\n' "$RANDOM$RANDOM" > "$d/secret" && chmod 600 "$d/secret"
+          printf 'listen = "127.0.0.1:7995"\nmetrics-listen = "127.0.0.1:7996"\nsecret = { file = "secret" }\n' > "$d/relay.toml"
+          up() { for i in $(seq 1 40); do curl -fsS http://127.0.0.1:7995/healthz && echo && return 0; sleep 0.25; done; return 1; }
+          down() { for i in $(seq 1 40); do curl -fsS -m 1 http://127.0.0.1:7995/healthz > /dev/null 2>&1 || return 0; sleep 0.25; done; return 1; }
+          no_secret() { ps -axo args | grep '[r]ein-remote relay' | tee "$d/args"; ! grep -qF "$(cat "$d/secret")" "$d/args"; }
+          $b install-service relay --config "$d/relay.toml" --print
+          if $b install-service relay --config "$d/relay.toml"; then
+            up
+            no_secret
+            curl -fsS http://127.0.0.1:7996/metrics | grep '^rein_remote_relay'
+            $b uninstall-service relay
+            down
+          else
+            $b uninstall-service relay || true
+            echo "::warning::no GUI session for a LaunchAgent on this runner: printed, not installed"
+          fi
+          sudo $b install-service relay --system --config "$d/relay.toml"
+          up
+          no_secret
+          sudo $b uninstall-service relay --system
+          down
+          test ! -e /Library/LaunchDaemons/com.rein-harness.rein-remote-relay.plist
+      - name: Service install (Windows, a service and a scheduled task)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $b = "$PWD\target\release\rein-remote.exe"; $d = "$env:RUNNER_TEMP\svc"
+          New-Item -ItemType Directory -Force $d | Out-Null
+          $secret = "s3cret-" + (Get-Random); Set-Content -NoNewline "$d\secret" $secret
+          Set-Content "$d\relay.toml" "listen = `"127.0.0.1:7995`"`nmetrics-listen = `"127.0.0.1:7996`"`nsecret = { file = `"secret`" }"
+          function Up { for ($i = 0; $i -lt 60; $i++) { try { return Invoke-RestMethod http://127.0.0.1:7995/healthz } catch { Start-Sleep -Milliseconds 250 } }; throw 'not up' }
+          function Down { for ($i = 0; $i -lt 60; $i++) { try { Invoke-RestMethod -TimeoutSec 1 http://127.0.0.1:7995/healthz | Out-Null; Start-Sleep -Milliseconds 250 } catch { return } }; throw 'still up' }
+          function NoSecret { $a = (Get-CimInstance Win32_Process -Filter "Name='rein-remote.exe'").CommandLine; $a; if ($a -match [regex]::Escape($secret)) { throw 'the secret is on the command line' } }
+          & $b install-service relay --system --config "$d\relay.toml" --print
+          & $b install-service relay --system --config "$d\relay.toml"
+          Up; NoSecret
+          sc.exe qc rein-remote-relay
+          (Invoke-WebRequest http://127.0.0.1:7996/metrics).Content -split "`n" | Select-String '^rein_remote_relay'
+          & $b uninstall-service relay --system; Down
+          Get-Content "$env:ProgramData\rein-remote\rein-remote-relay.log"
+          & $b install-service relay --config "$d\relay.toml" --print
+          & $b install-service relay --config "$d\relay.toml"
+          Up; NoSecret
+          & $b uninstall-service relay; Down
+      # The binary for the signing job.
+      - name: Keep the binary for the signing job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rein-remote-${{ runner.os }}
+          path: target/release/rein-remote${{ runner.os == 'Windows' && '.exe' || '' }}
+          retention-days: 1
       # The npm packages, installed from their tarballs, and Rein's contract with the binary (how
       # rein-harness's src/preview/remote.ts starts and talks to it).
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -187,6 +278,59 @@ jobs:
           kill %1 || true
           # What the server said (its per-second stats left out): the encoder, each viewer, adapting.
           grep -v '^rein-remote: {' serve.log || true
+  # Signing, as release.yml does it, with identities made here (nothing secret): macOS ad-hoc with the
+  # hardened runtime, Windows Authenticode with a self-signed certificate trusted on the runner only,
+  # cosign with a key generated here. Each signature checked, and a changed byte refused.
+  # docs/verification/signing.md has the same with real certificates.
+  signing:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: rein-remote-${{ runner.os }}
+          path: bin
+      - name: codesign, ad-hoc (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          chmod +x bin/rein-remote
+          sh tools/sign/macos.sh bin/rein-remote
+          ./bin/rein-remote --version
+          cp bin/rein-remote changed && printf 'x' | dd of=changed bs=1 seek=4096 conv=notrunc 2> /dev/null
+          if codesign --verify --strict changed 2> /dev/null; then echo "a changed binary verified"; exit 1; fi
+          echo "a changed byte: refused"
+      - name: signtool, a self-signed certificate (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./tools/sign/windows.ps1 bin/rein-remote.exe -SelfSigned
+          ./bin/rein-remote.exe --version
+          Copy-Item bin/rein-remote.exe changed.exe
+          $f = [IO.File]::Open("$PWD/changed.exe", 'Open', 'ReadWrite'); $f.Position = 4096; $f.WriteByte(120); $f.Close()
+          $s = Get-AuthenticodeSignature changed.exe
+          if ($s.Status -eq 'Valid') { throw 'a changed binary verified' }
+          "a changed byte: $($s.Status)"
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        if: runner.os == 'Linux'
+        with:
+          cosign-release: v3.1.3
+      - name: cosign, a key generated here (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          chmod +x bin/rein-remote
+          export COSIGN_PASSWORD=$(openssl rand -hex 16)
+          cosign generate-key-pair > /dev/null
+          (cd bin && sha256sum rein-remote > SHA256SUMS && cat SHA256SUMS)
+          COSIGN_KEY=cosign.key COSIGN_PUB=cosign.pub sh tools/sign/cosign.sh bin/SHA256SUMS bin/rein-remote
+          (cd bin && sha256sum -c SHA256SUMS)
+          cp bin/rein-remote changed && printf 'x' | dd of=changed bs=1 seek=4096 conv=notrunc 2> /dev/null
+          if cosign verify-blob --key cosign.pub --bundle bin/rein-remote.sigstore.json --insecure-ignore-tlog=true changed; then echo "a changed binary verified"; exit 1; fi
+          echo "a changed byte: refused"
   wasm:
     runs-on: ubuntu-latest
     steps:
