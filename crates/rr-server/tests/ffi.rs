@@ -12,7 +12,17 @@ use std::time::{Duration, Instant};
 #[test]
 fn a_session_through_the_c_abi() {
     let mut server = Proc::start(
-        &["serve", "--test-pattern", "320x240", "--listen", "127.0.0.1:0", "--token", "tok", "--mdns", "off"],
+        &[
+            "serve",
+            "--test-pattern",
+            "320x240",
+            "--listen",
+            "127.0.0.1:0",
+            "--token",
+            "tok",
+            "--mdns",
+            "off",
+        ],
         &[],
     );
     let addr = server.listening();

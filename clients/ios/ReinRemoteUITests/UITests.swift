@@ -26,7 +26,17 @@ final class UITests: XCTestCase {
     func testTheServerListFindsServersOnTheNetwork() throws {
         guard let name = ProcessInfo.processInfo.environment["RR_EXPECT_SERVER"], !name.isEmpty else { throw XCTSkip("set RR_EXPECT_SERVER") }
         let app = XCUIApplication()
+        app.launchArguments = ["-RRMeasure", "YES", "-RRAudio", "NO"]
         app.launch()
-        XCTAssertTrue(app.buttons["server-\(name)"].waitForExistence(timeout: 20), "found \(name) by Bonjour")
+        let server = app.buttons["server-\(name)"]
+        XCTAssertTrue(server.waitForExistence(timeout: 20), "found \(name) by Bonjour")
+        // Paired already (testPairsThenSignsIn, with RR_PAIR_URL): a tap resolves it and signs in.
+        guard server.label.contains("paired") && !server.label.contains("pair with") else { return }
+        server.tap()
+        let status = app.staticTexts["status"]
+        XCTAssertTrue(status.waitForExistence(timeout: 20))
+        expectation(for: NSPredicate(format: "label CONTAINS ' fps'"), evaluatedWith: status)
+        waitForExpectations(timeout: 20)
+        print("ui test: \(name) by Bonjour, signed in: \(status.label)")
     }
 }
