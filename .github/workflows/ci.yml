@@ -18,6 +18,11 @@ jobs:
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
       - name: Format
         run: cargo fmt --all --check
+      # The viewer's gamepads (gilrs) read devices through libudev on Linux; its window's keyboard
+      # needs libxkbcommon-x11 (loaded at run time).
+      - name: Linux packages
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libudev-dev libxkbcommon-x11-0 > /dev/null
       - name: Lint
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
@@ -72,6 +77,27 @@ jobs:
           RR_H264_OUT=/tmp/headers.h264 cargo test -q -p rr-server a_stream_from_these_headers_decodes
           ffmpeg -v error -i /tmp/headers.h264 -f rawvideo -pix_fmt yuv420p /tmp/headers.yuv
           cmp /tmp/headers.yuv /tmp/headers.h264.yuv
+      # The viewer's VA-API decoder reads the stream's headers itself (h264.rs): what it reads from the
+      # encoder's stream, next to what ffmpeg reads, in the log.
+      - name: H.264 headers as the viewer's VA-API decoder reads them, next to ffmpeg's (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          RR_H264_TRACE=/tmp/auto.h264 cargo test -q -p rr-viewer an_openh264_screen_stream -- --nocapture | grep -E '^(sps|pps|slice)' | head -40
+          ffmpeg -v error -i /tmp/auto.h264 -c copy -bsf:v trace_headers -f null - 2>&1 | grep -E 'frame_num|slice_type|first_mb' | head -40
+      # Gamepads on the server: a virtual Xbox 360 pad made through uinput and read back through evdev,
+      # as games read one (root: the runner's user can't open /dev/uinput or /dev/input); on Windows,
+      # what it says without ViGEmBus.
+      - name: Virtual gamepad (Linux uinput; Windows without ViGEmBus)
+        if: runner.os != 'macOS'
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo modprobe uinput
+            bin=$(cargo test -p rr-server --no-run --message-format=json 2>/dev/null | jq -r 'select(.profile.test and (.target.kind | index("bin"))) | .executable' | head -1)
+            sudo RR_UINPUT_TEST=1 "$bin" gamepad --nocapture
+          else
+            cargo test -p rr-server gamepad -- --nocapture
+          fi
       # Sound: a client that plays it gets Opus packets of what the machine plays, one that says it
       # doesn't gets none, and with no sound to be had the video streams on its own.
       - name: Sound (Linux, PulseAudio with a null sink as the output and a tone played into it)
@@ -129,6 +155,38 @@ jobs:
           cd "$RUNNER_TEMP/app" && npm init -y > /dev/null && npm install --no-audit --no-fund "$RUNNER_TEMP"/tgz/*.tgz
           npx rein-remote --version
           node "$GITHUB_WORKSPACE/npm/contract.mjs" $w
+      # The desktop viewer against a test-pattern server on the runner: decoding in software and with
+      # whatever the runner's hardware gives (none on Linux and Windows runners: it must say so and
+      # decode in software), the pointer sent and seen in the decoded picture (the pattern draws a
+      # cross there), then in a window (Linux: on Xvfb), reading the pattern's barcode for latency.
+      - name: Viewer smoke test (headless and in a window)
+        shell: bash
+        env:
+          DISPLAY: ':20'
+        run: |
+          cargo build --release -p rr-server -p rr-viewer
+          x=""; [ "$RUNNER_OS" = Windows ] && x=.exe
+          ./target/release/rein-remote$x serve --test-pattern 1280x720 --listen 127.0.0.1:7982 --token tok --mdns off 2> serve.log &
+          sleep 3
+          url="http://127.0.0.1:7982/?token=tok"
+          v=./target/release/rein-remote-viewer$x
+          $v "$url" --headless --frames 120 --decoder software --move 640,500
+          $v "$url" --headless --frames 120 --decoder auto --move 640,500
+          $v "$url" --headless --frames 60 --webtransport off --decoder software
+          # Windows: Media Foundation's decoder on the runner (no GPU: its own software decoding).
+          if [ "$RUNNER_OS" = Windows ]; then RR_DECODER=mediafoundation $v "$url" --headless --frames 120 --decoder hardware --move 640,500; fi
+          # Linux: no GPU here, so VA-API must say why it can't, and not decode.
+          if [ "$RUNNER_OS" = Linux ]; then
+            if out=$($v "$url" --headless --frames 10 --seconds 8 --decoder hardware 2>&1); then echo "VA-API decoded without a GPU?"; exit 1; fi
+            echo "$out"; echo "$out" | grep -q "VA-API"
+          fi
+          if ! $v "$url" --measure --seconds 5; then
+            [ "$RUNNER_OS" = macOS ] || exit 1
+            echo "no window on this runner"
+          fi
+          kill %1 || true
+          # What the server said (its per-second stats left out): the encoder, each viewer, adapting.
+          grep -v '^rein-remote: {' serve.log || true
   wasm:
     runs-on: ubuntu-latest
     steps:

@@ -1,5 +1,5 @@
 name: Release
-# A tag like v0.1.0 builds rein-remote for every platform and publishes a GitHub release with the
+# A tag like v0.1.0 builds rein-remote (and the desktop viewer, rein-remote-viewer) for every platform and publishes a GitHub release with the
 # archives and SHA256SUMS (what Rein checks before installing one). Unsigned for now (ROADMAP phase 6).
 on:
   push:
@@ -34,8 +34,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Rust
         run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }} && rustup default stable
+      # The viewer's gamepads (gilrs) read devices through libudev on Linux.
+      - name: Linux packages
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libudev-dev > /dev/null
       - name: Build
-        run: cargo build --release -p rr-server --target ${{ matrix.target }}
+        run: cargo build --release -p rr-server -p rr-viewer --target ${{ matrix.target }}
       - name: Package and upload
         shell: bash
         env:
@@ -45,11 +49,11 @@ jobs:
           mkdir "$name"
           cp LICENSE README.md "$name/"
           if [ "${{ runner.os }}" = Windows ]; then
-            cp "target/${{ matrix.target }}/release/rein-remote.exe" "$name/"
+            cp "target/${{ matrix.target }}/release/rein-remote.exe" "target/${{ matrix.target }}/release/rein-remote-viewer.exe" "$name/"
             7z a -tzip "$name.zip" "$name" > /dev/null
             file="$name.zip"
           else
-            cp "target/${{ matrix.target }}/release/rein-remote" "$name/"
+            cp "target/${{ matrix.target }}/release/rein-remote" "target/${{ matrix.target }}/release/rein-remote-viewer" "$name/"
             tar czf "$name.tar.gz" "$name"
             file="$name.tar.gz"
           fi

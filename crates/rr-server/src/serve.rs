@@ -5,8 +5,8 @@
 use crate::capture::Source;
 use crate::link::{E2eLink, Link, Recv, WsLink};
 use rr_proto::{
-    Codec, Config, Cursor, DirectOffer, Hello, Message, Video, FEATURE_AUDIO_DATAGRAMS, FEATURE_DIRECT, FEATURE_VIDEO_DATAGRAMS, INPUT_KEYBOARD, INPUT_POINTER,
-    INPUT_TOUCH, VERSION_MAX, VERSION_MIN,
+    Codec, Config, Cursor, DirectOffer, Hello, Message, Video, FEATURE_AUDIO_DATAGRAMS, FEATURE_DIRECT, FEATURE_VIDEO_DATAGRAMS, INPUT_GAMEPAD, INPUT_KEYBOARD,
+    INPUT_POINTER, INPUT_TOUCH, VERSION_MAX, VERSION_MIN,
 };
 use std::io::Write;
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -588,7 +588,8 @@ fn session(
         max_height: h as u16,
         max_fps: if opts.fps == 0 { MAX_FPS } else { opts.fps } as u16,
         audio: opts.audio.is_some(),
-        input: INPUT_POINTER | INPUT_KEYBOARD | INPUT_TOUCH,
+        // Gamepads too, where this machine can make a virtual one.
+        input: INPUT_POINTER | INPUT_KEYBOARD | INPUT_TOUCH | if crate::gamepad::available().is_ok() { INPUT_GAMEPAD } else { 0 },
         refresh_mhz: 0,
         features: 0,
     };
@@ -615,6 +616,9 @@ fn session(
             Recv::Nothing => {}
         }
     };
+    // The viewer's gamepads, as virtual pads for as long as the session lasts (why not, said when
+    // the first comes).
+    let mut pads = crate::gamepad::Pads::default();
     if rr_proto::negotiate(&hello, &client).is_none() {
         return Err(format!("{}: no protocol version in common", client.name));
     }
@@ -710,6 +714,27 @@ fn session(
                         let Ok((m, used)) = Message::decode(&b[at..]) else { break };
                         at += used;
                         match m {
+                            Some(Message::Input(rr_proto::Input::Gamepad {
+                                pad,
+                                buttons,
+                                lx,
+                                ly,
+                                rx,
+                                ry,
+                                lt,
+                                rt,
+                            })) => pads.set(
+                                pad,
+                                crate::gamepad::State {
+                                    buttons,
+                                    lx,
+                                    ly,
+                                    rx,
+                                    ry,
+                                    lt,
+                                    rt,
+                                },
+                            ),
                             Some(Message::Input(ev)) => {
                                 // The client's pixels are the picture's: the source's when it's scaled down.
                                 let ev = if (ew, eh) == enc_full { ev } else { unscale(ev, (ew, eh), (w, h)) };

@@ -1,0 +1,44 @@
+[package]
+name = "rr-viewer"
+description = "Rein Remote's desktop viewer (Windows, macOS, Linux): the stream in a window, hardware decoding, mouse, keyboard and gamepads"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rein-remote-viewer"
+path = "src/main.rs"
+
+[dependencies]
+rr-proto = {path = "../rr-proto"}
+rr-client = {path = "../rr-client"}
+openh264-sys2 = "0.6.6"
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
+softbuffer = { version = "0.4.8", default-features = false, features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"] }
+gilrs = "0.11.2"
+font8x8 = { version = "0.3", default-features = false, features = ["unicode"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10.1"
+objc2 = "0.6.5"
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFCGTypes"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "objc2", "CGColorSpace", "CGDataProvider", "CGImage"] }
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "CALayer", "CATransaction"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+] }
