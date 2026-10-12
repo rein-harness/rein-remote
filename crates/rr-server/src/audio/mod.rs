@@ -247,9 +247,10 @@ pub fn level_db(pcm: &[f32]) -> f32 {
 
 /// Blocks of any length into packets of exactly `FRAME` samples per channel, each with the capture
 /// time of its first sample. Within a run, times come from the sample count (packets exactly 10 ms
-/// apart, as the client expects); a block that starts more than 5 ms from where the count says (a
-/// gap: WASAPI sends nothing while nothing plays; or the device's clock drifting from the system's)
-/// closes the packet in progress with silence and starts counting again from its own time.
+/// apart, as the client expects; a block's own time jitters by a few ms with the device's buffering,
+/// which isn't the sound moving). A block that starts more than 20 ms from where the count says (a
+/// gap: WASAPI sends nothing while nothing plays; or the device's clock drifted that far from the
+/// system's) closes the packet in progress with silence and starts counting again from its own time.
 #[derive(Default)]
 pub struct Packetizer {
     pending: Vec<f32>,
@@ -263,7 +264,7 @@ impl Packetizer {
         let here = self.at_us + (self.pending.len() / 2) as f64 * 1e6 / RATE as f64;
         if self.pending.is_empty() {
             self.at_us = b.at_us as f64;
-        } else if (b.at_us as f64 - here).abs() > 5000.0 {
+        } else if (b.at_us as f64 - here).abs() > 20_000.0 {
             self.pending.resize(FRAME * 2, 0.0);
             out.push((self.at_us as u64, std::mem::take(&mut self.pending)));
             self.at_us = b.at_us as f64;
@@ -353,7 +354,8 @@ mod tests {
         let out = p.push(block(1_007_000));
         assert_eq!(out.len(), 1);
         assert_eq!((out[0].0, out[0].1.len()), (1_000_000, FRAME * 2));
-        let out = p.push(block(1_014_000));
+        // A block a few ms off where the count says (the device's buffering jitters): the count wins.
+        let out = p.push(block(1_017_500));
         assert_eq!(out[0].0, 1_010_000);
         // A gap of a second (nothing played): what was pending goes out padded, and counting starts
         // again at the new block's own time.
