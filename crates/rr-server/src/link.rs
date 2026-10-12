@@ -47,6 +47,11 @@ pub trait Link {
     }
     /// The share of parity shards to send with each frame's data shards (0.0–1.0).
     fn set_parity(&mut self, _parity: f32) {}
+    /// Through a relay, before a viewer has joined (the relay says when one does): no one is there to
+    /// say hello yet.
+    fn waiting_for_viewer(&self) -> bool {
+        false
+    }
 }
 
 // ---- WebSocket ----
@@ -73,11 +78,28 @@ impl Sock for tungstenite::stream::MaybeTlsStream<TcpStream> {
     }
 }
 
-pub struct WsLink<S: Sock>(pub WebSocket<S>);
+pub struct WsLink<S: Sock> {
+    ws: WebSocket<S>,
+    /// Through a relay: no viewer yet (until the relay's word that one joined).
+    waiting: bool,
+}
+
+impl<S: Sock> WsLink<S> {
+    /// A viewer's own connection.
+    pub fn new(ws: WebSocket<S>) -> Self {
+        Self { ws, waiting: false }
+    }
+
+    /// This machine's connection to a relay, where a viewer comes later: the relay sends a text
+    /// message when one joins (an older relay doesn't, and then the wait has no end but the relay's).
+    pub fn to_relay(ws: WebSocket<S>) -> Self {
+        Self { ws, waiting: true }
+    }
+}
 
 impl<S: Sock> Link for WsLink<S> {
     fn send_bytes(&mut self, bytes: Vec<u8>, _video: bool) -> Result<(), String> {
-        match self.0.write(Ws::Binary(bytes.into())) {
+        match self.ws.write(Ws::Binary(bytes.into())) {
             Ok(()) => Ok(()),
             Err(tungstenite::Error::Io(e)) if e.kind() == ErrorKind::WouldBlock => Ok(()), // buffered
             Err(e) => Err(e.to_string()),
@@ -85,7 +107,7 @@ impl<S: Sock> Link for WsLink<S> {
     }
 
     fn flushed(&mut self) -> Result<bool, String> {
-        match self.0.flush() {
+        match self.ws.flush() {
             Ok(()) => Ok(true),
             Err(tungstenite::Error::Io(e)) if e.kind() == ErrorKind::WouldBlock => Ok(false),
             Err(e) => Err(e.to_string()),
@@ -93,10 +115,15 @@ impl<S: Sock> Link for WsLink<S> {
     }
 
     fn recv(&mut self) -> Result<Recv, String> {
-        let _ = self.0.get_ref().tcp().set_nonblocking(true);
+        let _ = self.ws.get_ref().tcp().set_nonblocking(true);
         loop {
-            return match self.0.read() {
+            return match self.ws.read() {
                 Ok(Ws::Binary(b)) => Ok(Recv::Data(b.to_vec())),
+                // The relay's word: a viewer joined.
+                Ok(Ws::Text(_)) => {
+                    self.waiting = false;
+                    continue;
+                }
                 Ok(Ws::Close(_)) => Ok(Recv::Closed),
                 Ok(_) => continue,
                 Err(tungstenite::Error::Io(e)) if e.kind() == ErrorKind::WouldBlock => Ok(Recv::Nothing),
@@ -106,12 +133,16 @@ impl<S: Sock> Link for WsLink<S> {
         }
     }
 
+    fn waiting_for_viewer(&self) -> bool {
+        self.waiting
+    }
+
     fn wait(&mut self, d: Duration) {
         if d.is_zero() {
             return;
         }
         // Blocks until a byte comes or the time's up, without taking it.
-        let sock = self.0.get_ref().tcp();
+        let sock = self.ws.get_ref().tcp();
         let _ = sock.set_nonblocking(false);
         let _ = sock.set_read_timeout(Some(d));
         let _ = sock.peek(&mut [0u8; 1]);
@@ -392,5 +423,9 @@ impl Link for E2eLink {
 
     fn wait(&mut self, d: Duration) {
         self.inner.wait(d);
+    }
+
+    fn waiting_for_viewer(&self) -> bool {
+        self.inner.waiting_for_viewer()
     }
 }

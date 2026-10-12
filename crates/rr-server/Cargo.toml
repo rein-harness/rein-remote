@@ -23,7 +23,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pemfile = "2.2.0"
 hkdf = "0.12.4"
 sha2 = "0.10.9"
-socket2 = "0.6.1"
+socket2 = { version = "0.6.1", features = ["all"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
 wtransport = "0.7.2"
 zune-jpeg = "0.4"

@@ -279,10 +279,15 @@ fn through_relay(
                 use crate::link::Sock;
                 let _ = ws.get_ref().tcp().set_nodelay(true);
                 let _ = socket2::SockRef::from(ws.get_ref().tcp()).set_send_buffer_size((opts.bitrate_kbps as usize * 1000 / 8 / 20).max(64 * 1024));
-                // It may wait a long time for a viewer: TCP keepalive finds a connection that died quietly.
-                let _ = socket2::SockRef::from(ws.get_ref().tcp()).set_tcp_keepalive(&socket2::TcpKeepalive::new().with_time(Duration::from_secs(30)));
+                // It may wait a long time for a viewer: TCP keepalive finds a relay that went quietly
+                // (a reboot, a network gone) within a minute, and this machine connects again.
+                let keepalive = socket2::TcpKeepalive::new()
+                    .with_time(Duration::from_secs(30))
+                    .with_interval(Duration::from_secs(10))
+                    .with_retries(3);
+                let _ = socket2::SockRef::from(ws.get_ref().tcp()).set_tcp_keepalive(&keepalive);
                 // Sealed end to end: the relay passes what it can't read.
-                let link = match E2eLink::host(Box::new(WsLink(ws)), &opts.e2e_key) {
+                let link = match E2eLink::host(Box::new(WsLink::to_relay(ws)), &opts.e2e_key) {
                     Ok(l) => l,
                     Err(e) => {
                         eprintln!("rein-remote: {e}");
@@ -349,7 +354,7 @@ fn handle(
         let _ = conn.tcp().set_nodelay(true);
         let _ = socket2::SockRef::from(conn.tcp()).set_send_buffer_size((opts.bitrate_kbps as usize * 1000 / 8 / 20).max(64 * 1024));
         let ws = tungstenite::accept(crate::conn::Replay::new(head, conn)).map_err(|e| format!("websocket: {e}"))?;
-        return session(Box::new(WsLink(ws)), source, stats, opts, None);
+        return session(Box::new(WsLink::new(ws)), source, stats, opts, None);
     }
     let (status, kind, body) = match path.as_str() {
         "/" | "/index.html" => ("200 OK", "text/html; charset=utf-8", INDEX.to_string()),
@@ -567,12 +572,15 @@ fn session(
     };
     link.send(&Message::Hello(hello.clone()))?;
     link.flushed()?;
-    // The client's Hello (with a deadline), then the stream's config. Through the relay, the session
-    // starts when this machine connects there, and the viewer comes when it comes: no deadline (the
-    // relay closing the connection ends it).
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // The client's Hello (within 10 s), then the stream's config. Through the relay, the session starts
+    // when this machine connects there, and the viewer comes when it comes: the 10 s from when the
+    // relay says one joined.
+    let mut deadline = Instant::now() + Duration::from_secs(10);
     let client = loop {
-        if direct.is_none() && Instant::now() > deadline {
+        if link.waiting_for_viewer() {
+            deadline = Instant::now() + Duration::from_secs(10);
+        }
+        if Instant::now() > deadline {
             return Err("the client didn't say hello".into());
         }
         match link.recv_wait(Duration::from_millis(200))? {

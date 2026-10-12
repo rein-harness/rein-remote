@@ -153,8 +153,10 @@ fn handle(mut stream: TcpStream, rooms: Rooms, busy: Busy, secret: Option<String
     stream.write_all(resp.as_bytes()).map_err(|e| e.to_string())
 }
 
-/// Pass messages both ways until either side goes.
+/// Pass messages both ways until either side goes. First, a text message to the machine (`a`): a
+/// viewer joined (its wait for a hello starts now; what the two say to each other is binary).
 fn pipe(mut a: WebSocket<TcpStream>, mut b: WebSocket<TcpStream>) {
+    let _ = a.send(Ws::Text("viewer".into()));
     for ws in [&mut a, &mut b] {
         let _ = ws.get_mut().set_nonblocking(true);
         let _ = ws.get_mut().set_nodelay(true);
