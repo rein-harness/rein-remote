@@ -18,6 +18,7 @@
 //!                                                      # (or REIN_REMOTE_TOKEN; kept out of `ps`)
 
 mod adapt;
+mod audio;
 mod capture;
 mod conn;
 mod connect;
@@ -38,11 +39,12 @@ mod relay;
 mod serve;
 mod yuv;
 
+use audio::Sound;
 use capture::{Source, TestPattern};
 
 fn usage() -> ! {
     eprintln!(
-        "rein-remote {}\n\nusage:\n  rein-remote serve [--display :N | --window APP|TITLE|ID | --app NAME | --kms [CONNECTOR] | --vnc HOST:PORT [--vnc-password P] | --pipe WxH | --test-pattern [WxH] [--motion full]] [--listen ADDR] [--fps auto|N] [--codec h264|h265|auto] [--bitrate KBPS] [--token T] [--webtransport on|off] [--tls-cert PEM --tls-key PEM] [--tailscale-cert on|off] [--mdns on|off] [--pair on|off] [--relay ws(s)://HOST:PORT [--room CODE] [--relay-secret S]]\n  rein-remote relay [--listen ADDR] [--secret S]\n  rein-remote windows [--json]\n  rein-remote displays\n  rein-remote discover [SECONDS]\n  rein-remote paired | unpair ID\n  rein-remote connect URL|NAME [--seconds N] [--pair CODE] [--json] [--webtransport on|off] [--datagrams on|off] [--direct on|off]\n  rein-remote selftest [--window Q | --display :N | --kms [CONNECTOR] | --test-pattern [WxH]] [--type TEXT] [--encode OUT.h264 [--frames N]]\n  rein-remote --version",
+        "rein-remote {}\n\nusage:\n  rein-remote serve [--display :N | --window APP|TITLE|ID | --app NAME | --kms [CONNECTOR] | --vnc HOST:PORT [--vnc-password P] | --pipe WxH | --test-pattern [WxH] [--motion full]] [--listen ADDR] [--fps auto|N] [--codec h264|h265|auto] [--bitrate KBPS] [--token T] [--webtransport on|off] [--tls-cert PEM --tls-key PEM] [--tailscale-cert on|off] [--mdns on|off] [--pair on|off] [--relay ws(s)://HOST:PORT [--room CODE] [--relay-secret S]] [--audio on|off]\n  rein-remote relay [--listen ADDR] [--secret S]\n  rein-remote windows [--json]\n  rein-remote displays\n  rein-remote discover [SECONDS]\n  rein-remote paired | unpair ID\n  rein-remote connect URL|NAME [--seconds N] [--pair CODE] [--json] [--webtransport on|off] [--datagrams on|off] [--direct on|off]\n  rein-remote selftest [--window Q | --display :N | --kms [CONNECTOR] | --test-pattern [WxH]] [--type TEXT] [--encode OUT.h264 [--frames N]]\n  rein-remote --version",
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(2);
@@ -168,6 +170,7 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
         tailscale_cert: true,
         mdns: true,
         pair: None,
+        audio: None,
         e2e_key: {
             let mut k = [0u8; 32];
             let _ = getrandom::fill(&mut k);
@@ -185,6 +188,9 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
     let mut pattern: Option<(usize, usize)> = None;
     let mut full_motion = false;
     let mut kms: Option<Option<String>> = None;
+    // Sound: on unless turned off; for a VNC display or piped frames, off unless turned on (this
+    // machine's sound isn't theirs).
+    let mut sound: Option<bool> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut val = || it.next().cloned().ok_or_else(|| format!("{a} needs a value"));
@@ -230,6 +236,13 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
             "--webtransport" => opts.webtransport = !matches!(val()?.as_str(), "off" | "false" | "no"),
             "--test-pattern" => pattern = Some(size_arg(&mut it)?.unwrap_or((1280, 720))),
             "--kms" => kms = Some(optional_arg(&mut it)),
+            "--audio" => {
+                sound = Some(match val()?.as_str() {
+                    "on" | "true" | "yes" => true,
+                    "off" | "false" | "no" => false,
+                    _ => return Err("--audio is on or off".into()),
+                })
+            }
             _ => usage(),
         }
     }
@@ -259,16 +272,21 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
         }
         opts.relay = Some((r, room, relay_secret));
     }
-    let source: Box<dyn Source> = match (pattern, window) {
-        (Some((w, h)), _) if full_motion => Box::new(TestPattern::full_motion(w, h)),
-        (Some((w, h)), _) => Box::new(TestPattern::new(w, h)),
-        (None, _) if kms.is_some() => open_kms(kms.unwrap().as_deref())?,
-        (None, _) if pipe.is_some() => Box::new(capture::pipe::Pipe::open(pipe.unwrap().0, pipe.unwrap().1)),
-        (None, _) if vnc.is_some() => Box::new(capture::vnc::Vnc::open(vnc.as_deref().unwrap(), vnc_password.as_deref())?),
+    let elsewhere = || if sound == Some(true) { Sound::System } else { Sound::Off };
+    let (source, with): (Box<dyn Source>, Sound) = match (pattern, window) {
+        (Some((w, h)), _) if full_motion => (Box::new(TestPattern::full_motion(w, h)), Sound::Tone),
+        (Some((w, h)), _) => (Box::new(TestPattern::new(w, h)), Sound::Tone),
+        (None, _) if kms.is_some() => (open_kms(kms.unwrap().as_deref())?, Sound::System),
+        (None, _) if pipe.is_some() => (Box::new(capture::pipe::Pipe::open(pipe.unwrap().0, pipe.unwrap().1)), elsewhere()),
+        (None, _) if vnc.is_some() => (
+            Box::new(capture::vnc::Vnc::open(vnc.as_deref().unwrap(), vnc_password.as_deref())?),
+            elsewhere(),
+        ),
         (None, Some(q)) => open_window(&q)?,
         (None, None) if app.is_some() => open_app(app.as_deref().unwrap())?,
         (None, None) => open_display(display.as_deref())?,
     };
+    opts.audio = audio::Audio::new(if sound == Some(false) { Sound::Off } else { with });
     serve::run(source, opts)
 }
 
@@ -324,19 +342,24 @@ fn open_kms(_connector: Option<&str>) -> Result<Box<dyn Source>, String> {
     Err("--kms is Linux's (the screen through the kernel's display driver)".into())
 }
 
+// Each source with the sound that goes with it: on macOS, ScreenCaptureKit's for the same content
+// (one app's sound for a window or an app); elsewhere, everything the machine plays.
+
 #[cfg(target_os = "macos")]
-fn open_window(query: &str) -> Result<Box<dyn Source>, String> {
-    Ok(Box::new(capture::mac::MacWindow::open(query)?))
+fn open_window(query: &str) -> Result<(Box<dyn Source>, Sound), String> {
+    let w = capture::mac::MacWindow::open(query)?;
+    let sound = Sound::Mac(w.sound());
+    Ok((Box::new(w), sound))
 }
 
 #[cfg(target_os = "linux")]
-fn open_window(query: &str) -> Result<Box<dyn Source>, String> {
-    Ok(Box::new(capture::x11::X11::open_window(None, query)?))
+fn open_window(query: &str) -> Result<(Box<dyn Source>, Sound), String> {
+    Ok((Box::new(capture::x11::X11::open_window(None, query)?), Sound::System))
 }
 
 #[cfg(windows)]
-fn open_window(query: &str) -> Result<Box<dyn Source>, String> {
-    Ok(Box::new(capture::win::WinSource::open_window(query)?))
+fn open_window(query: &str) -> Result<(Box<dyn Source>, Sound), String> {
+    Ok((Box::new(capture::win::WinSource::open_window(query)?), Sound::System))
 }
 
 #[cfg(target_os = "macos")]
@@ -424,31 +447,35 @@ fn esc(s: &str) -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn open_display(display: Option<&str>) -> Result<Box<dyn Source>, String> {
-    Ok(Box::new(capture::x11::X11::open(display)?))
+fn open_display(display: Option<&str>) -> Result<(Box<dyn Source>, Sound), String> {
+    Ok((Box::new(capture::x11::X11::open(display)?), Sound::System))
 }
 
 #[cfg(target_os = "macos")]
-fn open_display(display: Option<&str>) -> Result<Box<dyn Source>, String> {
-    Ok(Box::new(capture::mac::MacWindow::open_display(display)?))
+fn open_display(display: Option<&str>) -> Result<(Box<dyn Source>, Sound), String> {
+    let d = capture::mac::MacWindow::open_display(display)?;
+    let sound = Sound::Mac(d.sound());
+    Ok((Box::new(d), sound))
 }
 
 #[cfg(target_os = "macos")]
-fn open_app(query: &str) -> Result<Box<dyn Source>, String> {
-    Ok(Box::new(capture::mac::MacWindow::open_app(query)?))
+fn open_app(query: &str) -> Result<(Box<dyn Source>, Sound), String> {
+    let a = capture::mac::MacWindow::open_app(query)?;
+    let sound = Sound::Mac(a.sound());
+    Ok((Box::new(a), sound))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn open_app(_query: &str) -> Result<Box<dyn Source>, String> {
+fn open_app(_query: &str) -> Result<(Box<dyn Source>, Sound), String> {
     Err("--app is for macOS (elsewhere, --window shows one of an app's windows)".into())
 }
 
 #[cfg(windows)]
-fn open_display(display: Option<&str>) -> Result<Box<dyn Source>, String> {
+fn open_display(display: Option<&str>) -> Result<(Box<dyn Source>, Sound), String> {
     if display.is_some() {
         return Err("--display is for Linux and macOS; on Windows, no source streams the primary display".into());
     }
-    Ok(Box::new(capture::win::WinSource::open_display()?))
+    Ok((Box::new(capture::win::WinSource::open_display()?), Sound::System))
 }
 
 #[cfg(target_os = "macos")]
@@ -554,9 +581,9 @@ fn selftest(args: &[String]) -> Result<String, String> {
     let mut src: Box<dyn Source> = match (pattern, window) {
         (Some((w, h)), _) => Box::new(TestPattern::new(w, h)),
         (None, _) if kms.is_some() => open_kms(kms.clone().unwrap().as_deref())?,
-        (None, Some(q)) => open_window(&q)?,
-        (None, None) if app.is_some() => open_app(app.as_deref().unwrap())?,
-        (None, None) => open_display(display.as_deref())?,
+        (None, Some(q)) => open_window(&q)?.0,
+        (None, None) if app.is_some() => open_app(app.as_deref().unwrap())?.0,
+        (None, None) => open_display(display.as_deref())?.0,
     };
     if let Some(path) = encode_to {
         return encode_test(&mut src, &path, frames);

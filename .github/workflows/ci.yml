@@ -72,6 +72,39 @@ jobs:
           RR_H264_OUT=/tmp/headers.h264 cargo test -q -p rr-server a_stream_from_these_headers_decodes
           ffmpeg -v error -i /tmp/headers.h264 -f rawvideo -pix_fmt yuv420p /tmp/headers.yuv
           cmp /tmp/headers.yuv /tmp/headers.h264.yuv
+      # Sound: a client that plays it gets Opus packets of what the machine plays, one that says it
+      # doesn't gets none, and with no sound to be had the video streams on its own.
+      - name: Sound (Linux, PulseAudio with a null sink as the output and a tone played into it)
+        if: runner.os == 'Linux'
+        run: |
+          node -e "process.exit(typeof WebSocket === 'function' ? 0 : 1)" || export NODE_OPTIONS=--experimental-websocket
+          sudo apt-get install -y -qq pulseaudio pulseaudio-utils > /dev/null
+          pulseaudio -D --exit-idle-time=-1
+          pactl load-module module-null-sink sink_name=rr && pactl set-default-sink rr
+          Xvfb :21 -screen 0 1280x720x24 & sleep 2
+          ./target/release/rein-remote serve --display :21 --listen 127.0.0.1:7979 --webtransport off 2> serve.log & sleep 2
+          pactl load-module module-sine sink=rr frequency=440
+          node tools/listen.mjs http://127.0.0.1:7979/ --seconds 4 | tee sound.json
+          node tools/listen.mjs http://127.0.0.1:7979/ --seconds 2 --audio off | tee none.json
+          grep -v '^rein-remote: {' serve.log
+          node -e "const r = require('./sound.json'); if (!(r.videoFrames > 0 && r.audioPackets > 100 && r.serverAudio.loud_packets > 100)) process.exit(1)"
+          node -e "const r = require('./none.json'); if (!(r.videoFrames > 0 && r.audioPackets === 0)) process.exit(1)"
+      - name: Sound (Windows, WASAPI loopback; a runner may have no output device, and the video streams anyway)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          node -e "process.exit(typeof WebSocket === 'function' ? 0 : 1)"
+          if ($LASTEXITCODE -ne 0) { $env:NODE_OPTIONS = '--experimental-websocket' }
+          Start-Process notepad
+          Start-Sleep -Seconds 2
+          $p = Start-Process ./target/release/rein-remote.exe -ArgumentList 'serve','--window','Notepad','--listen','127.0.0.1:7979','--webtransport','off' -RedirectStandardError serve.log -PassThru
+          Start-Sleep -Seconds 3
+          node tools/listen.mjs http://127.0.0.1:7979/ --seconds 4 | Tee-Object -FilePath sound.json
+          Stop-Process $p
+          Get-Content serve.log | Select-String -NotMatch '^rein-remote: \{'
+          $r = Get-Content sound.json -Raw | ConvertFrom-Json
+          if ($r.videoFrames -lt 1) { throw 'no video' }
+          if ($r.audioPackets -eq 0 -and -not (Select-String -Path serve.log -Pattern 'no sound \(' -Quiet)) { throw 'no sound, and no reason why' }
       - name: Selftest (macOS, test pattern; screen capture needs a permission runners can't give)
         if: runner.os == 'macOS'
         run: cargo run --release -p rr-server -- selftest --test-pattern

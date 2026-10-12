@@ -5,8 +5,8 @@
 use crate::capture::Source;
 use crate::link::{E2eLink, Link, Recv, WsLink};
 use rr_proto::{
-    Codec, Config, Cursor, DirectOffer, Hello, Message, Video, FEATURE_DIRECT, FEATURE_VIDEO_DATAGRAMS, INPUT_KEYBOARD, INPUT_POINTER, INPUT_TOUCH,
-    VERSION_MAX, VERSION_MIN,
+    Codec, Config, Cursor, DirectOffer, Hello, Message, Video, FEATURE_AUDIO_DATAGRAMS, FEATURE_DIRECT, FEATURE_VIDEO_DATAGRAMS, INPUT_KEYBOARD, INPUT_POINTER,
+    INPUT_TOUCH, VERSION_MAX, VERSION_MIN,
 };
 use std::io::Write;
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -44,6 +44,8 @@ pub struct Options {
     /// Pairing (a code to enter once, then each device signs in with its key): `None` is on when it
     /// listens beyond this computer.
     pub pair: Option<bool>,
+    /// The sound that goes with the video, for viewers that play it (`--audio off`: none).
+    pub audio: Option<Arc<crate::audio::Audio>>,
 }
 
 /// Latency and throughput, kept per session and shown by /stats.
@@ -360,7 +362,7 @@ fn handle(
         "/" | "/index.html" => ("200 OK", "text/html; charset=utf-8", INDEX.to_string()),
         "/rein-remote.js" => ("200 OK", "text/javascript; charset=utf-8", CLIENT_JS.to_string()),
         "/pair.js" => ("200 OK", "text/javascript; charset=utf-8", PAIR_JS.to_string()),
-        "/stats" => ("200 OK", "application/json", stats_json(&stats.lock().unwrap())),
+        "/stats" => ("200 OK", "application/json", stats_json(&stats.lock().unwrap(), opts.audio.as_deref())),
         // Where WebTransport is, and its certificate's SHA-256 when the browser has to be given it
         // (a self-signed one; a real certificate needs nothing).
         "/info" => ("200 OK", "application/json", {
@@ -509,7 +511,7 @@ pub fn pace(asked: u32, refresh_mhz: u32, hardware: bool) -> u32 {
     refresh.clamp(10, if hardware { MAX_FPS } else { SOFTWARE_FPS })
 }
 
-fn stats_json(s: &Stats) -> String {
+fn stats_json(s: &Stats, audio: Option<&crate::audio::Audio>) -> String {
     let pct = |v: &[f64], p: f64| -> f64 {
         if v.is_empty() {
             return 0.0;
@@ -518,8 +520,16 @@ fn stats_json(s: &Stats) -> String {
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         v[((v.len() - 1) as f64 * p) as usize]
     };
+    // The sound: packets made, how many weren't silence, the last second's loudest (dBFS).
+    let audio = match audio.map(|a| a.stats.lock().unwrap().clone()) {
+        Some(a) => format!(
+            r#"{{"packets":{},"bytes":{},"loud_packets":{},"level_db":{:.1},"listeners":{},"error":{:?}}}"#,
+            a.packets, a.bytes, a.loud_packets, a.level_db, a.listeners, a.error
+        ),
+        None => "null".into(),
+    };
     format!(
-        r#"{{"frames":{},"keyframes":{},"skipped_backed_up":{},"bytes":{},"rtt_ms":{:.1},"latency_ms":{{"p50":{:.1},"p95":{:.1},"samples":{}}},"encode_ms":{{"p50":{:.1},"p95":{:.1}}},"grab_ms":{{"p50":{:.1},"p95":{:.1}}},"still":{},"kbps":{},"fps":{},"queuing_ms":{:.1}}}"#,
+        r#"{{"frames":{},"keyframes":{},"skipped_backed_up":{},"bytes":{},"rtt_ms":{:.1},"latency_ms":{{"p50":{:.1},"p95":{:.1},"samples":{}}},"encode_ms":{{"p50":{:.1},"p95":{:.1}}},"grab_ms":{{"p50":{:.1},"p95":{:.1}}},"still":{},"kbps":{},"fps":{},"queuing_ms":{:.1},"audio":{audio}}}"#,
         s.frames,
         s.keyframes,
         s.skipped_backed_up,
@@ -565,7 +575,7 @@ fn session(
         max_width: w as u16,
         max_height: h as u16,
         max_fps: if opts.fps == 0 { MAX_FPS } else { opts.fps } as u16,
-        audio: false,
+        audio: opts.audio.is_some(),
         input: INPUT_POINTER | INPUT_KEYBOARD | INPUT_TOUCH,
         refresh_mhz: 0,
         features: 0,
@@ -626,11 +636,20 @@ fn session(
     // them: a lost packet then costs nothing (parity rebuilds it), not a retransmission.
     let datagrams = client.features & FEATURE_VIDEO_DATAGRAMS != 0 && link.use_datagrams();
     let mut loss = 0.0f32;
+    // Sound, to a client that plays it (one that doesn't say so, an older one, gets none): as
+    // datagrams of its own when it takes them (a lost packet is a gap, never a wait), else in order.
+    let audio = opts.audio.as_ref().filter(|_| client.audio).map(|a| a.listen());
+    let audio_datagrams = audio.is_some() && client.features & FEATURE_AUDIO_DATAGRAMS != 0 && link.use_audio_datagrams();
     eprintln!(
-        "rein-remote: {} connected ({:?} {ew}×{eh} at {fps} fps{refresh}{})",
+        "rein-remote: {} connected ({:?} {ew}×{eh} at {fps} fps{refresh}{}{})",
         client.name,
         codec,
-        if datagrams { ", video as datagrams" } else { "" }
+        if datagrams { ", video as datagrams" } else { "" },
+        match (&audio, audio_datagrams) {
+            (None, _) => "",
+            (Some(_), true) => ", sound as datagrams",
+            (Some(_), false) => ", with sound",
+        }
     );
     // A viewer through the relay that can go direct: where to find this machine, the certificate to
     // expect, a ticket for one session. Sealed like everything else here, so the relay can't use it.
@@ -730,6 +749,19 @@ fn session(
                 Recv::Closed => return Ok(()),
             }
         }
+        // Sound as it comes (small, and never held back with the video when the link backs up: a late
+        // packet is the client's to drop).
+        if let Some(l) = &audio {
+            let mut sent = false;
+            while let Ok(frame) = l.packets.try_recv() {
+                link.send_audio(frame.to_vec())?;
+                sent = true;
+            }
+            // Out now, not with the next frame (a WebSocket writes what's queued when flushed).
+            if sent {
+                link.flushed()?;
+            }
+        }
         let pointer = source.lock().unwrap().cursor();
         if let Some(p) = pointer {
             let new_shape = cursor_sent.is_none_or(|(_, _, s, _)| s != p.serial);
@@ -817,7 +849,7 @@ fn session(
         }
         if last_report.elapsed() > Duration::from_secs(5) {
             last_report = Instant::now();
-            eprintln!("rein-remote: {}", stats_json(&stats.lock().unwrap()));
+            eprintln!("rein-remote: {}", stats_json(&stats.lock().unwrap(), opts.audio.as_deref()));
         }
         // A few times a second: what the link takes now.
         if last_adapt.elapsed() > Duration::from_millis(250) {
@@ -856,6 +888,10 @@ fn session(
         if enc.in_flight() > 0 {
             rest = rest.min(Duration::from_millis(1));
         }
+        // With sound, a look every 2 ms: a packet comes every 10, and waits here no longer than that.
+        if audio.is_some() {
+            rest = rest.min(Duration::from_millis(2));
+        }
         link.wait(rest);
     }
 }
@@ -863,6 +899,124 @@ fn session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A connection in memory: what the session sends is kept, what the client says is queued.
+    struct MemLink {
+        sent: Arc<Mutex<Vec<Vec<u8>>>>,
+        inbox: std::sync::mpsc::Receiver<Vec<u8>>,
+    }
+
+    impl Link for MemLink {
+        fn send_bytes(&mut self, bytes: Vec<u8>, _video: bool) -> Result<(), String> {
+            self.sent.lock().unwrap().push(bytes);
+            Ok(())
+        }
+        fn flushed(&mut self) -> Result<bool, String> {
+            Ok(true)
+        }
+        fn recv(&mut self) -> Result<Recv, String> {
+            match self.inbox.try_recv() {
+                Ok(b) => Ok(Recv::Data(b)),
+                Err(std::sync::mpsc::TryRecvError::Empty) => Ok(Recv::Nothing),
+                Err(_) => Ok(Recv::Closed),
+            }
+        }
+        fn wait(&mut self, d: Duration) {
+            std::thread::sleep(d.min(Duration::from_millis(1)));
+        }
+    }
+
+    /// A session with the test pattern for `secs` from its first video frame (opening an encoder can
+    /// take a second or two), a client whose Hello is `hello`: the kinds of the frames it got, and the
+    /// server's Hello.
+    fn session_with(hello: Vec<u8>, sound: crate::audio::Sound, secs: f32) -> (Vec<u8>, Hello) {
+        let (tx, inbox) = std::sync::mpsc::channel();
+        let sent = Arc::new(Mutex::new(vec![]));
+        let link = MemLink { sent: sent.clone(), inbox };
+        let opts = Options {
+            listen: String::new(),
+            fps: 30,
+            codec: Some(Codec::H264),
+            bitrate_kbps: 2000,
+            token: None,
+            webtransport: false,
+            relay: None,
+            e2e_key: [0; 32],
+            tls: None,
+            tailscale_cert: false,
+            mdns: false,
+            pair: None,
+            audio: crate::audio::Audio::new(sound),
+        };
+        tx.send(hello).unwrap();
+        let source: Arc<Mutex<Box<dyn Source>>> = Arc::new(Mutex::new(Box::new(crate::capture::TestPattern::new(320, 240))));
+        let run = std::thread::spawn(move || session(Box::new(link), source, Arc::new(Mutex::new(Stats::default())), &opts, None));
+        let start = Instant::now();
+        while !sent.lock().unwrap().iter().any(|f| f[0] == rr_proto::kind::VIDEO) && start.elapsed() < Duration::from_secs(30) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_secs_f32(secs));
+        drop(tx);
+        run.join().unwrap().unwrap();
+        let frames = sent.lock().unwrap().clone();
+        let Ok((Some(Message::Hello(server)), _)) = Message::decode(&frames[0]) else {
+            panic!("no hello first")
+        };
+        (frames.iter().map(|f| f[0]).collect(), server)
+    }
+
+    fn client_hello(audio: bool) -> Hello {
+        Hello {
+            version_min: 0,
+            version_max: 0,
+            name: "test".into(),
+            codecs: vec![rr_proto::CodecCap {
+                codec: Codec::H264,
+                hardware: false,
+            }],
+            max_width: 1920,
+            max_height: 1080,
+            max_fps: 60,
+            audio,
+            input: INPUT_POINTER,
+            refresh_mhz: 60_000,
+            features: 0,
+        }
+    }
+
+    #[test]
+    fn sound_goes_only_to_clients_that_play_it_and_its_absence_stops_nothing() {
+        use crate::audio::Sound;
+        use rr_proto::kind;
+        let count = |kinds: &[u8], k: u8| kinds.iter().filter(|&&x| x == k).count();
+        // A client that plays sound: Opus packets, 100 a second, next to the video.
+        let (kinds, server) = session_with(Message::Hello(client_hello(true)).encode(), Sound::Tone, 1.5);
+        assert!(server.audio);
+        assert!(count(&kinds, kind::AUDIO) > 50, "{} audio packets: {kinds:?}", count(&kinds, kind::AUDIO));
+        assert!(count(&kinds, kind::VIDEO) > 10);
+        // One that says it doesn't: none.
+        let (kinds, _) = session_with(Message::Hello(client_hello(false)).encode(), Sound::Tone, 1.0);
+        assert_eq!(count(&kinds, kind::AUDIO), 0);
+        assert!(count(&kinds, kind::VIDEO) > 10);
+        // An older client (Hello version 1: no features, and audio: 0, as every web client before sound
+        // said): none either.
+        let mut old = Message::Hello(client_hello(false)).encode();
+        old.truncate(old.len() - 4);
+        old[1] = 1;
+        let len = (old.len() - rr_proto::HEADER_LEN) as u32;
+        old[3..7].copy_from_slice(&len.to_le_bytes());
+        let (kinds, _) = session_with(old, Sound::Tone, 1.0);
+        assert_eq!(count(&kinds, kind::AUDIO), 0);
+        assert!(count(&kinds, kind::VIDEO) > 10);
+        // No sound to be had (no device, no permission): the video streams on its own.
+        let (kinds, _) = session_with(Message::Hello(client_hello(true)).encode(), Sound::Broken, 1.0);
+        assert_eq!(count(&kinds, kind::AUDIO), 0);
+        assert!(count(&kinds, kind::VIDEO) > 10);
+        // And --audio off: the server says it has none.
+        let (kinds, server) = session_with(Message::Hello(client_hello(true)).encode(), Sound::Off, 0.5);
+        assert!(!server.audio);
+        assert_eq!(count(&kinds, kind::AUDIO), 0);
+    }
 
     #[test]
     fn scaled_pictures_map_input_back_to_the_source() {

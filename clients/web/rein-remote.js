@@ -388,6 +388,264 @@ class MseDecoder {
 
 const webcodecs = typeof VideoDecoder !== 'undefined';
 
+// ---- sound: Opus through WebCodecs into Web Audio, played in time with the picture ----
+
+/*
+ * Every Audio packet carries the capture time of its first sample on the server's clock, the clock
+ * video frames are stamped with. The clocks aren't synced, so sound is placed by a measured offset:
+ * for each frame decoded, (local time − capture time) is how late after capture the picture is ready.
+ * The offset both share is the median of the last ~3 s of those, or later if sound needs more time to
+ * arrive, decode and come out of the speakers (its own median, plus a 15 ms jitter buffer); then the
+ * picture waits for the sound, while there's sound (see presentAt). Each packet plays at capture time +
+ * offset, mapped onto the audio clock at the moment it's heard (getOutputTimestamp, so the output's
+ * own latency counts). Packets in a row play back to back; a small error is taken up by playing a
+ * touch fast or slow (≤1%), one over 20 ms by dropping packets (sound behind) or a gap (ahead).
+ */
+
+const median = (v) => {
+  if (!v.length) return undefined;
+  const s = [...v].sort((a, b) => a - b);
+  return s[s.length >> 1];
+};
+const pct = (v, p) => {
+  if (!v.length) return undefined;
+  const s = [...v].sort((a, b) => a - b);
+  return s[Math.min(s.length - 1, Math.floor(s.length * p))];
+};
+const localUs = () => (performance.timeOrigin + performance.now()) * 1000;
+
+/** Whether this browser plays the server's sound (Opus, 48 kHz, stereo, through WebCodecs). */
+export async function canPlaySound() {
+  if (typeof AudioDecoder === 'undefined' || typeof AudioContext === 'undefined') return false;
+  try {
+    return !!(await AudioDecoder.isConfigSupported({codec: 'opus', sampleRate: 48000, numberOfChannels: 2})).supported;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The offset sound and picture share, from what each needs (µs, local clock − capture clock): the
+ * picture's median, or the sound's median and a jitter buffer when that's later. (Medians: a page
+ * that stalls for a moment delays a burst of packets, which shouldn't move everything for seconds.)
+ */
+export function sharedOffset(videoUs, audioReadyUs, jitterUs = 15_000) {
+  const v = median(videoUs);
+  const a = audioReadyUs.length ? median(audioReadyUs) + jitterUs : undefined;
+  if (v === undefined) return a;
+  return a === undefined ? v : Math.max(v, a);
+}
+
+/**
+ * Where a packet goes, given where the last one ended (`playhead`, audio-clock seconds, 0: none
+ * yet), where it should be heard (`want`), how long it is, the earliest it can still start, and
+ * whether it's (nearly) silent: a silent one moves to where it should be at once (nobody hears a
+ * gap or a skip in silence). Returns {at, rate, playhead} to play it, or {drop: true} to skip it.
+ */
+export function placePacket(playhead, want, duration, earliest, quiet = false) {
+  const err = playhead ? playhead - want : Infinity; // > 0: the sound runs behind the picture
+  if (Math.abs(err) > 0.02 || (quiet && Math.abs(err) > 0.001)) {
+    // Off by more than 20 ms: start again where it should be; too late for that, drop it (and the
+    // ones after it, until the sound has caught up).
+    if (want < earliest) return {drop: true, playhead: playhead && err > 0.02 ? playhead : 0};
+    return {at: want, rate: 1, playhead: want + duration};
+  }
+  // Back to back, a little fast while behind, a little slow while ahead: 1% at most, inaudible.
+  const at = Math.max(playhead, earliest);
+  const rate = 1 + Math.max(-0.01, Math.min(0.01, (at - want) / 0.5));
+  return {at, rate, playhead: at + duration / rate};
+}
+
+/** How far ahead of its sound the picture is drawn when it waits for it (µs). */
+const SYNC_SLACK_US = 12_000;
+
+function makeSound(stats, measure, parent, sync = true) {
+  const ctx = new AudioContext({latencyHint: 'interactive', sampleRate: 48000});
+  const out = ctx.createGain();
+  out.connect(ctx.destination);
+  const a = (stats.audio = {state: ctx.state, decoder: 'opus (WebCodecs)', packets: 0, played: 0, dropped: 0, gaps: 0, offsetMs: null, videoMs: null, audioMs: null, arriveMs: null, holdMs: 0, sync, outputLatencyMs: 0});
+  // The last ~3 s of each (frames at 60 a second, packets at 100).
+  const videoUs = [], readyUs = [], arriveUs = [];
+  let playhead = 0, offsetUs, base, loudAt = -Infinity, running = 0;
+  const update = () => {
+    const o = sharedOffset(videoUs, readyUs);
+    if (o === undefined) return;
+    // Moved only for a change worth it, so the sound doesn't wander with each frame.
+    if (offsetUs === undefined || Math.abs(o - offsetUs) > 2000) offsetUs = o;
+    a.offsetMs = +(offsetUs / 1000).toFixed(1);
+  };
+  // Audio-clock time at which a local time (µs) is heard, from the output's own timestamp.
+  const toCtx = (us) => {
+    const ts = ctx.getOutputTimestamp?.();
+    const perf = us / 1000 - performance.timeOrigin;
+    if (ts?.performanceTime) return ts.contextTime + (perf - ts.performanceTime) / 1000;
+    return ctx.currentTime + (ctx.outputLatency || ctx.baseLatency || 0) + (perf - performance.now()) / 1000;
+  };
+  const toLocalUs = (ctxTime) => {
+    const ts = ctx.getOutputTimestamp?.();
+    if (ts?.performanceTime) return (performance.timeOrigin + ts.performanceTime + (ctxTime - ts.contextTime) * 1000) * 1000;
+    return localUs() + (ctxTime - ctx.currentTime - (ctx.outputLatency || 0)) * 1e6;
+  };
+  const decoder = new AudioDecoder({
+    output: (data) => {
+      const n = data.numberOfFrames;
+      const tsUs = data.timestamp + base;
+      let quiet = true;
+      const buf = ctx.createBuffer(2, n, 48000);
+      for (let c = 0; c < 2; c++) {
+        const plane = new Float32Array(n);
+        data.copyTo(plane, {planeIndex: Math.min(c, data.numberOfChannels - 1), format: 'f32-planar'});
+        buf.copyToChannel(plane, c);
+        // Sound worth keeping the picture in time with: louder than -50 dBFS.
+        if (c === 0) {
+          quiet = plane.reduce((acc, x) => acc + x * x, 0) / n < 1e-5;
+          if (!quiet) loudAt = performance.now();
+        }
+      }
+      data.close();
+      a.outputLatencyMs = +((ctx.outputLatency || ctx.baseLatency || 0) * 1000).toFixed(1);
+      if (ctx.state !== 'running') return;
+      // The earliest this could be heard: what sound needs, for the shared offset (not counting the
+      // first half second, while the output and the decoder warm up).
+      const earliest = ctx.currentTime + 0.004;
+      if (++running > 50) readyUs.push(toLocalUs(earliest) - tsUs);
+      if (readyUs.length > 300) readyUs.shift();
+      update();
+      a.audioMs = +(median(readyUs) / 1000).toFixed(1);
+      if (offsetUs === undefined) return;
+      const placed = placePacket(playhead, toCtx(tsUs + offsetUs), n / 48000, earliest, quiet);
+      if (placed.drop) {
+        a.dropped++;
+        if (!quiet) a.droppedLoud = (a.droppedLoud ?? 0) + 1;
+        playhead = placed.playhead;
+        return;
+      }
+      if (playhead && Math.abs(placed.at - playhead) > 0.001) a.gaps++;
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.playbackRate.value = placed.rate;
+      src.connect(out);
+      src.start(placed.at);
+      playhead = placed.playhead;
+      a.played++;
+    },
+    error: (e) => (a.decoder = `error: ${e.message ?? e}`),
+  });
+  decoder.configure({codec: 'opus', sampleRate: 48000, numberOfChannels: 2});
+
+  // Browsers start sound only after the person does something on the page: until then, a hint.
+  let hint;
+  const resume = () => ctx.resume().then(() => ((a.state = ctx.state), hint?.remove(), (hint = null)), () => {});
+  const gestures = ['pointerdown', 'keydown', 'touchend'];
+  const onGesture = () => {
+    resume();
+    if (ctx.state === 'running') gestures.forEach((g) => document.removeEventListener(g, onGesture, true));
+  };
+  gestures.forEach((g) => document.addEventListener(g, onGesture, true));
+  ctx.onstatechange = () => ((a.state = ctx.state), ctx.state === 'running' && hint && (hint.remove(), (hint = null)));
+  const showHint = () => {
+    if (hint || ctx.state === 'running' || typeof document === 'undefined') return;
+    hint = document.createElement('button');
+    hint.textContent = 'Tap for sound';
+    hint.setAttribute('aria-label', 'Turn on sound');
+    hint.style.cssText = 'position:absolute;left:12px;top:12px;z-index:2147483646;font:13px system-ui,sans-serif;padding:6px 12px;border-radius:16px;border:0;background:rgba(0,0,0,.65);color:#fff;cursor:pointer';
+    hint.onclick = (e) => (e.stopPropagation(), resume());
+    if (parent && getComputedStyle(parent).position === 'static') parent.style.position = 'relative';
+    (parent ?? document.body).append(hint);
+  };
+
+  // Measuring (the test pattern): when each beep starts, as heard, and when each flash was drawn.
+  const beeps = [], flashes = [];
+  stats.avSyncMs = [];
+  const pair = () => {
+    // Each beep with the flash nearest it (they come a second apart; within 300 ms is the same one).
+    while (beeps.length && flashes.length) {
+      const b = beeps[0];
+      const f = flashes.reduce((x, y) => (Math.abs(y - b) < Math.abs(x - b) ? y : x));
+      if (Math.abs(f - b) > 300) {
+        // No flash for it yet, or none at all: wait a little, then forget it.
+        if (performance.now() - b > 1000) beeps.shift();
+        else break;
+        continue;
+      }
+      stats.avSyncMs.push(+(b - f).toFixed(1));
+      if (stats.avSyncMs.length > 1000) stats.avSyncMs.shift();
+      beeps.shift();
+      flashes.splice(flashes.indexOf(f), 1);
+    }
+    while (flashes.length && performance.now() - flashes[0] > 2000) flashes.shift();
+  };
+  if (measure && ctx.audioWorklet) {
+    // Onsets found sample by sample on what goes out: |x| over 0.1 after 50 ms of quiet.
+    const code = `registerProcessor('rr-onset', class extends AudioWorkletProcessor {
+      constructor() { super(); this.quiet = 0; }
+      process([input]) {
+        const x = input[0];
+        if (x) for (let i = 0; i < x.length; i++) {
+          if (Math.abs(x[i]) > 0.1) { if (this.quiet > 2400) this.port.postMessage((currentFrame + i) / sampleRate); this.quiet = 0; }
+          else this.quiet++;
+        }
+        return true;
+      }
+    });`;
+    ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([code], {type: 'text/javascript'}))).then(() => {
+      const node = new AudioWorkletNode(ctx, 'rr-onset');
+      out.connect(node);
+      node.port.onmessage = (e) => (beeps.push(toLocalUs(e.data) / 1000 - performance.timeOrigin), pair());
+    }, () => {});
+  }
+
+  return {
+    packet(tsUs, data) {
+      a.packets++;
+      // How long after capture packets arrive (for the stats: the network and the server's share).
+      arriveUs.push(localUs() - tsUs);
+      if (arriveUs.length > 100) arriveUs.shift();
+      a.arriveMs = +(median(arriveUs) / 1000).toFixed(1);
+      showHint();
+      // Timestamps from the first packet on (µs fits a double either way; small ones are tidier).
+      base ??= tsUs;
+      try {
+        decoder.decode(new EncodedAudioChunk({type: 'key', timestamp: tsUs - base, data}));
+      } catch (e) {
+        a.decoder = `error: ${e.message ?? e}`;
+      }
+    },
+    /** A frame was decoded now, captured at `captureUs` (server clock). */
+    decoded(captureUs) {
+      videoUs.push(localUs() - captureUs);
+      if (videoUs.length > 180) videoUs.shift();
+      a.videoMs = +(median(videoUs) / 1000).toFixed(1);
+      update();
+    },
+    /**
+     * When to draw a frame captured at `captureUs` (performance.now ms), or undefined for now: while
+     * sound plays (something louder than -50 dBFS in the last 5 s) and the shared offset is longer
+     * than the picture's own, the picture waits, to SYNC_SLACK before its sound (sound a touch late
+     * is what people notice least) and 100 ms at most.
+     */
+    presentAt(captureUs) {
+      if (!sync || offsetUs === undefined || ctx.state !== 'running' || performance.now() - loudAt > 5000) return (a.holdMs = 0), undefined;
+      const wait = Math.min((captureUs + offsetUs - SYNC_SLACK_US - localUs()) / 1000, 100);
+      a.holdMs = Math.max(0, +wait.toFixed(1));
+      return wait > 0.5 ? performance.now() + wait : undefined;
+    },
+    /** The test pattern's flash was drawn now. */
+    flash() {
+      flashes.push(performance.now());
+      pair();
+    },
+    close() {
+      gestures.forEach((g) => document.removeEventListener(g, onGesture, true));
+      hint?.remove();
+      try {
+        decoder.close();
+      } catch {}
+      ctx.close();
+    },
+  };
+}
+
 // ---- the connection ----
 
 /**
@@ -458,6 +716,11 @@ function openLink(url, wt) {
       for (;;) {
         const {value, done} = await reader.read().catch(() => ({done: true}));
         if (done) return;
+        // Sound comes whole, a protocol frame a datagram (its first byte its kind); video in shards.
+        if (value[0] === K.AUDIO) {
+          link.ondata(value);
+          continue;
+        }
         const frame = link.fec.push(value);
         if (frame) link.ondata(frame);
       }
@@ -558,10 +821,18 @@ export function connect(url, canvas, opts = {}) {
   // Through a relay, sealed end to end: the key is in the page's address after # (never sent to a server).
   const e2eKey = opts.e2eKey ?? (typeof location !== 'undefined' ? new URLSearchParams(location.hash.slice(1)).get('k') : null);
   const link = e2eKey ? sealed(openLink(url, opts.webtransport), e2eKey) : openLink(url, opts.webtransport);
-  const stats = {frames: 0, keyframes: 0, bytes: 0, decoder: '', rttMs: 0, state: 'connecting', error: '', glassMs: [], refreshHz: 0, fps: 0};
+  const stats = {frames: 0, keyframes: 0, bytes: 0, decoder: '', rttMs: 0, state: 'connecting', error: '', glassMs: [], refreshHz: 0, fps: 0, audio: null};
+  // Sound, unless turned off (`audio: false`) or the browser can't play it.
+  const soundOk = opts.audio === false ? Promise.resolve(false) : canPlaySound();
+  // Sound and picture in time (the picture waits for the sound while it plays); `sync: false` (or
+  // ?sync=off) keeps the picture as early as it can be, the sound as it comes.
+  const syncAv = opts.sync ?? !(typeof location !== 'undefined' && new URLSearchParams(location.search).get('sync') === 'off');
+  let sound = null;
+  // Capture times of frames being decoded (frame number → µs, server clock), for the sound's offset.
+  const captured = new Map();
   // Measured while the connection opens.
   const refresh = opts.refreshMhz !== undefined ? Promise.resolve(opts.refreshMhz) : measureRefresh();
-  let config, decoder, waitKey = true, lost = 0, codec;
+  let config, decoder, waitKey = true, lost = 0, codec, wasLit = false;
   const sent = new Map(); // frame number → received time (µs, client clock)
   const shown = []; // when the last second's frames were shown
   const send = (bytes) => link.send(bytes);
@@ -583,14 +854,65 @@ export function connect(url, canvas, opts = {}) {
     w.u8(caps.length);
     for (const [id, hw] of caps) (w.u8(id), w.u8(hw));
     w.u16(screen.width * devicePixelRatio); w.u16(screen.height * devicePixelRatio); w.u16(240);
-    w.u8(0); // audio: not yet
+    // Sound: this plays Opus.
+    const plays = await soundOk;
+    if (plays) {
+      try {
+        sound = makeSound(stats, measure, canvas.parentNode, syncAv);
+      } catch {}
+    }
+    w.u8(sound ? 1 : 0);
     w.u8(1 | 2 | 4); // pointer, keyboard, touch
     // Hello version 1: this display's refresh rate, measured, so the server paces to it.
     stats.refreshHz = (await refresh) / 1000;
     w.u32(await refresh);
-    // Hello version 2: video as datagrams with parity, over WebTransport.
-    w.u32(link.fec && opts.datagrams !== false ? 1 : 0);
+    // Hello version 2: video as datagrams with parity, over WebTransport; sound as datagrams too.
+    const dgrams = link.fec && opts.datagrams !== false;
+    // (Bit 1: video datagrams; 2: a direct path, native clients only; 4: sound as datagrams.)
+    w.u32((dgrams ? 1 : 0) | (dgrams && sound ? 4 : 0));
     return w.frame(K.HELLO, 2);
+  };
+
+  // Drawing a frame: the canvas, then what's measured on it.
+  const present = (frame) => {
+    if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+      canvas.width = frame.displayWidth;
+      canvas.height = frame.displayHeight;
+    }
+    ctx.drawImage(frame.image ?? frame, 0, 0);
+    frame.close();
+    if (measure && canvas.height >= 24 && canvas.width >= 34 * 24) {
+      const row = ctx.getImageData(0, canvas.height - 12, 34 * 24, 1).data;
+      const bit = (k) => row[(k * 24 + 12) * 4 + 1] > 128;
+      if (bit(0) && !bit(1)) {
+        let ms = 0;
+        for (let k = 2; k < 34; k++) ms = ms * 2 + (bit(k) ? 1 : 0);
+        const now = Date.now() % 2 ** 32;
+        const d = (now - ms + 2 ** 32) % 2 ** 32;
+        if (d < 10_000) stats.glassMs.push(d), stats.glassMs.length > 1000 && stats.glassMs.shift();
+      }
+    }
+    // The flash in the test pattern's top left sixth (measuring sound against picture).
+    if (measure && sound && canvas.width >= 60) {
+      const px = ctx.getImageData(Math.floor(canvas.width / 12), Math.floor(canvas.height / 12), 1, 1).data;
+      const lit = px[0] > 200 && px[1] > 200 && px[2] > 200;
+      if (lit && !wasLit) sound.flash();
+      wasLit = lit;
+    }
+    stats.frames++;
+    // Frames shown in the last second.
+    const t = performance.now();
+    shown.push(t);
+    while (shown[0] < t - 1000) shown.shift();
+    stats.fps = shown.length;
+  };
+  // Frames waiting to be drawn with their sound, in order, each at its time (performance.now ms).
+  const held = [];
+  let heldTimer = 0;
+  const flush = () => {
+    clearTimeout(heldTimer);
+    while (held.length && held[0].due <= performance.now() + 0.5) present(held.shift().frame);
+    if (held.length) heldTimer = setTimeout(flush, held[0].due - performance.now());
   };
 
   const makeDecoder = () => {
@@ -599,33 +921,15 @@ export function connect(url, canvas, opts = {}) {
     } catch {}
     decoder = new (webcodecs ? VideoDecoder : MseDecoder)({
       output: (frame) => {
-        if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
-          canvas.width = frame.displayWidth;
-          canvas.height = frame.displayHeight;
-        }
-        ctx.drawImage(frame.image ?? frame, 0, 0);
-        if (measure && canvas.height >= 24 && canvas.width >= 34 * 24) {
-          const row = ctx.getImageData(0, canvas.height - 12, 34 * 24, 1).data;
-          const bit = (k) => row[(k * 24 + 12) * 4 + 1] > 128;
-          if (bit(0) && !bit(1)) {
-            let ms = 0;
-            for (let k = 2; k < 34; k++) ms = ms * 2 + (bit(k) ? 1 : 0);
-            const now = Date.now() % 2 ** 32;
-            const d = (now - ms + 2 ** 32) % 2 ** 32;
-            if (d < 10_000) stats.glassMs.push(d), stats.glassMs.length > 1000 && stats.glassMs.shift();
-          }
-        }
         const n = Number(frame.timestamp);
-        frame.close();
-        stats.frames++;
-        // Frames shown in the last second.
-        const t = performance.now();
-        shown.push(t);
-        while (shown[0] < t - 1000) shown.shift();
-        stats.fps = shown.length;
+        const capturedUs = captured.get(n);
+        captured.delete(n);
+        // How late after capture the picture is ready here: the offset the sound plays at.
+        if (sound && capturedUs !== undefined) sound.decoded(capturedUs);
         const received = sent.get(n);
         sent.delete(n);
-        // Feedback: what arrived and when it was on screen (drives the server's rate control).
+        // Feedback: what arrived and when it was decoded (drives the server's rate control), sent
+        // now, whether or not the frame waits for its sound (a wait isn't the link's).
         const w = new W();
         w.u32(n); w.u64(received ?? nowUs()); w.u64(nowUs()); w.u16(lost);
         // Version 1: the share of datagrams lost (the server sends parity for it).
@@ -633,6 +937,14 @@ export function connect(url, canvas, opts = {}) {
         if (link.fec) (stats.fecRecovered = link.fec.recovered), (stats.fecLost = link.fec.lost);
         lost = 0;
         send(w.frame(K.FEEDBACK, 1));
+        // While sound plays and needs longer than the picture to be heard, the picture waits for it
+        // (a WebCodecs frame can be held; Media Source plays live).
+        const due = webcodecs && capturedUs !== undefined ? sound?.presentAt(capturedUs) : undefined;
+        if (due === undefined && !held.length) return present(frame);
+        held.push({frame, due: due ?? 0});
+        // A hardware decoder has only a few frames to give: never hold more than 4.
+        while (held.length > 4) present(held.shift().frame);
+        flush();
       },
       error: (e) => {
         stats.error = String(e.message ?? e);
@@ -692,8 +1004,10 @@ export function connect(url, canvas, opts = {}) {
         } else if (f.kind === K.VIDEO) {
           const key = (f.flags & FLAG_KEYFRAME) !== 0;
           const n = r.u32();
-          r.u64(); // capture time, server clock
+          const capturedUs = Number(r.u64()); // capture time, server clock
           const data = r.bytes();
+          captured.set(n, capturedUs);
+          if (captured.size > 300) captured.delete(captured.keys().next().value);
           stats.bytes += data.length;
           if (waitKey && !key) {
             lost++;
@@ -725,6 +1039,10 @@ export function connect(url, canvas, opts = {}) {
             continue;
           }
           decodeOne({key, n, data});
+        } else if (f.kind === K.AUDIO) {
+          const ts = Number(r.u64());
+          const data = r.bytes();
+          sound?.packet(ts, data);
         } else if (f.kind === K.CURSOR) {
           const x = r.u16(), y = r.u16(), visible = r.u8() !== 0;
           if (r.u8() === 1) {
@@ -945,7 +1263,7 @@ export function connect(url, canvas, opts = {}) {
     stats,
     /** Show the device's on-screen keyboard (call it from a tap: browsers allow it only then). */
     keyboard: () => keys.focus({preventScroll: true}),
-    close: () => (link.close(), decoder?.close?.(), keys.remove(), pointer.remove()),
+    close: () => (link.close(), decoder?.close?.(), sound?.close(), keys.remove(), pointer.remove()),
   };
 }
 

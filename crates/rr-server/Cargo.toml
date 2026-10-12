@@ -13,6 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 openh264-sys2 = "0.6.6"
+# libopus (BSD), built from its source by CMake and linked in statically.
+opusic-sys = "0.7.5"
 rr-proto = {path = "../rr-proto"}
 rr-client = {path = "../rr-client"}
 aes-gcm = "0.10.3"
@@ -64,10 +66,13 @@ windows = { version = "0.62.2", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
     "Win32_System_LibraryLoader",
     "Win32_System_Ole",
+    "Win32_System_Performance",
     "Win32_System_Variant",
     "Win32_System_WinRT",
     "Win32_System_WinRT_Direct3D11",

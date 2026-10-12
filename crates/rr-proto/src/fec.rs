@@ -541,7 +541,8 @@ mod tests {
             std::fs::write(path, &want).unwrap();
         }
         assert!(
-            std::fs::read_to_string(path).is_ok_and(|have| have == want),
+            // A Windows checkout may have turned its line ends into CRLF.
+            std::fs::read_to_string(path).is_ok_and(|have| have.replace("\r\n", "\n") == want),
             "run with RR_WRITE_VECTORS=1 to update {path}"
         );
     }

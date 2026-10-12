@@ -52,6 +52,15 @@ pub trait Link {
     fn waiting_for_viewer(&self) -> bool {
         false
     }
+    /// Queue an audio packet (a whole `Audio` frame): in order with the control messages, or as a
+    /// datagram of its own once `use_audio_datagrams` said yes.
+    fn send_audio(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+        self.send_bytes(bytes, false)
+    }
+    /// Audio from now on as datagrams (the client said it takes them). False: no datagrams here.
+    fn use_audio_datagrams(&mut self) -> bool {
+        false
+    }
 }
 
 // ---- WebSocket ----
@@ -159,6 +168,8 @@ pub enum Out {
     Frame(Vec<u8>),
     /// A frame as datagrams (data and parity shards).
     Datagrams(Vec<Vec<u8>>),
+    /// An audio packet, a datagram of its own.
+    Datagram(Vec<u8>),
 }
 
 pub struct WtLink {
@@ -175,6 +186,7 @@ pub struct WtLink {
     seq: u32,
     datagram_seq: u16,
     max_datagram: Arc<AtomicUsize>,
+    audio_datagrams: bool,
 }
 
 /// Frames that may be on their way at once before the link counts as backed up.
@@ -230,6 +242,21 @@ impl Link for WtLink {
 
     fn set_parity(&mut self, parity: f32) {
         self.parity = parity.clamp(0.0, 1.0);
+    }
+
+    fn send_audio(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+        let fits = bytes.len() <= self.max_datagram.load(Ordering::Relaxed);
+        let out = if self.audio_datagrams && fits {
+            Out::Datagram(bytes)
+        } else {
+            Out::Control(bytes)
+        };
+        self.out.send(out).map_err(|_| "the WebTransport session ended".to_string())
+    }
+
+    fn use_audio_datagrams(&mut self) -> bool {
+        self.audio_datagrams = self.max_datagram.load(Ordering::Relaxed) > 0;
+        self.audio_datagrams
     }
 }
 
@@ -318,6 +345,7 @@ where
                         seq: 0,
                         datagram_seq: 0,
                         max_datagram: max_datagram.clone(),
+                        audio_datagrams: false,
                     };
                     std::thread::spawn(move || session(Box::new(link)));
                     // From the client: whole protocol frames, from however the stream cut them.
@@ -353,6 +381,9 @@ where
                                     max_datagram.store(m, Ordering::Relaxed);
                                 }
                                 in_flight.fetch_sub(1, Ordering::SeqCst);
+                            }
+                            Out::Datagram(b) => {
+                                let _ = conn.send_datagram(b);
                             }
                             Out::Frame(b) => {
                                 let (conn, in_flight) = (conn.clone(), in_flight.clone());
@@ -427,5 +458,10 @@ impl Link for E2eLink {
 
     fn waiting_for_viewer(&self) -> bool {
         self.inner.waiting_for_viewer()
+    }
+
+    fn send_audio(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+        let sealed = self.e2e.seal(&bytes);
+        self.inner.send_audio(sealed)
     }
 }
