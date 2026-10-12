@@ -926,7 +926,7 @@ mod tests {
         let Some(mut enc) = open(w, h, 2000) else { return };
         let mut frame = vec![40u8; w * h * 4];
         let first = one(&mut enc, &frame, w * 4, 1).expect("a first frame");
-        assert!(first.keyframe);
+        assert!(first.keyframe && nal_types(&first.data).any(|t| t == 5), "an IDR frame first");
         assert!(first.data.starts_with(&[0, 0, 0, 1]) || first.data.starts_with(&[0, 0, 1]));
         assert!(nal_types(&first.data).any(|t| t == 7), "SPS before the keyframe");
         assert!(nal_types(&first.data).any(|t| t == 8), "PPS before the keyframe");
@@ -935,12 +935,12 @@ mod tests {
                 px.copy_from_slice(&[255, 255, 255, 255]);
             }
             let delta = one(&mut enc, &frame, w * 4, n).expect("a delta frame");
-            assert!(!delta.keyframe, "frame {n} is a delta");
+            assert!(!delta.keyframe && !nal_types(&delta.data).any(|t| t == 5), "frame {n} is a delta");
             assert!(delta.data.len() < first.data.len() * 2);
         }
         enc.keyframe();
         let forced = one(&mut enc, &frame, w * 4, 10).expect("a forced frame");
-        assert!(forced.keyframe, "a keyframe on request");
+        assert!(forced.keyframe && nal_types(&forced.data).any(|t| t == 5), "an IDR frame on request");
         assert!(nal_types(&forced.data).any(|t| t == 7), "SPS before every keyframe");
         println!("keyframe {} bytes, forced keyframe {} bytes", first.data.len(), forced.data.len());
     }
