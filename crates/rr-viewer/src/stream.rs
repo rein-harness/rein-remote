@@ -56,6 +56,8 @@ pub struct Options {
     pub prefer: Prefer,
     /// Read the test pattern's barcode from each picture.
     pub measure: bool,
+    /// Pictures as the decoder made them, not copied, where it can (a window on macOS).
+    pub zero_copy: bool,
 }
 
 /// Runs the stream until the session ends (or `stop` says so), calling `update` as things change.
@@ -94,7 +96,8 @@ pub fn run(session: Session, shared: Arc<Shared>, opts: Options, stop: impl Fn()
                     let mut notes = Vec::new();
                     decoder = None;
                     match decode::open(c.codec, c.width as usize, c.height as usize, opts.prefer, &mut notes) {
-                        Ok(d) => {
+                        Ok(mut d) => {
+                            d.set_zero_copy(opts.zero_copy);
                             eprintln!("rein-remote-viewer: decoding with {}", d.name());
                             let (name, hw) = (d.name(), d.hardware());
                             decoder = Some(d);

@@ -35,12 +35,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const USAGE: &str = "usage: rein-remote-viewer [URL|NAME] [--pair CODE] [--decoder auto|hardware|software] [--measure] [--seconds N] [--json] [--fullscreen] [--webtransport on|off] [--datagrams on|off] [--direct on|off] [--name NAME]
-       rein-remote-viewer URL|NAME --headless [--frames N] [--seconds N] [--move X,Y] [--decoder …] [--json]
+       rein-remote-viewer URL|NAME --headless [--frames N] [--seconds N] [--move X,Y] [--type TEXT] [--decoder …] [--json]
 
   With no URL or name: a list of the machines on this network to pick from.
   --measure: read the test pattern's barcode (rein-remote serve --test-pattern) for glass-to-glass latency.
   --headless: no window; decode N frames (default 120) and report.
-  --move X,Y: send the pointer there and check the picture shows it (the test pattern draws a cross).";
+  --move X,Y: send the pointer there and check it got there (the test pattern draws a cross; a real
+    screen's pointer comes back at that place).
+  --type TEXT: type it as keys (key names, as the window sends them), once frames come.";
 
 pub struct Args {
     pub target: Option<String>,
@@ -52,6 +54,7 @@ pub struct Args {
     pub headless: bool,
     pub frames: u64,
     pub move_to: Option<(u16, u16)>,
+    pub type_text: Option<String>,
     pub fullscreen: bool,
 }
 
@@ -71,6 +74,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
         headless: false,
         frames: 120,
         move_to: None,
+        type_text: None,
         fullscreen: false,
     };
     let mut it = args.iter();
@@ -97,6 +101,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
                 let (x, y) = v.split_once(',').ok_or("--move X,Y")?;
                 a.move_to = Some((x.trim().parse().map_err(|_| "--move X,Y")?, y.trim().parse().map_err(|_| "--move X,Y")?));
             }
+            "--type" => a.type_text = Some(val()?),
             "--fullscreen" => a.fullscreen = true,
             "--webtransport" => a.client.webtransport = on(val()?),
             "--datagrams" => a.client.datagrams = on(val()?),
@@ -137,8 +142,10 @@ pub struct Report {
     pub glass: Vec<f64>,
     /// Capture to decoded, ms, from the session's clock estimate (any source, not just the pattern).
     pub latency: Vec<f64>,
-    /// Pointer sent to the cross seen in a decoded picture, ms.
+    /// Pointer sent to it seen where it was sent (the cross in a decoded picture, or the server's
+    /// pointer there), ms, and which.
     pub input_ms: Option<f64>,
+    pub input_seen: &'static str,
     pub cpu_start: Duration,
     pub wall_start: Option<Instant>,
 }
@@ -221,7 +228,7 @@ impl Report {
                 self.cpu_percent()
             );
             if let Some(m) = self.input_ms {
-                println!("  input: the pointer showed in the picture {m:.1} ms after it was sent");
+                println!("  input: the pointer showed {} {m:.1} ms after it was sent", self.input_seen);
             }
             if s.keyframe_requests > 0 || s.errors > 0 {
                 println!("  {} decode errors, {} keyframes asked for", s.errors, s.keyframe_requests);
@@ -248,10 +255,22 @@ fn headless(a: Args) -> Result<(), String> {
         stream::Options {
             prefer: a.prefer,
             measure: true,
+            zero_copy: false,
         },
         || done.load(Ordering::Relaxed) || started.elapsed() > limit,
         |u| {
-            if !matches!(u, stream::Update::Frame) {
+            let c = match u {
+                stream::Update::Frame => None,
+                stream::Update::Cursor(c) => Some(c),
+                stream::Update::Status => return,
+            };
+            // A real screen's pointer: the server says where it is, which is where it was sent.
+            if let (Some(c), Some((x, y)), Some(t)) = (c, a.move_to, *moved.lock().unwrap()) {
+                let mut r = report.lock().unwrap();
+                if r.input_ms.is_none() && c.x.abs_diff(x) <= 2 && c.y.abs_diff(y) <= 2 {
+                    r.input_ms = Some(t.elapsed().as_secs_f64() * 1000.0);
+                    r.input_seen = "at the server's pointer";
+                }
                 return;
             }
             let Some(pic) = shared.latest.lock().unwrap().take() else { return };
@@ -261,14 +280,29 @@ fn headless(a: Args) -> Result<(), String> {
             if let Some((x, y)) = a.move_to {
                 let mut m = moved.lock().unwrap();
                 match *m {
-                    None if r.frames >= 5 => {
+                    None => {
                         control.input(rr_proto::Input::PointerMove { x, y });
                         *m = Some(Instant::now());
                     }
                     Some(t) if r.input_ms.is_none() && cross_at(&pic, x as usize, y as usize) => {
                         r.input_ms = Some(t.elapsed().as_secs_f64() * 1000.0);
+                        r.input_seen = "in the picture";
                     }
                     _ => {}
+                }
+            }
+            if let Some(text) = &a.type_text {
+                if r.frames == 1 {
+                    for ch in text.chars() {
+                        let key = if ch == '\n' { "Enter".to_string() } else { ch.to_string() };
+                        for down in [true, false] {
+                            control.input(rr_proto::Input::Key {
+                                hid: 0,
+                                down,
+                                key: key.clone(),
+                            });
+                        }
+                    }
                 }
             }
             let enough = r.frames >= a.frames && (a.move_to.is_none() || r.input_ms.is_some());
@@ -286,7 +320,7 @@ fn headless(a: Args) -> Result<(), String> {
         return Err(format!("{} frames decoded of {} ({})", r.frames, a.frames, status.state));
     }
     if a.move_to.is_some() && r.input_ms.is_none() {
-        return Err("the pointer was sent but never showed in the picture".into());
+        return Err("the pointer was sent but never showed where it was sent".into());
     }
     Ok(())
 }

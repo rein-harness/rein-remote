@@ -14,13 +14,15 @@ const BLOCK: usize = 24;
 
 /// The capture time the test pattern drew into `pic` (ms, mod 2^32), when it has one.
 pub fn barcode(pic: &Picture) -> Option<u32> {
-    let bgra = pic.bytes();
-    if pic.h < BLOCK || pic.w < 34 * BLOCK || bgra.len() < pic.w * pic.h * 4 {
+    if pic.h < BLOCK || pic.w < 34 * BLOCK {
         return None;
     }
     // The middle of each block, half a block up from the bottom; green, as the web client reads.
-    let row = (pic.h - BLOCK / 2) * pic.w;
-    let bit = |k: usize| bgra[(row + k * BLOCK + BLOCK / 2) * 4 + 1] > 128;
+    let row = pic.row(pic.h - BLOCK / 2);
+    if row.len() < 34 * BLOCK {
+        return None;
+    }
+    let bit = |k: usize| (row[k * BLOCK + BLOCK / 2] >> 8 & 255) > 128;
     if !bit(0) || bit(1) {
         return None;
     }

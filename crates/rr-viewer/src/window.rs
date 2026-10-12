@@ -81,6 +81,8 @@ pub fn run(args: Args) -> Result<(), String> {
         shown: None,
         measured: None,
         gpu_scale: false,
+        #[cfg(target_os = "macos")]
+        video: None,
         rect: Rect::default(),
         cursor: None,
         remote_at: (0, 0),
@@ -145,6 +147,9 @@ struct App {
     measured: Option<u32>,
     /// The compositor scales the picture (macOS), so the buffer is the picture's size.
     gpu_scale: bool,
+    /// macOS: the decoder's pictures shown as they are, and the pointer over them.
+    #[cfg(target_os = "macos")]
+    video: Option<crate::mac_layer::VideoLayer>,
     rect: Rect,
     cursor: Option<CursorImage>,
     remote_at: (u16, u16),
@@ -187,6 +192,8 @@ impl App {
         let sopts = stream::Options {
             prefer: self.args.prefer,
             measure: self.args.measure,
+            // macOS: the decoder's pictures go to the screen as they are (mac_layer.rs).
+            zero_copy: cfg!(target_os = "macos"),
         };
         std::thread::spawn(move || match rr_client::connect(&target, opts) {
             Ok(session) => {
@@ -300,6 +307,10 @@ impl App {
     }
 
     fn draw(&mut self) {
+        #[cfg(target_os = "macos")]
+        if self.draw_layers() {
+            return;
+        }
         let lines = self.overlay();
         let (Some(window), Some(surface)) = (&self.window, &mut self.surface) else {
             return;
@@ -363,6 +374,53 @@ impl App {
                 r.glass.push(g as f64);
             }
         }
+    }
+
+    /// macOS: the decoder's picture as it is, in its layer, and the pointer in its own: true when
+    /// that's what's showing (else softbuffer draws, as everywhere else).
+    #[cfg(target_os = "macos")]
+    fn draw_layers(&mut self) -> bool {
+        let closed = self.status().closed;
+        let (Some(window), Some(video)) = (&self.window, &mut self.video) else {
+            return false;
+        };
+        let pic = match &self.shown {
+            Some(p) if p.surface.is_some() && !closed => p,
+            _ => {
+                video.hide();
+                return false;
+            }
+        };
+        let size = window.inner_size();
+        let scale = window.scale_factor();
+        self.rect = present::fit(pic.w, pic.h, size.width as usize, size.height as usize);
+        let new = self.measured != Some(pic.frame);
+        video.show(if new { pic.surface.as_ref() } else { None });
+        if let Some(c) = &self.cursor {
+            // In points: the window's pixels over its scale; the pointer's pixels are the stream's.
+            let k = self.rect.w as f64 / pic.w.max(1) as f64;
+            let (x, y) = match self.local_at {
+                Some((p, t)) if t.elapsed() < Duration::from_millis(250) => (p.x, p.y),
+                _ => (
+                    self.rect.x as f64 + self.remote_at.0 as f64 * k,
+                    self.rect.y as f64 + self.remote_at.1 as f64 * k,
+                ),
+            };
+            video.place_pointer((x - c.hx as f64 * k) / scale, (y - c.hy as f64 * k) / scale, k / scale, self.remote_visible);
+        }
+        if new {
+            self.measured = Some(pic.frame);
+            if let Some(g) = pic.barcode.and_then(measure::glass_ms) {
+                self.glass_recent.push(g as f64);
+                if self.glass_recent.len() > 120 {
+                    self.glass_recent.drain(..60);
+                }
+                if let Some(r) = &mut self.report {
+                    r.glass.push(g as f64);
+                }
+            }
+        }
+        true
     }
 
     /// The lines over the picture: the picker, or the connection's state when there's no picture.
@@ -468,6 +526,10 @@ impl App {
                         hy: s.hy as usize,
                         rgba: s.rgba,
                     });
+                    #[cfg(target_os = "macos")]
+                    if let Some(v) = &mut self.video {
+                        v.pointer_image(self.cursor.as_ref());
+                    }
                     // The remote pointer is drawn: this one's hidden over the window.
                     if let Some(w) = &self.window {
                         w.set_cursor_visible(!has);
@@ -609,6 +671,7 @@ impl ApplicationHandler<UserEvent> for App {
         #[cfg(target_os = "macos")]
         {
             self.gpu_scale = crate::mac_layer::scale_on_gpu(&window);
+            self.video = crate::mac_layer::VideoLayer::new(&window);
         }
         self.window = Some(window);
         self.update_title(true);

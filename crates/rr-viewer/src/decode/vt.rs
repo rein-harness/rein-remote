@@ -4,9 +4,9 @@
 //! once (no reordering: the server sends none). The session gives BGRA, converted by the hardware, so
 //! the CPU only copies the picture out.
 //!
-//! Straight into a GPU texture (the IOSurface behind each picture) would save that copy, but the
-//! window draws with softbuffer, which takes pixels in memory; at 1080p the copy is about a
-//! millisecond.
+//! In a window, nothing is copied at all ("zero copy"): the picture stays the decoder's (an IOSurface,
+//! GPU memory) and becomes the contents of a Core Animation layer, which the GPU scales and
+//! composites (mac_layer.rs). Headless, it's copied out into memory.
 
 use super::{nal_units, Decoder, Picture};
 use core_foundation::base::{CFRelease, TCFType};
@@ -112,6 +112,7 @@ extern "C" {
     fn CVPixelBufferGetHeight(buf: PixelBuffer) -> usize;
     fn CVPixelBufferRetain(buf: PixelBuffer) -> PixelBuffer;
     fn CVPixelBufferRelease(buf: PixelBuffer);
+    fn CVPixelBufferGetIOSurface(buf: PixelBuffer) -> *mut c_void;
     static kCVPixelBufferPixelFormatTypeKey: CFStringRef;
     static kCVPixelBufferIOSurfacePropertiesKey: CFStringRef;
 }
@@ -145,6 +146,53 @@ extern "C" fn on_frame(refcon: *mut c_void, _frame: *mut c_void, status: i32, _f
     }
 }
 
+/// A decoded picture as the decoder made it (a retained CVPixelBuffer on an IOSurface), held for as
+/// long as this is.
+pub struct Surface(PixelBuffer);
+
+// A retained, immutable picture: any thread may hold or release it.
+unsafe impl Send for Surface {}
+unsafe impl Sync for Surface {}
+
+impl Clone for Surface {
+    fn clone(&self) -> Self {
+        Surface(unsafe { CVPixelBufferRetain(self.0) })
+    }
+}
+
+impl Drop for Surface {
+    fn drop(&mut self) {
+        unsafe { CVPixelBufferRelease(self.0) };
+    }
+}
+
+impl Surface {
+    /// Its IOSurface, what a layer shows (valid for as long as this is held).
+    pub fn io_surface(&self) -> *mut c_void {
+        unsafe { CVPixelBufferGetIOSurface(self.0) }
+    }
+
+    /// Row `y`, `w` pixels of it (read through the CPU: for measuring, a row at a time).
+    pub fn row(&self, y: usize, w: usize) -> Vec<u32> {
+        unsafe {
+            CVPixelBufferLockBaseAddress(self.0, LOCK_READ_ONLY);
+            let (h, stride, base) = (
+                CVPixelBufferGetHeight(self.0),
+                CVPixelBufferGetBytesPerRow(self.0),
+                CVPixelBufferGetBaseAddress(self.0),
+            );
+            let row = if base.is_null() || y >= h {
+                Vec::new()
+            } else {
+                let p = base.add(y * stride) as *const u32;
+                (0..w.min(stride / 4)).map(|x| p.add(x).read_unaligned()).collect()
+            };
+            CVPixelBufferUnlockBaseAddress(self.0, LOCK_READ_ONLY);
+            row
+        }
+    }
+}
+
 pub struct VideoToolbox {
     codec: Codec,
     session: Session,
@@ -154,6 +202,8 @@ pub struct VideoToolbox {
     out: Box<Out>,
     /// The frame as one sample: each NAL unit with its length before it.
     sample: Vec<u8>,
+    /// Pictures handed out as they are (a window shows them), not copied.
+    zero_copy: bool,
 }
 
 // The session is only used by whoever holds the decoder.
@@ -171,6 +221,7 @@ impl VideoToolbox {
             sets: Vec::new(),
             out: Box::default(),
             sample: Vec::new(),
+            zero_copy: false,
         })
     }
 
@@ -271,6 +322,10 @@ impl Decoder for VideoToolbox {
         true
     }
 
+    fn set_zero_copy(&mut self, on: bool) {
+        self.zero_copy = on;
+    }
+
     fn decode(&mut self, data: &[u8], _keyframe: bool, out: &mut Picture) -> Result<bool, String> {
         let hevc = self.codec == Codec::H265;
         // The parameter sets go to the format description; the rest into the sample.
@@ -341,6 +396,15 @@ impl Decoder for VideoToolbox {
                 Some(Err(s)) => return Err(format!("VideoToolbox: decode failed ({s})")),
                 None => return Ok(false),
             };
+            if self.zero_copy {
+                // Handed on as it is: the surface holds the reference.
+                out.w = CVPixelBufferGetWidth(image);
+                out.h = CVPixelBufferGetHeight(image);
+                out.px.clear();
+                out.surface = Some(Surface(image));
+                return Ok(true);
+            }
+            out.surface = None;
             CVPixelBufferLockBaseAddress(image, LOCK_READ_ONLY);
             let (w, h, stride) = (CVPixelBufferGetWidth(image), CVPixelBufferGetHeight(image), CVPixelBufferGetBytesPerRow(image));
             let base = CVPixelBufferGetBaseAddress(image);

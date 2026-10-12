@@ -76,6 +76,13 @@ jobs:
           RR_H264_OUT=/tmp/headers.h264 cargo test -q -p rr-server a_stream_from_these_headers_decodes
           ffmpeg -v error -i /tmp/headers.h264 -f rawvideo -pix_fmt yuv420p /tmp/headers.yuv
           cmp /tmp/headers.yuv /tmp/headers.h264.yuv
+      # The viewer's VA-API decoder reads the stream's headers itself (h264.rs): what it reads from the
+      # encoder's stream, next to what ffmpeg reads, in the log.
+      - name: H.264 headers as the viewer's VA-API decoder reads them, next to ffmpeg's (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          RR_H264_TRACE=/tmp/auto.h264 cargo test -q -p rr-viewer an_openh264_screen_stream -- --nocapture | grep -E '^(sps|pps|slice)' | head -40
+          ffmpeg -v error -i /tmp/auto.h264 -c copy -bsf:v trace_headers -f null - 2>&1 | grep -E 'frame_num|slice_type|first_mb' | head -40
       # Gamepads on the server: a virtual Xbox 360 pad made through uinput and read back through evdev,
       # as games read one (root: the runner's user can't open /dev/uinput or /dev/input); on Windows,
       # what it says without ViGEmBus.
@@ -167,6 +174,11 @@ jobs:
           $v "$url" --headless --frames 60 --webtransport off --decoder software
           # Windows: Media Foundation's decoder on the runner (no GPU: its own software decoding).
           if [ "$RUNNER_OS" = Windows ]; then RR_DECODER=mediafoundation $v "$url" --headless --frames 120 --decoder hardware --move 640,500; fi
+          # Linux: no GPU here, so VA-API must say why it can't, and not decode.
+          if [ "$RUNNER_OS" = Linux ]; then
+            if out=$($v "$url" --headless --frames 10 --seconds 8 --decoder hardware 2>&1); then echo "VA-API decoded without a GPU?"; exit 1; fi
+            echo "$out"; echo "$out" | grep -q "VA-API"
+          fi
           $v "$url" --measure --seconds 5 || { [ "$RUNNER_OS" = macOS ] && echo "no window on this runner"; }
           kill %1 || true
   wasm:

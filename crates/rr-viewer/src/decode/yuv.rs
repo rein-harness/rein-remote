@@ -12,7 +12,7 @@ pub struct Plane<'a> {
 
 /// The chroma of 4:2:0: two planes (I420), or one with U and V interleaved (NV12).
 #[derive(Clone, Copy)]
-#[cfg_attr(not(windows), allow(dead_code))] // NV12 is Media Foundation's and VA-API's
+#[cfg_attr(target_os = "macos", allow(dead_code))] // NV12 is Media Foundation's and VA-API's
 pub enum Chroma<'a> {
     I420(Plane<'a>, Plane<'a>),
     Nv12(Plane<'a>),

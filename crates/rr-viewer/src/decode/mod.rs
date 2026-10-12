@@ -5,13 +5,15 @@
 //! The stream is the server's: Annex B (start codes), the parameter sets before each keyframe, no
 //! B-frames (each frame is shown the moment it's decoded, nothing to reorder).
 
+#[cfg(any(target_os = "linux", test))]
+mod h264;
 #[cfg(windows)]
 mod mf;
 mod software;
 #[cfg(target_os = "linux")]
 mod vaapi;
 #[cfg(target_os = "macos")]
-mod vt;
+pub mod vt;
 pub mod yuv;
 
 use rr_proto::{Codec, CodecCap};
@@ -28,24 +30,36 @@ pub struct Picture {
     pub received_us: u64,
     /// The test pattern's capture time, read from the picture (ms, mod 2^32), when measuring.
     pub barcode: Option<u32>,
+    /// macOS, zero copy: the decoder's own picture (GPU memory, an IOSurface), shown as it is; `px`
+    /// is then empty.
+    #[cfg(target_os = "macos")]
+    pub surface: Option<vt::Surface>,
 }
 
 impl Picture {
     /// Sized for `w`×`h` (keeping its memory when it's the same size).
     pub fn reshape(&mut self, w: usize, h: usize) {
+        #[cfg(target_os = "macos")]
+        {
+            self.surface = None;
+        }
         self.w = w;
         self.h = h;
         self.px.resize(w * h, 0);
     }
 
-    /// The pixels as BGRA bytes, `w * 4` a row.
-    pub fn bytes(&self) -> &[u8] {
-        // SAFETY: a u32's memory is four valid bytes, and u8 needs no alignment.
-        unsafe { std::slice::from_raw_parts(self.px.as_ptr().cast(), self.px.len() * 4) }
+    /// Row `y`'s pixels, wherever the picture is.
+    pub fn row(&self, y: usize) -> Vec<u32> {
+        #[cfg(target_os = "macos")]
+        if let Some(s) = &self.surface {
+            return s.row(y, self.w);
+        }
+        self.px.get(y * self.w..(y + 1) * self.w).map_or_else(Vec::new, <[u32]>::to_vec)
     }
 
+    /// The pixels as BGRA bytes, `w * 4` a row, to decode into.
     pub fn bytes_mut(&mut self) -> &mut [u8] {
-        // SAFETY: as above; any bytes written make a valid u32.
+        // SAFETY: a u32's memory is four bytes, u8 needs no alignment, and any bytes make a u32.
         unsafe { std::slice::from_raw_parts_mut(self.px.as_mut_ptr().cast(), self.px.len() * 4) }
     }
 }
@@ -68,6 +82,9 @@ pub trait Decoder: Send {
     /// One frame in; the picture out, into `out` (true), or none yet (false). An error means the
     /// decoder lost its place: ask for a keyframe and wait for it.
     fn decode(&mut self, data: &[u8], keyframe: bool, out: &mut Picture) -> Result<bool, String>;
+    /// Give pictures as the decoder's own (GPU memory) where it can, for a window that shows them as
+    /// they are (macOS); else they're copied into `px`.
+    fn set_zero_copy(&mut self, _on: bool) {}
 }
 
 /// What this machine decodes, for the Hello (the server picks from these, hardware first).
