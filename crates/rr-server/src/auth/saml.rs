@@ -202,17 +202,27 @@ mod tests {
         path
     }
 
-    /// A response from `idp` (signed with its key) to the request `id`, for `audience`.
-    fn response(idp: &IdentityProvider, cert: &samael::crypto::CertificateDer, user: &str, audience: &str, id: &str) -> String {
-        let group = |v| ResponseAttribute {
+    fn groups() -> Vec<ResponseAttribute<'static>> {
+        vec![ResponseAttribute {
             required_attribute: RequiredAttribute {
                 name: "groups".into(),
                 format: Some("urn:oasis:names:tc:SAML:2.0:attrname-format:basic".into()),
             },
-            value: v,
-        };
-        let r = idp.sign_authn_response(cert, user, audience, ACS, IDP, id, &[group("rr-admins")]).unwrap();
-        base64::engine::general_purpose::STANDARD.encode(r.to_string().unwrap())
+            value: "rr-admins",
+        }]
+    }
+
+    /// A response from `idp` (signed with its key, SHA-256 digests as IdPs sign today) to the request
+    /// `id`, for `audience`.
+    fn response(idp: &IdentityProvider, cert: &samael::crypto::CertificateDer, user: &str, audience: &str, id: &str) -> String {
+        use samael::crypto::{Crypto, CryptoProvider};
+        let mut r = samael::idp::response_builder::build_response_template(cert, user, audience, IDP, ACS, id, &groups());
+        // samael's template digests with SHA-1, which this service provider refuses.
+        for reference in &mut r.signature.as_mut().unwrap().signed_info.reference {
+            reference.digest_method.algorithm = samael::signature::DigestAlgorithm::Sha256;
+        }
+        let signed = Crypto::sign_xml(r.to_string().unwrap(), &idp.export_private_key_der().unwrap()).unwrap();
+        base64::engine::general_purpose::STANDARD.encode(signed)
     }
 
     fn form(resp: &str) -> HashMap<String, String> {
@@ -248,6 +258,12 @@ mod tests {
         let id = request_id(&s);
         assert!(s
             .acs(&form(&response(&key, &cert, "alice@corp.example", "https://other.example", &id)))
+            .is_err());
+        // Digests with SHA-1 (samael's own signer): refused.
+        let id = request_id(&s);
+        let sha1 = key.sign_authn_response(&cert, "alice@corp.example", SP, ACS, IDP, &id, &groups()).unwrap();
+        assert!(s
+            .acs(&form(&base64::engine::general_purpose::STANDARD.encode(sha1.to_string().unwrap())))
             .is_err());
         // Signed by someone else's key.
         let (other, other_cert) = idp();
