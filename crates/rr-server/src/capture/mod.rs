@@ -1,8 +1,11 @@
 //! Screen sources. Each gives frames of BGRA pixels and takes input events. Phase 1: an X11 display
 //! (Linux: a real one, or a virtual display), and a test pattern (any platform: CI, and checking a
-//! client without a display). macOS (ScreenCaptureKit) and Windows (Windows Graphics Capture) come
-//! in phase 3 behind the same trait.
+//! client without a display). Phase 3: macOS (ScreenCaptureKit) and Windows (Windows Graphics
+//! Capture), windows and whole displays, and Linux's scanout (KMS, whose frames stay on the GPU),
+//! behind the same trait.
 
+#[cfg(target_os = "linux")]
+pub mod kms;
 #[cfg(target_os = "macos")]
 pub mod mac;
 pub mod pipe;
@@ -37,19 +40,28 @@ pub trait Source: Send {
     fn generation(&mut self) -> Option<u64> {
         None
     }
-    /// The latest frame as the system's own image (macOS: a CVPixelBuffer in GPU memory), for an
-    /// encoder that takes it as it is: no copy at all. None: use `grab`.
+    /// The latest frame as the system's own image (macOS: a CVPixelBuffer in GPU memory; Windows: a
+    /// D3D11 texture on the capture's device; Linux: the screen's DMA-BUF), for an encoder that takes
+    /// it as it is: no copy through the CPU at all. None: use `grab`.
     fn surface(&mut self) -> Option<Surface> {
         None
     }
 }
 
-/// A frame the hardware encoder reads in place: a retained CVPixelBuffer (macOS).
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // only macOS sources make one so far
+/// A frame the hardware encoder reads in place, held for as long as this is: a retained
+/// CVPixelBuffer (macOS), or a referenced `ID3D11Texture2D` in BGRA (Windows). (Linux: below.)
+#[cfg(not(target_os = "linux"))]
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))] // only macOS and Windows sources make one
 pub struct Surface(pub *mut std::ffi::c_void);
 
 // Retained for as long as it's held; released when dropped.
+#[cfg(not(target_os = "linux"))]
 unsafe impl Send for Surface {}
+
+/// A frame the hardware encoder reads in place: the screen's framebuffer as DMA-BUFs (Linux, KMS),
+/// its file descriptors closed when dropped.
+#[cfg(target_os = "linux")]
+pub struct Surface(pub kms::DmaBuf);
 
 #[cfg(target_os = "macos")]
 impl Drop for Surface {
@@ -58,6 +70,27 @@ impl Drop for Surface {
             fn CFRelease(p: *const std::ffi::c_void);
         }
         unsafe { CFRelease(self.0) }
+    }
+}
+
+#[cfg(windows)]
+impl Surface {
+    /// A texture, the reference handed over (released when the surface is dropped).
+    pub fn texture(t: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D) -> Self {
+        Self(windows::core::Interface::into_raw(t))
+    }
+
+    /// The texture, borrowed for as long as the surface is.
+    pub fn as_texture(&self) -> &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D {
+        unsafe { <windows::Win32::Graphics::Direct3D11::ID3D11Texture2D as windows::core::Interface>::from_raw_borrowed(&self.0) }.expect("a texture")
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Surface {
+    fn drop(&mut self) {
+        // The reference `texture` took over, given back.
+        drop(unsafe { <windows::Win32::Graphics::Direct3D11::ID3D11Texture2D as windows::core::Interface>::from_raw(self.0) });
     }
 }
 
@@ -70,7 +103,9 @@ pub struct Pointer {
     pub visible: bool,
 }
 
-/// A moving pattern with a frame counter: something to stream without a display.
+/// A moving pattern with a frame counter: something to stream without a display. Only what moves
+/// is drawn each frame (the block, the barcode, the pointer's cross), so it costs next to nothing
+/// even at 240 frames a second.
 pub struct TestPattern {
     w: usize,
     h: usize,
@@ -78,6 +113,8 @@ pub struct TestPattern {
     buf: Vec<u8>,
     /// Where the last pointer event landed (drawn as a cross), so input can be seen working.
     pointer: Option<(usize, usize)>,
+    /// What was drawn over the background last frame, to put back: the block's left edge, the cross.
+    drawn: Option<(usize, Option<(usize, usize)>)>,
 }
 
 impl TestPattern {
@@ -88,6 +125,34 @@ impl TestPattern {
             n: 0,
             buf: vec![0; w * h * 4],
             pointer: None,
+            drawn: None,
+        }
+    }
+
+    fn background(&mut self, x0: usize, x1: usize, y0: usize, y1: usize) {
+        let (w, h) = (self.w, self.h);
+        for y in y0..y1.min(h) {
+            for x in x0..x1.min(w) {
+                let i = (y * w + x) * 4;
+                self.buf[i..i + 4].copy_from_slice(&[(x * 255 / w.max(1)) as u8, (y * 255 / h.max(1)) as u8, 64, 255]);
+            }
+        }
+    }
+
+    fn cross(&mut self, (px, py): (usize, usize), color: Option<[u8; 4]>) {
+        let (w, h) = (self.w, self.h);
+        for d in 0..20usize {
+            for (x, y) in [(px + d, py), (px.saturating_sub(d), py), (px, py + d), (px, py.saturating_sub(d))] {
+                if x < w && y < h {
+                    match color {
+                        Some(c) => {
+                            let i = (y * w + x) * 4;
+                            self.buf[i..i + 4].copy_from_slice(&c);
+                        }
+                        None => self.background(x, x + 1, y, y + 1),
+                    }
+                }
+            }
         }
     }
 }
@@ -99,13 +164,14 @@ impl Source for TestPattern {
     fn grab(&mut self) -> Result<Frame<'_>, String> {
         self.n += 1;
         let (w, h, n) = (self.w, self.h, self.n as usize);
-        for y in 0..h {
-            for x in 0..w {
-                let i = (y * w + x) * 4;
-                self.buf[i] = (x * 255 / w.max(1)) as u8;
-                self.buf[i + 1] = (y * 255 / h.max(1)) as u8;
-                self.buf[i + 2] = 64;
-                self.buf[i + 3] = 255;
+        // The background once; after that, only what was drawn over it goes back.
+        match self.drawn.take() {
+            None => self.background(0, w, 0, h),
+            Some((bx, cross)) => {
+                self.background(bx, bx + w / 12, h / 3, h / 3 + h / 6);
+                if let Some(c) = cross {
+                    self.cross(c, None);
+                }
             }
         }
         // A white block moving left to right, one step a frame.
@@ -139,16 +205,10 @@ impl Source for TestPattern {
                 }
             }
         }
-        if let Some((px, py)) = self.pointer {
-            for d in 0..20usize {
-                for (x, y) in [(px + d, py), (px.saturating_sub(d), py), (px, py + d), (px, py.saturating_sub(d))] {
-                    if x < w && y < h {
-                        let i = (y * w + x) * 4;
-                        self.buf[i..i + 4].copy_from_slice(&[0, 0, 255, 255]);
-                    }
-                }
-            }
+        if let Some(p) = self.pointer {
+            self.cross(p, Some([0, 0, 255, 255]));
         }
+        self.drawn = Some((bx, self.pointer));
         Ok(Frame {
             bgra: &self.buf,
             stride: w * 4,
@@ -197,5 +257,30 @@ pub fn keysym(key: &str) -> Option<u32> {
     match (chars.next(), chars.next()) {
         (Some(c), None) => Some(if (c as u32) < 0x100 { c as u32 } else { 0x0100_0000 + c as u32 }),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_test_pattern_drawn_in_parts_is_the_same_as_drawn_whole() {
+        let (w, h) = (320, 240);
+        let mut p = TestPattern::new(w, h);
+        for n in 0..50 {
+            if n == 10 {
+                p.input(&Input::PointerMove { x: 100, y: 50 }).unwrap();
+            }
+            if n == 30 {
+                p.input(&Input::PointerMove { x: 5, y: 200 }).unwrap();
+            }
+            let got = p.grab().unwrap().bgra.to_vec();
+            // The same frame drawn from scratch.
+            let mut fresh = TestPattern::new(w, h);
+            fresh.n = p.n - 1;
+            fresh.pointer = p.pointer;
+            assert!(fresh.grab().unwrap().bgra == got.as_slice(), "frame {n}");
+        }
     }
 }

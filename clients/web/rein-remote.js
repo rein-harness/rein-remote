@@ -12,6 +12,8 @@ const K = {HELLO: 1, CONFIG: 2, VIDEO: 3, AUDIO: 4, CURSOR: 5, INPUT: 6, FEEDBAC
 const HEADER = 7;
 const FLAG_KEYFRAME = 1;
 const CODECS = {1: 'h264', 2: 'h265', 3: 'av1', 4: 'vp9', 5: 'vp8'};
+// HEVC Main, level 5.1 (up to 4K at 60): Annex B, as the server sends it.
+const HEVC = 'hvc1.1.6.L153.B0';
 
 // ---- frames ----
 
@@ -54,6 +56,32 @@ function* frames(buf) {
     yield {kind, version, flags, body: buf.subarray(at + HEADER, at + HEADER + len)};
     at += HEADER + len;
   }
+}
+
+/**
+ * This display's refresh rate, measured (not assumed): the median gap between animation frames over
+ * ~30 of them, in millihertz (0 when the page can't animate now, e.g. a background tab).
+ */
+export function measureRefresh(frames = 30, timeoutMs = 1000) {
+  if (typeof requestAnimationFrame === 'undefined') return Promise.resolve(0);
+  return new Promise((resolve) => {
+    const gaps = [];
+    let last = 0;
+    const timer = setTimeout(() => done(), timeoutMs);
+    const done = () => {
+      clearTimeout(timer);
+      if (gaps.length < 5) return resolve(0);
+      gaps.sort((a, b) => a - b);
+      resolve(Math.round(1e6 / gaps[gaps.length >> 1]));
+    };
+    const tick = (t) => {
+      if (last) gaps.push(t - last);
+      last = t;
+      if (gaps.length >= frames) return done();
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  });
 }
 
 const nowUs = () => BigInt(Math.round((performance.timeOrigin + performance.now()) * 1000));
@@ -374,9 +402,12 @@ export function connect(url, canvas, opts = {}) {
   // Through a relay, sealed end to end: the key is in the page's address after # (never sent to a server).
   const e2eKey = opts.e2eKey ?? (typeof location !== 'undefined' ? new URLSearchParams(location.hash.slice(1)).get('k') : null);
   const link = e2eKey ? sealed(openLink(url, opts.webtransport), e2eKey) : openLink(url, opts.webtransport);
-  const stats = {frames: 0, keyframes: 0, bytes: 0, decoder: '', rttMs: 0, state: 'connecting', error: '', glassMs: []};
+  const stats = {frames: 0, keyframes: 0, bytes: 0, decoder: '', rttMs: 0, state: 'connecting', error: '', glassMs: [], refreshHz: 0, fps: 0};
+  // Measured while the connection opens.
+  const refresh = opts.refreshMhz !== undefined ? Promise.resolve(opts.refreshMhz) : measureRefresh();
   let config, decoder, waitKey = true, lost = 0, codec;
   const sent = new Map(); // frame number → received time (µs, client clock)
+  const shown = []; // when the last second's frames were shown
   const send = (bytes) => link.send(bytes);
 
   const helloFrame = async () => {
@@ -386,7 +417,7 @@ export function connect(url, canvas, opts = {}) {
     // What this browser decodes (hardware first is the server's preference to honor).
     const caps = [];
     if (!webcodecs && MS?.isTypeSupported('video/mp4; codecs="avc1.42e01f"')) caps.push([1, 0]); // H.264 through Media Source
-    for (const [id, c] of webcodecs ? [[1, 'avc1.42e01f'], [4, 'vp09.00.10.08'], [3, 'av01.0.04M.08']] : []) {
+    for (const [id, c] of webcodecs ? [[1, 'avc1.42e01f'], [2, HEVC], [4, 'vp09.00.10.08'], [3, 'av01.0.04M.08']] : []) {
       try {
         const hw = await VideoDecoder.isConfigSupported({codec: c, hardwareAcceleration: 'prefer-hardware'});
         const sw = hw.supported ? hw : await VideoDecoder.isConfigSupported({codec: c});
@@ -395,10 +426,13 @@ export function connect(url, canvas, opts = {}) {
     }
     w.u8(caps.length);
     for (const [id, hw] of caps) (w.u8(id), w.u8(hw));
-    w.u16(screen.width * devicePixelRatio); w.u16(screen.height * devicePixelRatio); w.u16(120);
+    w.u16(screen.width * devicePixelRatio); w.u16(screen.height * devicePixelRatio); w.u16(240);
     w.u8(0); // audio: not yet
     w.u8(1 | 2 | 4); // pointer, keyboard, touch
-    return w.frame(K.HELLO);
+    // Hello version 1: this display's refresh rate, measured, so the server paces to it.
+    stats.refreshHz = (await refresh) / 1000;
+    w.u32(await refresh);
+    return w.frame(K.HELLO, 1);
   };
 
   const makeDecoder = () => {
@@ -426,6 +460,11 @@ export function connect(url, canvas, opts = {}) {
         const n = Number(frame.timestamp);
         frame.close();
         stats.frames++;
+        // Frames shown in the last second.
+        const t = performance.now();
+        shown.push(t);
+        while (shown[0] < t - 1000) shown.shift();
+        stats.fps = shown.length;
         const received = sent.get(n);
         sent.delete(n);
         // Feedback: what arrived and when it was on screen (drives the server's rate control).
@@ -501,7 +540,7 @@ export function connect(url, canvas, opts = {}) {
           }
           if (!codec) {
             // Hardware decoding where the device has it, else whatever this browser decodes with.
-            codec = {codec: config?.codec === 'h264' ? avcCodec(data) : 'vp09.00.10.08', optimizeForLatency: true, width: config?.width, height: config?.height};
+            codec = {codec: config?.codec === 'h264' ? avcCodec(data) : config?.codec === 'h265' ? HEVC : 'vp09.00.10.08', optimizeForLatency: true, width: config?.width, height: config?.height};
             pending.push({key, n, data});
             if (!webcodecs) {
               decoder.configure(codec);

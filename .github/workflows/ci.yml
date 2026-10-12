@@ -22,16 +22,26 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
-      # Capture and input on a real desktop: a window streams, and typing into it changes it.
-      - name: Selftest (Windows, Notepad)
+      # Which Media Foundation H.264 encoder the runner has (no GPU: Microsoft's software one), and
+      # what the encoder tests saw with it.
+      - name: Media Foundation encoder (Windows)
+        if: runner.os == 'Windows'
+        run: cargo test -p rr-server encode_mf -- --nocapture --test-threads=1
+      # Capture and input on a real desktop: a window streams, and typing into it changes it; each
+      # through the default encoder and through Media Foundation's; then the whole display.
+      - name: Selftest (Windows, Notepad and the display)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
           cargo build --release -p rr-server
-          Start-Process notepad
+          Start-Process notepad -WindowStyle Maximized
           Start-Sleep -Seconds 3
           ./target/release/rein-remote.exe windows
           ./target/release/rein-remote.exe selftest --window Notepad --type "rein remote was here"
+          $env:RR_ENCODER = "mediafoundation"
+          ./target/release/rein-remote.exe selftest --window Notepad --type " through media foundation"
+          ./target/release/rein-remote.exe selftest --type " and on the whole display"
       - name: Selftest (Linux, an xterm on Xvfb)
         if: runner.os == 'Linux'
         run: |
@@ -42,6 +52,23 @@ jobs:
           DISPLAY=:20 ./target/release/rein-remote windows
           DISPLAY=:20 ./target/release/rein-remote selftest --window selftest --type "echo rein remote was here"
           DISPLAY=:20 ./target/release/rein-remote selftest --display :20
+      # The runner has no GPU: VA-API must say why and leave encoding to software, and the H.264 headers
+      # the VA-API encoder writes must be what a real decoder reads (a stream built from them alone, raw
+      # macroblocks, decoded by ffmpeg to exactly the pixels put in).
+      - name: VA-API without a GPU, and our H.264 headers through ffmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y -qq vainfo ffmpeg > /dev/null
+          vainfo || true
+          ./target/release/rein-remote selftest --test-pattern 1280x720 --encode /tmp/auto.h264 --frames 30
+          ffmpeg -v error -i /tmp/auto.h264 -f null -
+          if out=$(RR_ENCODER=vaapi ./target/release/rein-remote selftest --test-pattern --encode /tmp/hw.h264 --frames 3 2>&1); then
+            echo "VA-API encoded without a GPU?"; exit 1
+          fi
+          echo "$out"; echo "$out" | grep -q "VA-API"
+          RR_H264_OUT=/tmp/headers.h264 cargo test -q -p rr-server a_stream_from_these_headers_decodes
+          ffmpeg -v error -i /tmp/headers.h264 -f rawvideo -pix_fmt yuv420p /tmp/headers.yuv
+          cmp /tmp/headers.yuv /tmp/headers.h264.yuv
       - name: Selftest (macOS, test pattern; screen capture needs a permission runners can't give)
         if: runner.os == 'macOS'
         run: cargo run --release -p rr-server -- selftest --test-pattern

@@ -1,5 +1,5 @@
-//! macOS: a window (or a whole display) captured with ScreenCaptureKit, input sent with Core Graphics
-//! events. Any app's window works the same way (a native app, the iOS Simulator, the Android
+//! macOS: a window, an app (all its windows) or a whole display captured with ScreenCaptureKit, input
+//! sent with Core Graphics events. Any app's window works the same way (a native app, the iOS Simulator, the Android
 //! emulator, a game): nothing in the app needs to support it. ScreenCaptureKit sends a frame only
 //! when the window changed, so a still window costs nothing.
 //!
@@ -21,8 +21,9 @@ use objc2_core_video::{
     kCVPixelFormatType_32BGRA, CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight, CVPixelBufferLockBaseAddress,
     CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
 };
+use objc2_foundation::NSArray;
 use objc2_foundation::{NSError, NSObject, NSObjectProtocol};
-use objc2_screen_capture_kit::{SCContentFilter, SCShareableContent, SCStream, SCStreamConfiguration, SCStreamOutput, SCStreamOutputType, SCWindow};
+use objc2_screen_capture_kit::{SCContentFilter, SCDisplay, SCShareableContent, SCStream, SCStreamConfiguration, SCStreamOutput, SCStreamOutputType, SCWindow};
 use rr_proto::{Button, CursorShape, Input};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -165,7 +166,8 @@ fn raise_now(pid: i32, window_id: u32) {
                     break;
                 }
             }
-            if let Some(w) = target.or_else(|| windows.iter().next().map(|w| *w)) {
+            // No window (an app or a display shown): the app in front is enough.
+            if let Some(w) = target.or_else(|| windows.iter().next().map(|w| *w)).filter(|_| window_id != 0) {
                 AXUIElementPerformAction(w as *mut _, CFString::new("AXRaise").as_concrete_TypeRef());
             }
         }
@@ -258,6 +260,71 @@ pub fn windows() -> Result<Vec<WindowInfo>, String> {
     Ok(out)
 }
 
+/// A display by its number (1 is the main one, then in ScreenCaptureKit's order) or its id; none: the main one.
+fn pick_display(c: &SCShareableContent, which: Option<&str>) -> Result<Retained<SCDisplay>, String> {
+    let list = unsafe { c.displays() };
+    let main = CGDisplay::main().id;
+    let mut ordered: Vec<Retained<SCDisplay>> = list.iter().collect();
+    ordered.sort_by_key(|d| unsafe { d.displayID() } != main);
+    match which.map(str::trim).filter(|w| !w.is_empty()) {
+        None => ordered.into_iter().next().ok_or_else(|| "no display".to_string()),
+        Some(w) => {
+            let n: u32 = w
+                .trim_start_matches(':')
+                .parse()
+                .map_err(|_| format!("--display {w}: a number (1 is the main display) or a display id"))?;
+            ordered
+                .iter()
+                .find(|d| unsafe { d.displayID() } == n)
+                .or_else(|| ordered.get((n as usize).wrapping_sub(1)))
+                .cloned()
+                .ok_or_else(|| format!("no display {w} (rein-remote displays lists them)"))
+        }
+    }
+}
+
+/// Pixels per point on a display (2 on a Retina display): from its mode's real pixels (a scaled
+/// mode's "pixels wide" is in points).
+fn display_scale(id: u32, points_wide: f64) -> f64 {
+    let d = CGDisplay::new(id);
+    let px = d.display_mode().map_or(d.pixels_wide() as f64, |m| m.pixel_width() as f64);
+    (px / points_wide.max(1.0)).max(1.0)
+}
+
+/// A display, for `rein-remote displays`.
+pub struct DisplayInfo {
+    /// What `--display` takes (1 is the main display).
+    pub n: u32,
+    pub id: u32,
+    pub width: usize,
+    pub height: usize,
+    pub main: bool,
+}
+
+/// The displays, the main one first.
+pub fn displays() -> Result<Vec<DisplayInfo>, String> {
+    let c = content()?;
+    let main = CGDisplay::main().id;
+    let mut list: Vec<Retained<SCDisplay>> = unsafe { c.displays() }.iter().collect();
+    list.sort_by_key(|d| unsafe { d.displayID() } != main);
+    Ok(list
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            let id = unsafe { d.displayID() };
+            let f = unsafe { d.frame() };
+            let k = display_scale(id, f.size.width);
+            DisplayInfo {
+                n: i as u32 + 1,
+                id,
+                width: (f.size.width * k) as usize,
+                height: (f.size.height * k) as usize,
+                main: id == main,
+            }
+        })
+        .collect())
+}
+
 /// The latest frame ScreenCaptureKit delivered, and how many it has.
 #[derive(Default)]
 struct Latest {
@@ -343,9 +410,67 @@ impl MacWindow {
             .ok_or_else(|| format!("no window matches \"{query}\" (rein-remote windows lists them)"))?;
         let frame = unsafe { window.frame() };
         let main = CGDisplay::main();
-        let scale = (main.pixels_wide() as f64 / main.bounds().size.width).max(1.0);
-        let (w, h) = (((frame.size.width * scale) as usize) & !1, ((frame.size.height * scale) as usize) & !1);
+        let scale = display_scale(main.id, main.bounds().size.width);
         let filter = unsafe { SCContentFilter::initWithDesktopIndependentWindow(SCContentFilter::alloc(), &window) };
+        let id = unsafe { window.windowID() };
+        let t = title(&window);
+        let what = format!(
+            "window {id} ({}{})",
+            app_name(&window),
+            if t.is_empty() { String::new() } else { format!(": {t}") }
+        );
+        let pid = unsafe { window.owningApplication() }.map_or(0, |a| unsafe { a.processID() });
+        Self::start(&filter, frame, scale, id, pid, what)
+    }
+
+    /// A whole display: `which` is its number in `rein-remote displays` order (1 is the main one) or
+    /// its display id; none: the main display. Input goes where it lands, as on the machine itself.
+    pub fn open_display(which: Option<&str>) -> Result<Self, String> {
+        let c = content()?;
+        let display = pick_display(&c, which)?;
+        let none: Retained<NSArray<SCWindow>> = NSArray::new();
+        let filter = unsafe { SCContentFilter::initWithDisplay_excludingWindows(SCContentFilter::alloc(), &display, &none) };
+        let id = unsafe { display.displayID() };
+        let frame = unsafe { display.frame() };
+        let what = format!("display {id}");
+        Self::start(&filter, frame, display_scale(id, frame.size.width), 0, 0, what)
+    }
+
+    /// One app, all its windows (on the display its first window is on), without the rest of the
+    /// screen: `query` is part of its name or its bundle id. A press brings it to the front.
+    pub fn open_app(query: &str) -> Result<Self, String> {
+        let c = content()?;
+        let q = query.to_lowercase();
+        let app = unsafe { c.applications() }
+            .iter()
+            .find(|a| unsafe { a.applicationName() }.to_string().to_lowercase().contains(&q) || unsafe { a.bundleIdentifier() }.to_string().to_lowercase() == q)
+            .ok_or_else(|| format!("no app matches \"{query}\""))?;
+        let pid = unsafe { app.processID() };
+        // The display its first window is on, else the main one.
+        let at = unsafe { c.windows() }
+            .iter()
+            .find(|w| unsafe { w.isOnScreen() } && unsafe { w.owningApplication() }.is_some_and(|o| unsafe { o.processID() } == pid))
+            .map(|w| unsafe { w.frame() }.origin);
+        let display = unsafe { c.displays() }
+            .iter()
+            .find(|d| {
+                let f = unsafe { d.frame() };
+                at.is_some_and(|p| p.x >= f.origin.x && p.y >= f.origin.y && p.x < f.origin.x + f.size.width && p.y < f.origin.y + f.size.height)
+            })
+            .map_or_else(|| pick_display(&c, None), Ok)?;
+        let apps = NSArray::from_retained_slice(std::slice::from_ref(&app));
+        let none: Retained<NSArray<SCWindow>> = NSArray::new();
+        let filter = unsafe { SCContentFilter::initWithDisplay_includingApplications_exceptingWindows(SCContentFilter::alloc(), &display, &apps, &none) };
+        let frame = unsafe { display.frame() };
+        let what = format!("app {} (pid {pid}) on display {}", unsafe { app.applicationName() }, unsafe {
+            display.displayID()
+        });
+        Self::start(&filter, frame, display_scale(unsafe { display.displayID() }, frame.size.width), 0, pid, what)
+    }
+
+    /// Captures what `filter` shows, `frame` on screen (in points) at `scale` pixels a point.
+    fn start(filter: &SCContentFilter, frame: objc2_core_foundation::CGRect, scale: f64, window_id: u32, pid: i32, what: String) -> Result<Self, String> {
+        let (w, h) = (((frame.size.width * scale) as usize) & !1, ((frame.size.height * scale) as usize) & !1);
         let config = unsafe { SCStreamConfiguration::new() };
         unsafe {
             config.setWidth(w);
@@ -353,9 +478,10 @@ impl MacWindow {
             config.setPixelFormat(kCVPixelFormatType_32BGRA);
             // The pointer goes apart from the video; the client draws its own.
             config.setShowsCursor(false);
+            // As often as the screen changes, up to 240 times a second (a high-refresh display).
             config.setMinimumFrameInterval(CMTime {
                 value: 1,
-                timescale: 120,
+                timescale: 240,
                 flags: CMTimeFlags::Valid,
                 epoch: 0,
             });
@@ -363,7 +489,7 @@ impl MacWindow {
         }
         let latest = Arc::new(Mutex::new(Latest::default()));
         let output = Output::new(latest.clone());
-        let stream = unsafe { SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &config, None) };
+        let stream = unsafe { SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), filter, &config, None) };
         let queue = DispatchQueue::new("rein-remote.frames", None);
         unsafe { stream.addStreamOutput_type_sampleHandlerQueue_error(ProtocolObject::from_ref(&*output), SCStreamOutputType::Screen, Some(&queue)) }
             .map_err(|e| e.localizedDescription().to_string())?;
@@ -374,22 +500,16 @@ impl MacWindow {
         unsafe { stream.startCaptureWithCompletionHandler(Some(&done)) };
         rx.recv_timeout(Duration::from_secs(10))
             .map_err(|_| "the capture didn't start".to_string())?
-            .map_err(|e| format!("couldn't start capturing the window: {e}"))?;
+            .map_err(|e| format!("couldn't start capturing the {what}: {e}"))?;
         let can_control = may_control();
         if !can_control {
-            eprintln!("rein-remote: showing the window, but input won't reach it: allow Accessibility for the app that runs rein-remote (System Settings → Privacy & Security → Accessibility)");
+            eprintln!("rein-remote: showing the {what}, but input won't reach it: allow Accessibility for the app that runs rein-remote (System Settings → Privacy & Security → Accessibility)");
         }
-        let id = unsafe { window.windowID() };
-        let t = title(&window);
-        eprintln!(
-            "rein-remote: window {id} ({}{}), {w}×{h}",
-            app_name(&window),
-            if t.is_empty() { String::new() } else { format!(": {t}") }
-        );
+        eprintln!("rein-remote: {what}, {w}×{h}");
         Ok(Self {
             w,
             h,
-            window_id: id,
+            window_id,
             scale,
             origin: (frame.origin.x, frame.origin.y),
             origin_at: Instant::now(),
@@ -399,7 +519,7 @@ impl MacWindow {
             _stream: stream,
             _output: output,
             buttons: [false; 3],
-            pid: unsafe { window.owningApplication() }.map_or(0, |a| unsafe { a.processID() }),
+            pid,
             pointer: CGPoint::new(frame.origin.x, frame.origin.y),
             shape: None,
             shape_at: Instant::now() - Duration::from_secs(1),
@@ -408,7 +528,8 @@ impl MacWindow {
 
     /// The window's place on screen now (it may have moved), at most twice a second.
     fn refresh_origin(&mut self) {
-        if self.origin_at.elapsed() < Duration::from_millis(500) {
+        // A display or an app's display doesn't move.
+        if self.window_id == 0 || self.origin_at.elapsed() < Duration::from_millis(500) {
             return;
         }
         self.origin_at = Instant::now();
@@ -430,7 +551,11 @@ impl MacWindow {
     /// keyboard keeps typing where you are.
     fn post_key(&self, ev: Result<CGEvent, ()>) {
         if let Ok(e) = ev {
-            e.post_to_pid(self.pid);
+            match self.pid {
+                // A display: wherever the keyboard focus is, as typing on the machine.
+                0 => e.post(core_graphics::event::CGEventTapLocation::HID),
+                pid => e.post_to_pid(pid),
+            }
         }
     }
 
@@ -494,7 +619,10 @@ fn type_text(pid: i32, text: &str) {
             if let Some(src) = source() {
                 if let Ok(e) = CGEvent::new_keyboard_event(src, 0, down) {
                     e.set_string(&s);
-                    e.post_to_pid(pid);
+                    match pid {
+                        0 => e.post(core_graphics::event::CGEventTapLocation::HID),
+                        pid => e.post_to_pid(pid),
+                    }
                 }
             }
         }
@@ -591,7 +719,7 @@ impl Source for MacWindow {
                     _ => return Ok(()),
                 };
                 self.buttons[i] = *down;
-                if *down && !frontmost(self.pid) {
+                if *down && self.pid != 0 && !frontmost(self.pid) {
                     raise(self.pid, self.window_id);
                 }
                 let here = self.pointer;

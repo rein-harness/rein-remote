@@ -3,9 +3,8 @@
 //! skip when the connection backs up, and latency measured from the client's feedback.
 
 use crate::capture::Source;
-use crate::encode::Video as Encoder;
 use crate::link::{E2eLink, Link, Recv, WsLink};
-use rr_proto::{Codec, CodecCap, Config, Cursor, Hello, Message, Video, INPUT_KEYBOARD, INPUT_POINTER, INPUT_TOUCH, VERSION_MAX, VERSION_MIN};
+use rr_proto::{Codec, Config, Cursor, Hello, Message, Video, INPUT_KEYBOARD, INPUT_POINTER, INPUT_TOUCH, VERSION_MAX, VERSION_MIN};
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -16,7 +15,12 @@ pub const CLIENT_JS: &str = include_str!("../../../clients/web/rein-remote.js");
 
 pub struct Options {
     pub listen: String,
+    /// Frames a second at most; 0: the client's display refresh as it measured it (up to 240, 60 in
+    /// software; 60 when the client doesn't say).
     pub fps: u32,
+    /// The codec to prefer when the client decodes it (`--codec`, H.264 by default); `None` (auto):
+    /// HEVC where both sides do it in hardware, else H.264.
+    pub codec: Option<Codec>,
     pub bitrate_kbps: u32,
     /// When set, /stream and /stats need `?token=` this (another program on the machine, a proxy
     /// that didn't check who's asking, can't reach the screen).
@@ -79,6 +83,12 @@ pub fn run(source: Box<dyn Source>, opts: Options) -> Result<(), String> {
         }
     }
     let (w, h) = source.size();
+    // Which encoders this machine has, found now, and one opened and closed: the first a process opens
+    // takes a second or two (the system loads it), which the first viewer would otherwise wait for.
+    std::thread::spawn(move || {
+        crate::encode::capabilities();
+        let _ = crate::encode::open(Codec::H264, w, h, 60.0, 1000);
+    });
     // The address it got (a port of 0 picks a free one): a program that started it reads this line.
     let addr = listener.local_addr().map_or(opts.listen.clone(), |a| a.to_string());
     eprintln!("rein-remote: streaming a {w}×{h} screen on http://{addr} (open it in a browser)");
@@ -245,6 +255,69 @@ fn handle(
     conn.write_all(resp.as_bytes()).map_err(|e| e.to_string())
 }
 
+/// A frame the encoder finished, out to the client: numbered, timed (reading, encoding) and kept for
+/// the latency its feedback measures.
+fn send_frame(
+    e: crate::encode::Encoded,
+    link: &mut (dyn Link + Send),
+    encoding: &mut std::collections::VecDeque<(u64, Instant, f64)>,
+    captured: &mut std::collections::VecDeque<(u32, u64, Instant)>,
+    frame_no: &mut u32,
+    stats: &Mutex<Stats>,
+) -> Result<(), String> {
+    // This frame's own timing (frames the encoder dropped, earlier than it, are forgotten).
+    let mut timing = None;
+    while let Some(&(tag, t0, grab_ms)) = encoding.front() {
+        if tag > e.tag {
+            break;
+        }
+        encoding.pop_front();
+        if tag == e.tag {
+            timing = Some((t0, grab_ms));
+        }
+    }
+    *frame_no = frame_no.wrapping_add(1);
+    captured.push_back((*frame_no, e.tag, Instant::now()));
+    if captured.len() > 600 {
+        captured.pop_front();
+    }
+    let len = e.data.len() as u64;
+    link.send(&Message::Video(Video {
+        keyframe: e.keyframe,
+        frame: *frame_no,
+        timestamp_us: e.tag,
+        data: e.data,
+    }))?;
+    let mut s = stats.lock().unwrap();
+    s.frames += 1;
+    s.bytes += len;
+    s.keyframes += e.keyframe as u64;
+    if let Some((t0, grab_ms)) = timing {
+        s.encode_ms.push(t0.elapsed().as_secs_f64() * 1000.0 - grab_ms);
+        s.grab_ms.push(grab_ms);
+        if s.encode_ms.len() > 2000 {
+            s.encode_ms.drain(..1000);
+            s.grab_ms.drain(..1000);
+        }
+    }
+    Ok(())
+}
+
+/// The most frames a second a stream runs at, and what software encoding holds.
+pub const MAX_FPS: u32 = 240;
+pub const SOFTWARE_FPS: u32 = 60;
+
+/// Frames a second for a stream: `asked` when given (capped at 240), else the client's display
+/// refresh rate (millihertz, 0 when it didn't say: 60), capped at 240 with a hardware encoder and 60
+/// without.
+pub fn pace(asked: u32, refresh_mhz: u32, hardware: bool) -> u32 {
+    if asked > 0 {
+        return asked.min(MAX_FPS);
+    }
+    let refresh = if refresh_mhz >= 10_000 { (refresh_mhz + 500) / 1000 } else { SOFTWARE_FPS };
+    refresh.clamp(10, if hardware { MAX_FPS } else { SOFTWARE_FPS })
+}
+
 fn stats_json(s: &Stats) -> String {
     let pct = |v: &[f64], p: f64| -> f64 {
         if v.is_empty() {
@@ -277,19 +350,26 @@ fn stats_json(s: &Stats) -> String {
 
 fn session(mut link: Box<dyn Link + Send>, source: Arc<Mutex<Box<dyn Source>>>, stats: Arc<Mutex<Stats>>, opts: &Options) -> Result<(), String> {
     let (w, h) = source.lock().unwrap().size();
+    // What this machine encodes, the codec asked for first (H.264 by default: every device decodes
+    // it); with `auto`, HEVC first when this machine encodes it in hardware.
+    let mut codecs = crate::encode::capabilities().to_vec();
+    let first = opts.codec.unwrap_or(if codecs.iter().any(|c| c.codec == Codec::H265 && c.hardware) {
+        Codec::H265
+    } else {
+        Codec::H264
+    });
+    codecs.sort_by_key(|c| c.codec != first);
     let hello = Hello {
         version_min: VERSION_MIN,
         version_max: VERSION_MAX,
         name: std::env::var("HOSTNAME").unwrap_or_else(|_| "rein-remote".into()),
-        codecs: vec![CodecCap {
-            codec: Codec::H264,
-            hardware: false,
-        }],
+        codecs,
         max_width: w as u16,
         max_height: h as u16,
-        max_fps: opts.fps as u16,
+        max_fps: if opts.fps == 0 { MAX_FPS } else { opts.fps } as u16,
         audio: false,
         input: INPUT_POINTER | INPUT_KEYBOARD | INPUT_TOUCH,
+        refresh_mhz: 0,
     };
     link.send(&Message::Hello(hello.clone()))?;
     link.flushed()?;
@@ -313,20 +393,32 @@ fn session(mut link: Box<dyn Link + Send>, source: Arc<Mutex<Box<dyn Source>>>, 
         return Err(format!("{}: no protocol version in common", client.name));
     }
     let codec = rr_proto::pick_codec(&hello, &client).ok_or_else(|| format!("{}: decodes none of this server's codecs", client.name))?;
-    let mut enc = Encoder::new(w, h, opts.fps as f32, opts.bitrate_kbps)?;
+    // As fast as the client's display shows frames (measured there), up to 240 a second; software
+    // encoding stays at 60 (what a CPU core holds).
+    let auto = opts.fps == 0;
+    let mut fps = pace(opts.fps, client.refresh_mhz, true);
+    let mut enc = crate::encode::open(codec, w, h, fps as f32, opts.bitrate_kbps)?;
+    if auto && !enc.hardware() && fps > SOFTWARE_FPS {
+        fps = pace(opts.fps, client.refresh_mhz, false);
+        enc = crate::encode::open(codec, w, h, fps as f32, opts.bitrate_kbps)?;
+    }
     eprintln!("rein-remote: encoding {}", enc.name());
     let (ew, eh) = enc.size();
     link.send(&Message::Config(Config {
         codec,
         width: ew as u16,
         height: eh as u16,
-        fps: opts.fps as u16,
+        fps: fps as u16,
         bitrate_kbps: opts.bitrate_kbps,
     }))?;
-    eprintln!("rein-remote: {} connected ({:?} {ew}×{eh} at {} fps)", client.name, codec, opts.fps);
+    let refresh = match client.refresh_mhz {
+        0 => String::new(),
+        r => format!(", its display {:.1} Hz", r as f64 / 1000.0),
+    };
+    eprintln!("rein-remote: {} connected ({:?} {ew}×{eh} at {fps} fps{refresh})", client.name, codec);
 
-    let mut frame_time = Duration::from_secs_f64(1.0 / opts.fps.max(1) as f64);
-    let mut adapt = crate::adapt::Adapt::new(opts.bitrate_kbps, opts.fps);
+    let mut frame_time = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
+    let mut adapt = crate::adapt::Adapt::new(opts.bitrate_kbps, fps);
     let mut last_adapt = Instant::now();
     let mut frame_no: u32 = 0;
     // Frames sent: number, capture time (µs, for latency) and when they went out (for the round trip).
@@ -339,8 +431,10 @@ fn session(mut link: Box<dyn Link + Send>, source: Arc<Mutex<Box<dyn Source>>>, 
     // The pointer as last sent: its place, and its image's serial (the image goes only when it changes).
     let mut cursor_sent: Option<(u16, u16, u32, bool)> = None;
     let mut seen_generation: Option<u64> = None;
-    let mut last_frame = Instant::now();
-    const REFRESH: Duration = Duration::from_secs(1);
+    // Whether a frame has gone in where it was (said once in the log).
+    let mut zero_copy = false;
+    // Frames in the encoder: their capture time (the tag), when they were read, and how long reading took.
+    let mut encoding: std::collections::VecDeque<(u64, Instant, f64)> = Default::default();
     loop {
         // Everything the client sent (as soon as it arrives: see the wait at the end).
         loop {
@@ -416,55 +510,45 @@ fn session(mut link: Box<dyn Link + Send>, source: Arc<Mutex<Box<dyn Source>>>, 
                 stats.lock().unwrap().skipped_backed_up += 1;
             } else {
                 backed_up = false;
-                // A still screen (the source says nothing changed) is neither read nor encoded, except for a
-                // keyframe someone needs and a refresh each second.
+                // A still screen (the source says nothing changed) is neither read nor encoded nor sent,
+                // however long it stays still: only a keyframe someone asks for. (The client has the last
+                // frame; frames are never lost on the way, and one that can't be decoded asks again.)
                 let generation = source.lock().unwrap().generation();
-                if generation.is_some() && generation == seen_generation && !enc.wants_keyframe() && last_frame.elapsed() < REFRESH {
+                if generation.is_some() && generation == seen_generation && !enc.wants_keyframe() {
                     stats.lock().unwrap().still += 1;
                 } else {
                     seen_generation = generation;
-                    last_frame = Instant::now();
                     let t0 = Instant::now();
                     let captured_at = now_us();
-                    let (encoded, grab_ms) = {
+                    let done = {
                         let mut src = source.lock().unwrap();
                         // Zero copy where both ends can: the system's own frame straight into the hardware encoder.
                         let surface = if enc.takes_surfaces() { src.surface() } else { None };
                         if let Some(surface) = surface {
+                            if !zero_copy {
+                                zero_copy = true;
+                                eprintln!("rein-remote: zero copy: frames go from the capture into the encoder on the GPU");
+                            }
                             let grab_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                            (enc.encode_surface(&surface)?, grab_ms)
+                            encoding.push_back((captured_at, t0, grab_ms));
+                            enc.encode_surface(&surface, captured_at)?
                         } else {
                             let frame = src.grab()?;
                             let grab_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                            (enc.encode(frame.bgra, frame.stride)?, grab_ms)
+                            encoding.push_back((captured_at, t0, grab_ms));
+                            enc.encode(frame.bgra, frame.stride, captured_at)?
                         }
                     };
-                    let encode_ms = t0.elapsed().as_secs_f64() * 1000.0 - grab_ms;
-                    if let Some(e) = encoded {
-                        frame_no = frame_no.wrapping_add(1);
-                        captured.push_back((frame_no, captured_at, Instant::now()));
-                        if captured.len() > 600 {
-                            captured.pop_front();
-                        }
-                        let len = e.data.len() as u64;
-                        link.send(&Message::Video(Video {
-                            keyframe: e.keyframe,
-                            frame: frame_no,
-                            timestamp_us: captured_at,
-                            data: e.data,
-                        }))?;
-                        let mut s = stats.lock().unwrap();
-                        s.frames += 1;
-                        s.bytes += len;
-                        s.keyframes += e.keyframe as u64;
-                        s.encode_ms.push(encode_ms);
-                        s.grab_ms.push(grab_ms);
-                        if s.encode_ms.len() > 2000 {
-                            s.encode_ms.drain(..1000);
-                            s.grab_ms.drain(..1000);
-                        }
+                    for e in done {
+                        send_frame(e, &mut *link, &mut encoding, &mut captured, &mut frame_no, &stats)?;
                     }
                 }
+            }
+        }
+        // Frames a pipelined encoder finished since: out at once.
+        if enc.in_flight() > 0 || !encoding.is_empty() {
+            for e in enc.poll()? {
+                send_frame(e, &mut *link, &mut encoding, &mut captured, &mut frame_no, &stats)?;
             }
         }
         if last_report.elapsed() > Duration::from_secs(5) {
@@ -488,7 +572,30 @@ fn session(mut link: Box<dyn Link + Send>, source: Arc<Mutex<Box<dyn Source>>>, 
         }
         // Until the next frame is due, wait for the client: a message wakes this at once (input
         // reaches the source and feedback is timed without waiting for the next frame).
-        let rest = next_frame.saturating_duration_since(Instant::now());
+        // While the encoder works on a frame, look again within a millisecond: it goes out once done.
+        let mut rest = next_frame.saturating_duration_since(Instant::now());
+        if enc.in_flight() > 0 {
+            rest = rest.min(Duration::from_millis(1));
+        }
         link.wait(rest);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paces_to_the_clients_display() {
+        assert_eq!(pace(0, 59_940, true), 60);
+        assert_eq!(pace(0, 120_000, true), 120);
+        assert_eq!(pace(0, 200_000, true), 200);
+        assert_eq!(pace(0, 360_000, true), 240);
+        // Software holds 60; an old client (no refresh rate) gets 60.
+        assert_eq!(pace(0, 144_000, false), 60);
+        assert_eq!(pace(0, 0, true), 60);
+        // --fps N wins, up to 240.
+        assert_eq!(pace(30, 144_000, true), 30);
+        assert_eq!(pace(500, 0, false), 240);
     }
 }
