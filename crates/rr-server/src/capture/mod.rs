@@ -1,8 +1,11 @@
 //! Screen sources. Each gives frames of BGRA pixels and takes input events. Phase 1: an X11 display
 //! (Linux: a real one, or a virtual display), and a test pattern (any platform: CI, and checking a
-//! client without a display). macOS (ScreenCaptureKit) and Windows (Windows Graphics Capture) come
-//! in phase 3 behind the same trait.
+//! client without a display). Phase 3: macOS (ScreenCaptureKit) and Windows (Windows Graphics
+//! Capture), windows and whole displays, and Linux's scanout (KMS, whose frames stay on the GPU),
+//! behind the same trait.
 
+#[cfg(target_os = "linux")]
+pub mod kms;
 #[cfg(target_os = "macos")]
 pub mod mac;
 pub mod pipe;
@@ -37,19 +40,28 @@ pub trait Source: Send {
     fn generation(&mut self) -> Option<u64> {
         None
     }
-    /// The latest frame as the system's own image (macOS: a CVPixelBuffer in GPU memory), for an
-    /// encoder that takes it as it is: no copy at all. None: use `grab`.
+    /// The latest frame as the system's own image (macOS: a CVPixelBuffer in GPU memory; Windows: a
+    /// D3D11 texture on the capture's device; Linux: the screen's DMA-BUF), for an encoder that takes
+    /// it as it is: no copy through the CPU at all. None: use `grab`.
     fn surface(&mut self) -> Option<Surface> {
         None
     }
 }
 
-/// A frame the hardware encoder reads in place: a retained CVPixelBuffer (macOS).
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // only macOS sources make one so far
+/// A frame the hardware encoder reads in place, held for as long as this is: a retained
+/// CVPixelBuffer (macOS), or a referenced `ID3D11Texture2D` in BGRA (Windows). (Linux: below.)
+#[cfg(not(target_os = "linux"))]
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))] // only macOS and Windows sources make one
 pub struct Surface(pub *mut std::ffi::c_void);
 
 // Retained for as long as it's held; released when dropped.
+#[cfg(not(target_os = "linux"))]
 unsafe impl Send for Surface {}
+
+/// A frame the hardware encoder reads in place: the screen's framebuffer as DMA-BUFs (Linux, KMS),
+/// its file descriptors closed when dropped.
+#[cfg(target_os = "linux")]
+pub struct Surface(pub kms::DmaBuf);
 
 #[cfg(target_os = "macos")]
 impl Drop for Surface {
@@ -58,6 +70,27 @@ impl Drop for Surface {
             fn CFRelease(p: *const std::ffi::c_void);
         }
         unsafe { CFRelease(self.0) }
+    }
+}
+
+#[cfg(windows)]
+impl Surface {
+    /// A texture, the reference handed over (released when the surface is dropped).
+    pub fn texture(t: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D) -> Self {
+        Self(windows::core::Interface::into_raw(t))
+    }
+
+    /// The texture, borrowed for as long as the surface is.
+    pub fn as_texture(&self) -> &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D {
+        unsafe { <windows::Win32::Graphics::Direct3D11::ID3D11Texture2D as windows::core::Interface>::from_raw_borrowed(&self.0) }.expect("a texture")
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Surface {
+    fn drop(&mut self) {
+        // The reference `texture` took over, given back.
+        drop(unsafe { <windows::Win32::Graphics::Direct3D11::ID3D11Texture2D as windows::core::Interface>::from_raw(self.0) });
     }
 }
 

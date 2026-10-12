@@ -25,16 +25,26 @@ jobs:
       - name: Test (web client)
         if: runner.os == 'Linux'
         run: node --test clients/web/test/*.test.mjs
-      # Capture and input on a real desktop: a window streams, and typing into it changes it.
-      - name: Selftest (Windows, Notepad)
+      # Which Media Foundation H.264 encoder the runner has (no GPU: Microsoft's software one), and
+      # what the encoder tests saw with it.
+      - name: Media Foundation encoder (Windows)
+        if: runner.os == 'Windows'
+        run: cargo test -p rr-server encode_mf -- --nocapture --test-threads=1
+      # Capture and input on a real desktop: a window streams, and typing into it changes it; each
+      # through the default encoder and through Media Foundation's; then the whole display.
+      - name: Selftest (Windows, Notepad and the display)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
           cargo build --release -p rr-server
-          Start-Process notepad
+          Start-Process notepad -WindowStyle Maximized
           Start-Sleep -Seconds 3
           ./target/release/rein-remote.exe windows
           ./target/release/rein-remote.exe selftest --window Notepad --type "rein remote was here"
+          $env:RR_ENCODER = "mediafoundation"
+          ./target/release/rein-remote.exe selftest --window Notepad --type " through media foundation"
+          ./target/release/rein-remote.exe selftest --type " and on the whole display"
       - name: Selftest (Linux, an xterm on Xvfb)
         if: runner.os == 'Linux'
         run: |
@@ -45,9 +55,47 @@ jobs:
           DISPLAY=:20 ./target/release/rein-remote windows
           DISPLAY=:20 ./target/release/rein-remote selftest --window selftest --type "echo rein remote was here"
           DISPLAY=:20 ./target/release/rein-remote selftest --display :20
+      # The runner has no GPU: VA-API must say why and leave encoding to software, and the H.264 headers
+      # the VA-API encoder writes must be what a real decoder reads (a stream built from them alone, raw
+      # macroblocks, decoded by ffmpeg to exactly the pixels put in).
+      - name: VA-API without a GPU, and our H.264 headers through ffmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y -qq vainfo ffmpeg > /dev/null
+          vainfo || true
+          ./target/release/rein-remote selftest --test-pattern 1280x720 --encode /tmp/auto.h264 --frames 30
+          ffmpeg -v error -i /tmp/auto.h264 -f null -
+          if out=$(RR_ENCODER=vaapi ./target/release/rein-remote selftest --test-pattern --encode /tmp/hw.h264 --frames 3 2>&1); then
+            echo "VA-API encoded without a GPU?"; exit 1
+          fi
+          echo "$out"; echo "$out" | grep -q "VA-API"
+          RR_H264_OUT=/tmp/headers.h264 cargo test -q -p rr-server a_stream_from_these_headers_decodes
+          ffmpeg -v error -i /tmp/headers.h264 -f rawvideo -pix_fmt yuv420p /tmp/headers.yuv
+          cmp /tmp/headers.yuv /tmp/headers.h264.yuv
       - name: Selftest (macOS, test pattern; screen capture needs a permission runners can't give)
         if: runner.os == 'macOS'
         run: cargo run --release -p rr-server -- selftest --test-pattern
+      # The npm packages, installed from their tarballs, and Rein's contract with the binary (how
+      # rein-harness's src/preview/remote.ts starts and talks to it).
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: npm packages and Rein's contract
+        shell: bash
+        env:
+          DISPLAY: ':20'
+        run: |
+          case "$RUNNER_OS" in
+            Linux) t=x86_64-unknown-linux-gnu; b=target/release/rein-remote; w="--windows required" ;;
+            macOS) t=aarch64-apple-darwin; b=target/release/rein-remote; w="" ;;
+            Windows) t=x86_64-pc-windows-msvc; b=target/release/rein-remote.exe; w="--windows required" ;;
+          esac
+          node npm/build.mjs --out "$RUNNER_TEMP/npm" --bin "$t=$b"
+          mkdir "$RUNNER_TEMP/tgz" "$RUNNER_TEMP/app"
+          for d in "$RUNNER_TEMP"/npm/*; do (cd "$RUNNER_TEMP/tgz" && npm pack "$d"); done
+          cd "$RUNNER_TEMP/app" && npm init -y > /dev/null && npm install --no-audit --no-fund "$RUNNER_TEMP"/tgz/*.tgz
+          npx rein-remote --version
+          node "$GITHUB_WORKSPACE/npm/contract.mjs" $w
   wasm:
     runs-on: ubuntu-latest
     steps:

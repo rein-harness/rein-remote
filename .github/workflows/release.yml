@@ -70,3 +70,39 @@ jobs:
           cd .. && cat SHA256SUMS
           gh release upload "$GITHUB_REF_NAME" SHA256SUMS --repo "$GITHUB_REPOSITORY"
           gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+  # npm: the web client, the server's front package and one package per platform binary, from the
+  # archives just published. Only when the repository has an NPM_TOKEN secret.
+  npm:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: env.NPM_TOKEN != ''
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: env.NPM_TOKEN != ''
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Build and publish the npm packages
+        if: env.NPM_TOKEN != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          mkdir dl && cd dl
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY"
+          sha256sum -c SHA256SUMS
+          bins=()
+          for t in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-msvc; do
+            n="rein-remote-$GITHUB_REF_NAME-$t"
+            if [ -f "$n.zip" ]; then unzip -q "$n.zip"; bins+=(--bin "$t=$PWD/$n/rein-remote.exe"); else tar xzf "$n.tar.gz"; bins+=(--bin "$t=$PWD/$n/rein-remote"); fi
+          done
+          cd ..
+          node npm/build.mjs --out npm-out --version "${GITHUB_REF_NAME#v}" "${bins[@]}"
+          # The platform packages first: the front package depends on them.
+          for d in npm-out/remote-server-* npm-out/remote-server npm-out/remote; do npm publish "$d" --access public --provenance; done

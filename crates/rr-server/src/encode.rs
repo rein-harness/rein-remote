@@ -249,31 +249,46 @@ fn choice() -> String {
 }
 
 /// The machine's hardware encoders for `codec`, best first: each is tried in turn when a stream starts.
+/// (On Windows, Media Foundation's software encoder comes last among them: `hardware()` tells.)
 #[allow(unused_variables, unused_mut)]
-fn hardware(codec: Codec, width: usize, height: usize, fps: f32, kbps: u32) -> Vec<Result<Box<dyn VideoEncoder>, String>> {
-    let want = choice();
-    let named = |n: &str| matches!(want.as_str(), "" | "auto" | "hardware") || want == n;
+fn hardware(want: &str, codec: Codec, width: usize, height: usize, fps: f32, kbps: u32) -> Vec<Result<Box<dyn VideoEncoder>, String>> {
+    let named = |n: &str| matches!(want, "" | "auto" | "hardware") || want == n;
     let mut out: Vec<Result<Box<dyn VideoEncoder>, String>> = Vec::new();
     #[cfg(target_os = "macos")]
     if named("videotoolbox") {
         out.push(crate::encode_vt::VideoToolbox::new(codec, width, height, fps, kbps).map(|e| Box::new(e) as Box<dyn VideoEncoder>));
+    }
+    // The vendors' encoders (NVENC, AMF, Quick Sync) through Media Foundation, then Microsoft's
+    // software one (before openh264) unless only hardware will do.
+    #[cfg(windows)]
+    if named("mediafoundation") {
+        let hardware_only = want == "hardware";
+        out.push(crate::encode_mf::MediaFoundation::new(codec, width, height, fps, kbps, hardware_only).map(|e| Box::new(e) as Box<dyn VideoEncoder>));
+    }
+    #[cfg(target_os = "linux")]
+    if named("vaapi") {
+        out.push(crate::encode_vaapi::Vaapi::new(codec, width, height, fps, kbps).map(|e| Box::new(e) as Box<dyn VideoEncoder>));
     }
     out
 }
 
 /// An encoder for a stream: the machine's hardware one where it works, else software (H.264 only).
 pub fn open(codec: Codec, width: usize, height: usize, fps: f32, kbps: u32) -> Result<Box<dyn VideoEncoder>, String> {
-    let want = choice();
+    open_as(&choice(), codec, width, height, fps, kbps)
+}
+
+/// `open` with RR_ENCODER's value given (the tests try each without changing the environment).
+fn open_as(want: &str, codec: Codec, width: usize, height: usize, fps: f32, kbps: u32) -> Result<Box<dyn VideoEncoder>, String> {
     let mut why = Vec::new();
     if want != "software" {
-        for e in hardware(codec, width, height, fps, kbps) {
+        for e in hardware(want, codec, width, height, fps, kbps) {
             match e {
                 Ok(e) => return Ok(e),
                 Err(e) => why.push(e),
             }
         }
     }
-    let soft = !matches!(want.as_str(), "hardware" | "videotoolbox" | "mediafoundation" | "vaapi");
+    let soft = !matches!(want, "hardware" | "videotoolbox" | "mediafoundation" | "vaapi");
     if soft && codec == Codec::H264 {
         if !why.is_empty() {
             eprintln!("rein-remote: no hardware encoder ({}): encoding in software", why.join("; "));
@@ -294,7 +309,9 @@ fn has_hardware(codec: Codec) -> bool {
     if matches!(choice().as_str(), "" | "auto" | "hardware" | "videotoolbox") {
         return crate::encode_vt::listed(codec);
     }
-    hardware(codec, 256, 144, 30.0, 500).into_iter().any(|e| e.is_ok())
+    hardware(&choice(), codec, 256, 144, 30.0, 500)
+        .into_iter()
+        .any(|e| e.is_ok_and(|e| e.hardware()))
 }
 
 /// What this machine encodes, each codec once, hardware first (for the server's Hello): found the
@@ -306,7 +323,9 @@ pub fn capabilities() -> &'static [CodecCap] {
         for codec in [Codec::H264, Codec::H265] {
             if choice() != "software" && has_hardware(codec) {
                 caps.push(CodecCap { codec, hardware: true });
-            } else if codec == Codec::H264 && !matches!(choice().as_str(), "hardware" | "videotoolbox" | "mediafoundation" | "vaapi") {
+            } else if codec == Codec::H264 && !matches!(choice().as_str(), "hardware" | "videotoolbox" | "vaapi") {
+                // Software: openh264, or Media Foundation's own encoder (RR_ENCODER=mediafoundation
+                // on a machine without a hardware one).
                 caps.push(CodecCap { codec, hardware: false });
             }
         }
@@ -336,6 +355,25 @@ mod tests {
         assert!(!delta.keyframe);
         enc.keyframe();
         assert!(enc.encode(&frame, w * 4).unwrap().unwrap().keyframe);
+    }
+
+    /// A machine without a VA-API device (CI, a container): `auto` encodes in software, `vaapi` and
+    /// `hardware` say why they can't.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn without_a_gpu_auto_falls_back_and_vaapi_says_why() {
+        if crate::encode_vaapi::Vaapi::new(Codec::H264, 320, 240, 30.0, 2000).is_ok() {
+            return; // a machine with a GPU: nothing to fall back from
+        }
+        let auto = open_as("auto", Codec::H264, 320, 240, 30.0, 2000).unwrap();
+        assert!(!auto.hardware(), "{}", auto.name());
+        for want in ["vaapi", "hardware"] {
+            let e = open_as(want, Codec::H264, 320, 240, 30.0, 2000).err().expect("no software fallback");
+            assert!(e.contains("VA-API"), "{want}: {e}");
+        }
+        // HEVC has no software encoder: no fallback either.
+        assert!(open_as("auto", Codec::H265, 320, 240, 30.0, 2000).is_err());
+        assert!(!open_as("software", Codec::H264, 320, 240, 30.0, 2000).unwrap().hardware());
     }
 }
 

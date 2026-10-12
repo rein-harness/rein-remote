@@ -168,15 +168,20 @@ const MOTION: u8 = 6;
 impl X11 {
     /// `display`: ":20", or None for $DISPLAY.
     pub fn open(display: Option<&str>) -> Result<Self, String> {
-        Self::start(display, None)
+        Self::start(display, None, true)
+    }
+
+    /// Input and the pointer only, for a screen captured another way (`serve --kms`): nothing read.
+    pub fn open_input(display: Option<&str>) -> Result<Self, String> {
+        Self::start(display, None, false)
     }
 
     /// One window: its id (from `rein-remote windows`, decimal or 0x hex), or part of its title or class.
     pub fn open_window(display: Option<&str>, query: &str) -> Result<Self, String> {
-        Self::start(display, Some(query))
+        Self::start(display, Some(query), true)
     }
 
-    fn start(display: Option<&str>, query: Option<&str>) -> Result<Self, String> {
+    fn start(display: Option<&str>, query: Option<&str>, capture: bool) -> Result<Self, String> {
         let (conn, screen) = connect(display)?;
         let root_screen = &conn.setup().roots[screen];
         let root = root_screen.root;
@@ -219,23 +224,33 @@ impl X11 {
             .map_err(|_| "the display has no XTest (input won't work)".to_string())?;
         let keymap = keymap(&conn)?;
         let xfixes = conn.xfixes_query_version(4, 0).ok().and_then(|c| c.reply().ok()).is_some();
-        let shm = shm(&conn, w, h);
+        let shm = if capture { shm(&conn, w, h) } else { None };
         let damage = (|| {
+            if !capture {
+                return None;
+            }
             conn.damage_query_version(1, 1).ok()?.reply().ok()?;
             let id = conn.generate_id().ok()?;
             conn.damage_create(id, watch, damage::ReportLevel::NON_EMPTY).ok()?.check().ok()?;
             Some(id)
         })();
-        eprintln!(
-            "rein-remote: X display {}: capture {}, {}",
-            display.unwrap_or("$DISPLAY"),
-            if shm.is_some() { "in shared memory" } else { "with GetImage (no MIT-SHM)" },
-            if damage.is_some() {
-                "changes from XDamage"
-            } else {
-                "every frame (no XDamage)"
-            }
-        );
+        if !capture {
+            eprintln!(
+                "rein-remote: X display {}: input with XTest, the pointer from XFixes",
+                display.unwrap_or("$DISPLAY")
+            );
+        } else {
+            eprintln!(
+                "rein-remote: X display {}: capture {}, {}",
+                display.unwrap_or("$DISPLAY"),
+                if shm.is_some() { "in shared memory" } else { "with GetImage (no MIT-SHM)" },
+                if damage.is_some() {
+                    "changes from XDamage"
+                } else {
+                    "every frame (no XDamage)"
+                }
+            );
+        }
         Ok(Self {
             conn,
             root,
