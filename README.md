@@ -122,7 +122,8 @@ rein-remote install-service … --print            # what it would install, noth
 rein-remote uninstall-service [relay] [--system]
 ```
 
-Secrets stay out of the service's command line: `token = { file = "/etc/rein-remote/token" }`. The
+Secrets stay out of the service's command line: `token = { file = "/etc/rein-remote/token" }`
+(for sign-in, `oidc-client-secret-file = "/etc/rein-remote/oidc-secret"`). The
 command line wins over the file. See [docs/verification/service-install.md](docs/verification/service-install.md).
 
 ### Signed binaries
@@ -153,7 +154,9 @@ rein-remote serve --public-url https://remote.example.com \
   `token`, `paired`, `relay`), the first that matches decides: `view_only` (the server drops their
   input), `clipboard`, `audio`, `sources` (which of this machine's displays or windows), `record`,
   `max_session_minutes`. No rule: refused, with the reason. Without `--policy`, everyone who signs
-  in may watch and control.
+  in may watch and control. `clipboard = false` stops pastes from this version's clients; a viewer
+  who may control can still type, and an older web client sends a paste as typing. With `--relay`,
+  viewers through it are `via = ["relay"]`: no rule for them, no relayed viewers.
 - `--audit FILE`: a JSON line for each sign-in (and refusal), each session's start and end (who,
   from where, over what, which rule, its recording) and each pairing. Never a token or a secret.
 - `--record DIR`: each session's video as it was sent (and its sound) in an MP4 that plays in any

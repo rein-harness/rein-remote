@@ -1670,7 +1670,9 @@ max_session_minutes = 0.05
         let refused = sign_in(port, &idp, &key, "carol@corp.example", &[]).unwrap_err();
         assert!(refused.contains("no rule in the policy lets carol@corp.example in"), "{refused}");
 
-        // Signing out ends the cookie.
+        // Signing out ends the cookie (a POST: the GET only shows the button).
+        http(port, "GET", "/sso/logout", &[("Cookie", &alice)], "");
+        assert_eq!(http(port, "POST", "/sso/ticket", &[("Cookie", &alice), ("Origin", origin)], "").0, 200);
         http(port, "POST", "/sso/logout", &[("Cookie", &alice), ("Origin", origin)], "");
         assert_eq!(http(port, "POST", "/sso/ticket", &[("Cookie", &alice), ("Origin", origin)], "").0, 401);
 

@@ -381,7 +381,17 @@ impl crate::pairing::Gate {
                 Some(p) => Resp::json("200 OK", serde_json::json!({"user": p.user, "groups": p.groups, "via": p.via})),
                 None => Resp::json("401 Unauthorized", serde_json::json!({"error": "not signed in", "login": "/sso/login"})),
             },
-            ("POST", "/sso/logout") | ("GET", "/sso/logout") => {
+            // Signing out is a POST (a link on another site can't sign anyone out); the GET is its button.
+            ("GET", "/sso/logout") => Resp {
+                status: "200 OK",
+                kind: "text/html; charset=utf-8",
+                headers: vec![],
+                body: "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width\"><title>Rein Remote</title>\
+<body style=\"font:15px system-ui;background:#0b0c0e;color:#e8ecf2;display:grid;place-items:center;height:90vh\">\
+<form method=post action=/sso/logout><button style=\"font:inherit;padding:8px 18px\">Sign out of Rein Remote</button></form>"
+                    .into(),
+            },
+            ("POST", "/sso/logout") => {
                 if let Some(p) = s.end_session(req.cookies) {
                     self.audit.log("signout", serde_json::json!({"user": p.user, "via": p.via, "addr": req.peer}));
                 }
