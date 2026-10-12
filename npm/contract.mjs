@@ -17,11 +17,11 @@ import {spawn} from 'node:child_process';
 import {readFileSync} from 'node:fs';
 import {createRequire} from 'node:module';
 import path from 'node:path';
-import {fileURLToPath} from 'node:url';
+import {fileURLToPath, pathToFileURL} from 'node:url';
 
 const require = createRequire(path.join(process.cwd(), 'noop.js'));
 const here = path.dirname(fileURLToPath(import.meta.url));
-const {binaryPath} = await import(require.resolve('@rein-harness/remote-server'));
+const {binaryPath} = await import(pathToFileURL(require.resolve('@rein-harness/remote-server')).href);
 const webJs = readFileSync(require.resolve('@rein-harness/remote/rein-remote.js'), 'utf8');
 const version = JSON.parse(readFileSync(require.resolve('@rein-harness/remote-server/package.json'), 'utf8')).version;
 const windowsRequired = process.argv.includes('--windows') && process.argv[process.argv.indexOf('--windows') + 1] === 'required';
