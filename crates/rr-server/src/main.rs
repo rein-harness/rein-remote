@@ -228,7 +228,7 @@ fn optional_arg(it: &mut std::slice::Iter<String>) -> Option<String> {
 /// says so before anyone connects.
 #[cfg(target_os = "linux")]
 fn open_kms(connector: Option<&str>) -> Result<Box<dyn Source>, String> {
-    let kms = capture::kms::Kms::open(connector)?;
+    let mut kms = capture::kms::Kms::open(connector)?;
     if std::env::var_os("RR_VAAPI_DEVICE").is_none() {
         if let Some(node) = &kms.render_node {
             // Still one thread: nothing reads the environment meanwhile.
@@ -236,13 +236,18 @@ fn open_kms(connector: Option<&str>) -> Result<Box<dyn Source>, String> {
         }
     }
     let (w, h) = kms.size();
-    let enc = encode::open(rr_proto::Codec::H264, w, h, 30.0, 2000)?;
+    let mut enc = encode::open(rr_proto::Codec::H264, w, h, 30.0, 2000)?;
     if !enc.takes_surfaces() {
         return Err(format!(
             "--kms needs VA-API with colour conversion on the GPU, and the encoder here is {} (RR_ENCODER, and the log above, say why)",
             enc.name()
         ));
     }
+    // One frame through, as a stream would: a screen the GPU can't import fails here, not per viewer.
+    let frame = kms
+        .surface()
+        .ok_or("--kms: no frame from the screen (it's blanked, or the line above says why)")?;
+    enc.encode_surface(&frame, 0).map_err(|e| format!("--kms: {e}"))?;
     eprintln!("rein-remote: --kms encodes with {}", enc.name());
     Ok(Box::new(kms))
 }

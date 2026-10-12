@@ -195,10 +195,15 @@ Expected:
 ```text
 rein-remote: KMS eDP-1 on /dev/dri/card1: 1920×1080, frames to the GPU's encoder as they are (DMA-BUF)
 rein-remote: X display $DISPLAY: input with XTest, the pointer from XFixes
+rein-remote: VA-API: frames straight from the screen's buffer (XR24, modifier 0x100000000000002), no copy
 rein-remote: --kms encodes with H.264 in hardware (VA-API: …)
 rein-remote: VA-API: frames straight from the screen's buffer (XR24, modifier 0x100000000000002), no copy
 rein-remote selftest: 1920×1080, 300 frames by H.264 in hardware (VA-API: …), 300 straight from the GPU's memory: 1.50 ms a frame (…), 0.10 ms of CPU a frame, 1 keyframe(s), … bytes in /tmp/kms.h264
 ```
+
+(The `frames straight from the screen's buffer` line shows twice: once from the check `--kms` makes
+as it starts, a frame imported and encoded so a screen the GPU can't take fails before anyone
+connects, and once from the encoder that does the work.)
 
 **The zero-copy path is active** when you see both the `frames straight from the screen's buffer …
 no copy` line and `300 straight from the GPU's memory` in the result, and the CPU per frame is a
@@ -267,7 +272,9 @@ software (NVENC is a separate backend, not part of this).
   through).
 - `… has no H.264 encoder`: the driver decodes only (Fedora's Mesa, iHD without `-non-free` on some
   generations, NVIDIA): see step 0's notes.
-- `importing the screen's buffer (XR24, modifier …) failed (…)`: the driver can't import that layout.
-  Report the line and the GPU.
+- `--kms: VA-API: importing the screen's buffer (XR24, modifier …) failed (…)`, at start: the driver
+  can't import that layout. Report the line and the GPU.
+- `the GPU's colour conversion failed (…): converting on the CPU`: the driver lists video processing
+  but can't convert BGRX to NV12. Frames from memory still encode (the CPU converts); `--kms` won't.
 - To see libva's own messages: `LIBVA_MESSAGING_LEVEL=2` (they're kept out of the log otherwise).
 - A different driver than the one autodetected: `LIBVA_DRIVER_NAME=iHD` (or `i965`, `radeonsi`).

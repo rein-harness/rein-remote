@@ -755,6 +755,8 @@ pub struct Vaapi {
     cur: usize,
     /// Logged once: frames came straight from the GPU's memory.
     zero_copy_seen: bool,
+    /// The GPU has converted a frame (until then, a failure falls back to the CPU's conversion).
+    vpp_works: bool,
 }
 
 // The display and its objects are only used by whoever holds the encoder.
@@ -894,6 +896,7 @@ impl Vaapi {
             idr_pic_id: 0,
             cur: 0,
             zero_copy_seen: false,
+            vpp_works: false,
         };
         // Surfaces in whole macroblocks (the SPS crops to the picture).
         e.input = e.d.surfaces(VA_RT_FORMAT_YUV420, VA_FOURCC_NV12, cw, ch, 1)?[0];
@@ -1007,7 +1010,17 @@ impl Vaapi {
                 width: w as u16,
                 height: h as u16,
             };
-            self.convert(self.upload.surface, full)?;
+            match self.convert(self.upload.surface, full) {
+                Ok(()) => self.vpp_works = true,
+                // A driver that lists video processing but can't do this conversion: the CPU does it
+                // from now on, this frame included.
+                Err(e) if !self.vpp_works => {
+                    eprintln!("rein-remote: VA-API: the GPU's colour conversion failed ({e}): converting on the CPU");
+                    self.drop_vpp();
+                    return self.encode(bgra, stride, tag);
+                }
+                Err(e) => return Err(e),
+            }
         }
         self.encode_input(tag)
     }
@@ -1048,6 +1061,28 @@ impl Vaapi {
                 (d.va.vaPutImage)(d.dpy, up.surface, img.image_id, 0, 0, w, h, 0, 0, w, h),
             )
         }
+    }
+
+    /// No more GPU conversion: frames from memory go straight into the NV12 input (converted by the CPU).
+    fn drop_vpp(&mut self) {
+        let (va, dpy) = (self.d.va, self.d.dpy);
+        unsafe {
+            if let Some(img) = self.upload.image.take() {
+                (va.vaDestroyImage)(dpy, img.image_id);
+            }
+            if let Some(vpp) = self.vpp.take() {
+                (va.vaDestroyContext)(dpy, vpp.context);
+                (va.vaDestroyConfig)(dpy, vpp.config);
+            }
+            if self.upload.surface != self.input {
+                (va.vaDestroySurfaces)(dpy, &mut self.upload.surface, 1);
+            }
+        }
+        self.upload = Upload {
+            surface: self.input,
+            fourcc: VA_FOURCC_NV12,
+            image: None,
+        };
     }
 
     /// The GPU converts `region` of an RGB surface into the encoder's NV12 input (BT.601, limited
@@ -1206,7 +1241,7 @@ impl Vaapi {
                     bits_per_second: bps,
                     target_percentage: 100,
                     window_size: 1000,
-                    rc_flags: 1 << 1 | 1 << 2,
+                    rc_flags: RC_NO_SKIP_NO_STUFFING,
                     ..Default::default()
                 };
                 bufs.push(d.buffer(
@@ -1400,6 +1435,9 @@ fn vui_fields(log2_max_mv_length_horizontal: u32, log2_max_mv_length_vertical: u
 
 /// The PPS and picture fields: every frame a reference, deblocking control present (the slice header
 /// carries it), CABAC for Main.
+/// Rate control's flags: disable_frame_skip and disable_bit_stuffing.
+const RC_NO_SKIP_NO_STUFFING: u32 = 1 << 1 | 1 << 2;
+
 fn pic_fields(idr: bool, cabac: bool) -> u32 {
     idr as u32 | 1 << 1 | (cabac as u32) << 3 | 1 << 9
 }
@@ -1601,8 +1639,8 @@ mod tests {
         (offset_of!(VADRMPRIMESurfaceDescriptor, layers), 84),
     ];
 
-    /// The bit fields as gcc packs them from the headers' declarations (each value read off a union
-    /// with one field set, in C).
+    /// The bit fields as gcc packs them from the headers' declarations (each value read off the union
+    /// in C, with these fields set).
     #[test]
     fn bit_fields_are_where_libva_packs_them() {
         // chroma_format_idc=1, frame_mbs_only_flag=1, direct_8x8_inference_flag=1,
@@ -1614,6 +1652,8 @@ mod tests {
         // idr_pic_flag, reference_pic_flag=1, entropy_coding_mode_flag, deblocking_filter_control_present_flag.
         assert_eq!(pic_fields(true, true), 0x020b);
         assert_eq!(pic_fields(false, false), 0x0202);
+        // disable_frame_skip, disable_bit_stuffing.
+        assert_eq!(RC_NO_SKIP_NO_STUFFING, 0x6);
     }
 
     #[test]
