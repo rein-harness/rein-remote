@@ -37,7 +37,8 @@ Early: the design is done and being built one verified piece at a time
 | Transport: WebTransport (QUIC) | working: a stream per frame, self-signed certificate by hash, falls back to the WebSocket by itself (phase 4) |
 | Transport: relay (behind NAT, no open ports) | working: `rein-remote relay` (self-hosted), `serve --relay`; NAT hole punching todo (phase 4) |
 | Adaptive bitrate, audio | todo (phase 4) |
-| Pairing, enterprise sign-in and policy | todo (phases 4, 6) |
+| Enterprise sign-in, policy, audit, recording | working: OIDC and SAML sign-in, policies (view only, clipboard, audio, sources, time limit), a JSON-lines audit log, MP4 recording; verified with Keycloak in Docker: a viewer's input dropped, an unknown user refused, the recording decoded ([real IdP test](docs/verification/identity.md)) (phase 6) |
+| Relay fleet, metrics, config file, services, signing | working: several relays per machine with failover (a frame through the other in 60 ms), `/healthz` and `/metrics`, `--config FILE.toml`, `install-service` on all three (installed in CI), binaries signed in CI with runner-made identities; real certificates and notarization: [manual test](docs/verification/signing.md) (phase 6) |
 
 ## Try it
 

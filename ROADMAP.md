@@ -203,3 +203,27 @@ has been verified.
 - A relay fleet, health and metrics, headless install and config by file.
 - Signed and notarized binaries on every platform.
 - **Verified:** a multi-user deployment behind an identity provider, with policies enforced.
+- **Status:** all in. Sign-in: OIDC (code flow with PKCE, discovery, ID tokens checked on `ring`,
+  RS256 and ES256 only, the client secret from a file) and SAML (`--features saml`, samael on
+  xmlsec1, plus our own checks: the IdP's certificate required, the audience, each request answered
+  once, SHA-256 or stronger); a session cookie stored only as a hash, traded for a one-minute ticket
+  for WebTransport. Policies (`--policy`, TOML or JSON) by user, group or way in: view only (input
+  dropped), clipboard, audio, sources, recording, a time limit; no rule, no entry, with the reason
+  shown (rr-proto's new Access and Notice messages, which older clients skip). Audit log
+  (`--audit`, JSON lines, no secrets). Recording (`--record`, fragmented MP4 with the video as sent
+  and Opus). **Verified** (`tests/idp/run.sh`: Keycloak 26.2.5, rein-remote showing an xterm,
+  headless Chromium; OIDC and SAML both): alice (admins) streamed and her typed command ran; bob
+  (viewers) streamed but his 57 input events were dropped and his command never ran; carol (no
+  group) refused with the reason; no sign-in, 401; every event in the audit log and no secret in it;
+  only alice's session recorded, 40 of 40 frames, decoded by ffmpeg without a message. A real IdP
+  tenant (Okta, Entra, Google): [manual test](docs/verification/identity.md). Relay fleet: `serve
+  --relay A --relay B` keeps its room on every relay and the link lists the others after `#`;
+  `/healthz` and Prometheus `/metrics` on `serve` (token) and the relay (`--metrics-listen`,
+  localhost). Killing the relay a viewer was on: a frame through the other one 60 ms later (median
+  of 10, worst 85); behind one haproxy name in Docker, with relays killed outright, 1.16 s without a
+  picture (median of 5, worst 1.88). Config by file (`--config FILE.toml`, every flag a key, secrets
+  from files) and `install-service` (systemd, launchd, a Windows service or logon task): CI installs
+  a relay all six ways and it answers. Signing: `tools/sign` in release.yml when the secrets exist
+  (codesign with the hardened runtime and notarytool, signtool, cosign on SHA256SUMS); CI signs with
+  identities made on the runner and refuses a tampered copy on all three. Real certificates
+  (Developer ID with notarization, an OV/EV certificate): [manual test](docs/verification/signing.md).
