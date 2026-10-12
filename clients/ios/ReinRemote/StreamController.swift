@@ -80,6 +80,7 @@ final class StreamController: NSObject, ObservableObject {
     private var timer: Timer?
     private var serverInput: UInt8 = 0
     private var lastPad: GamepadState?
+    private var closed = false
     /// Read the test pattern's barcode from every frame.
     var measure = false
 
@@ -120,6 +121,11 @@ final class StreamController: NSObject, ObservableObject {
         let s = try await Task.detached(priority: .userInitiated) {
             try RemoteSession(target: target, name: name, pairCode: pairCode, options: opts)
         }.value
+        // Closed while connecting (the screen went): the session ends here (and is freed as `s` goes).
+        if closed {
+            s.close()
+            return
+        }
         session = s
         let tap = InputTap(s)
         input = tap
@@ -145,6 +151,7 @@ final class StreamController: NSObject, ObservableObject {
     }
 
     func close() {
+        closed = true
         timer?.invalidate()
         session?.close()
         audio?.close()
