@@ -82,6 +82,9 @@ pub struct TestPattern {
     pointer: Option<(usize, usize)>,
     /// What was drawn over the background last frame, to put back: the block's left edge, the cross.
     drawn: Option<(usize, Option<(usize, usize)>)>,
+    /// Full motion (`--motion full`): a detailed scene scrolling under it all, every pixel changing
+    /// every frame, as a game's would; the texture it scrolls (twice the width, so rows copy whole).
+    scene: Option<Vec<u8>>,
 }
 
 impl TestPattern {
@@ -93,7 +96,33 @@ impl TestPattern {
             buf: vec![0; w * h * 4],
             pointer: None,
             drawn: None,
+            scene: None,
         }
+    }
+
+    /// Every pixel moving every frame: a busy textured scene scrolling diagonally (hard to encode, as
+    /// a game is), with the block, the barcode and the pointer's cross on top.
+    pub fn full_motion(w: usize, h: usize) -> Self {
+        let mut t = Self::new(w, h);
+        let tw = w * 2;
+        let mut scene = vec![0u8; tw * h * 4];
+        let mut x: u32 = 0x9e37_79b9;
+        for (i, px) in scene.chunks_exact_mut(4).enumerate() {
+            let (cx, cy) = ((i % tw) as u32, (i / tw) as u32);
+            // Smooth bands plus fine noise: gradients and detail, like a rendered scene.
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            let n = (x & 63) as u8;
+            px.copy_from_slice(&[
+                (((cx * 3 + cy) % 256) as u8).wrapping_add(n),
+                (((cx + cy * 2) / 3 % 256) as u8).wrapping_add(n / 2),
+                ((((cx ^ cy) >> 2) % 256) as u8).wrapping_add(n / 3),
+                255,
+            ]);
+        }
+        t.scene = Some(scene);
+        t
     }
 
     fn background(&mut self, x0: usize, x1: usize, y0: usize, y1: usize) {
@@ -131,8 +160,18 @@ impl Source for TestPattern {
     fn grab(&mut self) -> Result<Frame<'_>, String> {
         self.n += 1;
         let (w, h, n) = (self.w, self.h, self.n as usize);
+        // Full motion: the scene, scrolled on, under everything (all of it changes).
+        if let Some(scene) = &self.scene {
+            let (tw, dx, dy) = (w * 2, (n * 6) % w.max(1), (n * 2) % h.max(1));
+            for y in 0..h {
+                let sy = (y + dy) % h;
+                self.buf[y * w * 4..(y + 1) * w * 4].copy_from_slice(&scene[(sy * tw + dx) * 4..(sy * tw + dx + w) * 4]);
+            }
+            self.drawn = Some((0, None));
+        }
         // The background once; after that, only what was drawn over it goes back.
-        match self.drawn.take() {
+        match self.drawn.take().filter(|_| self.scene.is_none()) {
+            None if self.scene.is_some() => {}
             None => self.background(0, w, 0, h),
             Some((bx, cross)) => {
                 self.background(bx, bx + w / 12, h / 3, h / 3 + h / 6);

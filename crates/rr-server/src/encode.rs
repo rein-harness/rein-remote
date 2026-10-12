@@ -199,6 +199,10 @@ pub trait VideoEncoder: Send {
     fn takes_surfaces(&self) -> bool {
         false
     }
+    /// Whether it scales a surface bigger than its own size itself (in hardware).
+    fn scales_surfaces(&self) -> bool {
+        false
+    }
     /// A frame as the system's own image (`Source::surface`), read where it is.
     fn encode_surface(&mut self, _surface: &crate::capture::Surface, _tag: u64) -> Result<Vec<Encoded>, String> {
         Err("this encoder reads frames from memory".into())

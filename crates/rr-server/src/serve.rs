@@ -340,7 +340,7 @@ fn send_frame(
     e: crate::encode::Encoded,
     link: &mut (dyn Link + Send),
     encoding: &mut std::collections::VecDeque<(u64, Instant, f64)>,
-    captured: &mut std::collections::VecDeque<(u32, u64, Instant)>,
+    captured: &mut std::collections::VecDeque<(u32, u64, Instant, usize)>,
     frame_no: &mut u32,
     stats: &Mutex<Stats>,
 ) -> Result<(), String> {
@@ -356,7 +356,7 @@ fn send_frame(
         }
     }
     *frame_no = frame_no.wrapping_add(1);
-    captured.push_back((*frame_no, e.tag, Instant::now()));
+    captured.push_back((*frame_no, e.tag, Instant::now(), e.data.len()));
     if captured.len() > 600 {
         captured.pop_front();
     }
@@ -380,6 +380,32 @@ fn send_frame(
         }
     }
     Ok(())
+}
+
+/// The picture's size at `scale` of `full` (even, at least 160×90).
+fn scaled_size(full: (usize, usize), scale: f32) -> (usize, usize) {
+    if scale >= 1.0 {
+        return full;
+    }
+    let f = |n: usize, min: usize| (((n as f32 * scale) as usize).max(min.min(n))) & !1;
+    (f(full.0, 160), f(full.1, 90))
+}
+
+/// An input event's coordinates from the picture's pixels (`pic`) to the source's (`src`).
+fn unscale(ev: rr_proto::Input, pic: (usize, usize), src: (usize, usize)) -> rr_proto::Input {
+    use rr_proto::Input;
+    if pic.0 >= src.0 && pic.1 >= src.1 || pic.0 == 0 || pic.1 == 0 {
+        return ev;
+    }
+    let x = |v: u16| ((v as usize * src.0) / pic.0).min(src.0.saturating_sub(1)) as u16;
+    let y = |v: u16| ((v as usize * src.1) / pic.1).min(src.1.saturating_sub(1)) as u16;
+    match ev {
+        Input::PointerMove { x: px, y: py } => Input::PointerMove { x: x(px), y: y(py) },
+        Input::Touch { points } => Input::Touch {
+            points: points.into_iter().map(|(id, px, py)| (id, x(px), y(py))).collect(),
+        },
+        other => other,
+    }
 }
 
 /// Parity shards per data shard for a datagram loss rate: enough that a frame very rarely loses more
@@ -489,7 +515,10 @@ fn session(mut link: Box<dyn Link + Send>, source: Arc<Mutex<Box<dyn Source>>>, 
         enc = crate::encode::open(codec, w, h, fps as f32, opts.bitrate_kbps)?;
     }
     eprintln!("rein-remote: encoding {}", enc.name());
-    let (ew, eh) = enc.size();
+    let (mut ew, mut eh) = enc.size();
+    // The picture at full size, and a buffer for it scaled down (when the link asks for that).
+    let enc_full = (ew, eh);
+    let mut small: Vec<u8> = Vec::new();
     link.send(&Message::Config(Config {
         codec,
         width: ew as u16,
@@ -517,7 +546,7 @@ fn session(mut link: Box<dyn Link + Send>, source: Arc<Mutex<Box<dyn Source>>>, 
     let mut last_adapt = Instant::now();
     let mut frame_no: u32 = 0;
     // Frames sent: number, capture time (µs, for latency) and when they went out (for the round trip).
-    let mut captured: std::collections::VecDeque<(u32, u64, Instant)> = Default::default();
+    let mut captured: std::collections::VecDeque<(u32, u64, Instant, usize)> = Default::default();
     let mut next_frame = Instant::now();
     let mut backed_up = false;
     let mut last_ping = Instant::now() - Duration::from_secs(10);
@@ -539,6 +568,8 @@ fn session(mut link: Box<dyn Link + Send>, source: Arc<Mutex<Box<dyn Source>>>, 
                         at += used;
                         match m {
                             Some(Message::Input(ev)) => {
+                                // The client's pixels are the picture's: the source's when it's scaled down.
+                                let ev = if (ew, eh) == enc_full { ev } else { unscale(ev, (ew, eh), (w, h)) };
                                 let _ = source.lock().unwrap().input(&ev);
                             }
                             Some(Message::KeyframeRequest) => enc.keyframe(),
@@ -548,10 +579,14 @@ fn session(mut link: Box<dyn Link + Send>, source: Arc<Mutex<Box<dyn Source>>>, 
                                     loss = loss * 0.9 + (f.loss_permille as f32 / 1000.0) * 0.1;
                                     link.set_parity(parity_for(loss));
                                 }
-                                if let Some(&(_, at_us, sent)) = captured.iter().find(|(n, _, _)| *n == f.frame) {
+                                if let Some(&(_, at_us, sent, bytes)) = captured.iter().find(|(n, _, _, _)| *n == f.frame) {
                                     // The frame's round trip on this machine's clock alone (the client's can
                                     // be offset and drift, as a VM's does): queuing shows as it growing.
-                                    adapt.feedback(sent.elapsed().as_secs_f64() * 1000.0, Instant::now());
+                                    // Less the client's own time decoding it (both its times are on its clock):
+                                    // what's left is the network's, which is what the bitrate can change.
+                                    let decode_ms = f.decoded_us.saturating_sub(f.received_us) as f64 / 1000.0;
+                                    let rtt = sent.elapsed().as_secs_f64() * 1000.0 - decode_ms.min(1000.0);
+                                    adapt.feedback(rtt.max(0.0), bytes, Instant::now());
                                     let mut s = stats.lock().unwrap();
                                     let l = (now_us().saturating_sub(at_us)) as f64 / 1000.0 - s.rtt_ms / 2.0;
                                     s.latency_ms.push(l.max(0.0));
@@ -621,7 +656,12 @@ fn session(mut link: Box<dyn Link + Send>, source: Arc<Mutex<Box<dyn Source>>>, 
                     let done = {
                         let mut src = source.lock().unwrap();
                         // Zero copy where both ends can: the system's own frame straight into the hardware encoder.
-                        let surface = if enc.takes_surfaces() { src.surface() } else { None };
+                        let scaled = (ew, eh) != enc_full;
+                        let surface = if enc.takes_surfaces() && (!scaled || enc.scales_surfaces()) {
+                            src.surface()
+                        } else {
+                            None
+                        };
                         if let Some(surface) = surface {
                             let grab_ms = t0.elapsed().as_secs_f64() * 1000.0;
                             encoding.push_back((captured_at, t0, grab_ms));
@@ -630,7 +670,12 @@ fn session(mut link: Box<dyn Link + Send>, source: Arc<Mutex<Box<dyn Source>>>, 
                             let frame = src.grab()?;
                             let grab_ms = t0.elapsed().as_secs_f64() * 1000.0;
                             encoding.push_back((captured_at, t0, grab_ms));
-                            enc.encode(frame.bgra, frame.stride, captured_at)?
+                            if scaled {
+                                crate::yuv::scale_down(frame.bgra, frame.stride, w, h, &mut small, ew, eh);
+                                enc.encode(&small, ew * 4, captured_at)?
+                            } else {
+                                enc.encode(frame.bgra, frame.stride, captured_at)?
+                            }
                         }
                     };
                     for e in done {
@@ -656,6 +701,21 @@ fn session(mut link: Box<dyn Link + Send>, source: Arc<Mutex<Box<dyn Source>>>, 
             if let Some(t) = adapt.tick(last_adapt).filter(|_| !off) {
                 enc.set_bitrate(t.kbps)?;
                 frame_time = Duration::from_secs_f64(1.0 / t.fps.max(1) as f64);
+                // A new picture size: a new encoder (its first frame a keyframe) and Config.
+                let size = scaled_size(enc_full, t.scale);
+                if size != (ew, eh) && std::env::var("RR_SCALE").as_deref() != Ok("off") {
+                    enc = crate::encode::open(codec, size.0, size.1, fps as f32, t.kbps)?;
+                    (ew, eh) = enc.size();
+                    encoding.clear();
+                    link.send(&Message::Config(Config {
+                        codec,
+                        width: ew as u16,
+                        height: eh as u16,
+                        fps: fps as u16,
+                        bitrate_kbps: t.kbps,
+                    }))?;
+                    eprintln!("rein-remote: picture {ew}×{eh} ({:.0}%) for {} kbit/s", t.scale * 100.0, t.kbps);
+                }
             }
             let t = adapt.target();
             if std::env::var_os("RR_DEBUG_ADAPT").is_some() {
@@ -678,6 +738,17 @@ fn session(mut link: Box<dyn Link + Send>, source: Arc<Mutex<Box<dyn Source>>>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scaled_pictures_map_input_back_to_the_source() {
+        assert_eq!(scaled_size((1920, 1080), 0.5), (960, 540));
+        assert_eq!(scaled_size((1920, 1080), 0.75), (1440, 810));
+        assert_eq!(scaled_size((200, 100), 0.5), (160, 90));
+        let ev = unscale(rr_proto::Input::PointerMove { x: 480, y: 270 }, (960, 540), (1920, 1080));
+        assert_eq!(ev, rr_proto::Input::PointerMove { x: 960, y: 540 });
+        let same = unscale(rr_proto::Input::PointerMove { x: 5, y: 6 }, (1920, 1080), (1920, 1080));
+        assert_eq!(same, rr_proto::Input::PointerMove { x: 5, y: 6 });
+    }
 
     #[test]
     fn paces_to_the_clients_display() {

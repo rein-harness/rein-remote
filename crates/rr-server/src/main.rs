@@ -34,7 +34,7 @@ use capture::{Source, TestPattern};
 
 fn usage() -> ! {
     eprintln!(
-        "rein-remote {}\n\nusage:\n  rein-remote serve [--display :N | --window APP|TITLE|ID | --app NAME | --vnc HOST:PORT [--vnc-password P] | --pipe WxH | --test-pattern [WxH]] [--listen ADDR] [--fps auto|N] [--codec h264|h265|auto] [--bitrate KBPS] [--token T] [--webtransport on|off] [--tls-cert PEM --tls-key PEM] [--tailscale-cert on|off] [--mdns on|off] [--pair on|off] [--relay ws(s)://HOST:PORT [--room CODE] [--relay-secret S]]\n  rein-remote relay [--listen ADDR] [--secret S]\n  rein-remote windows [--json]\n  rein-remote displays\n  rein-remote discover [SECONDS]\n  rein-remote paired | unpair ID\n  rein-remote selftest [--window Q | --display :N | --test-pattern] [--type TEXT]\n  rein-remote --version",
+        "rein-remote {}\n\nusage:\n  rein-remote serve [--display :N | --window APP|TITLE|ID | --app NAME | --vnc HOST:PORT [--vnc-password P] | --pipe WxH | --test-pattern [WxH] [--motion full]] [--listen ADDR] [--fps auto|N] [--codec h264|h265|auto] [--bitrate KBPS] [--token T] [--webtransport on|off] [--tls-cert PEM --tls-key PEM] [--tailscale-cert on|off] [--mdns on|off] [--pair on|off] [--relay ws(s)://HOST:PORT [--room CODE] [--relay-secret S]]\n  rein-remote relay [--listen ADDR] [--secret S]\n  rein-remote windows [--json]\n  rein-remote displays\n  rein-remote discover [SECONDS]\n  rein-remote paired | unpair ID\n  rein-remote selftest [--window Q | --display :N | --test-pattern] [--type TEXT]\n  rein-remote --version",
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(2);
@@ -169,6 +169,7 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
     let mut pipe: Option<(usize, usize)> = None;
     let mut vnc_password = std::env::var("REIN_REMOTE_VNC_PASSWORD").ok();
     let mut pattern: Option<(usize, usize)> = None;
+    let mut full_motion = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut val = || it.next().cloned().ok_or_else(|| format!("{a} needs a value"));
@@ -194,6 +195,7 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
             "--display" => display = Some(val()?),
             "--window" => window = Some(val()?),
             "--app" => app = Some(val()?),
+            "--motion" => full_motion = val()? == "full",
             "--vnc" => vnc = Some(val()?),
             "--pipe" => {
                 let v = val()?;
@@ -249,6 +251,7 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
         opts.relay = Some((r, room, relay_secret));
     }
     let source: Box<dyn Source> = match (pattern, window) {
+        (Some((w, h)), _) if full_motion => Box::new(TestPattern::full_motion(w, h)),
         (Some((w, h)), _) => Box::new(TestPattern::new(w, h)),
         (None, _) if pipe.is_some() => Box::new(capture::pipe::Pipe::open(pipe.unwrap().0, pipe.unwrap().1)),
         (None, _) if vnc.is_some() => Box::new(capture::vnc::Vnc::open(vnc.as_deref().unwrap(), vnc_password.as_deref())?),
