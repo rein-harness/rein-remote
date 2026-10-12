@@ -185,6 +185,8 @@ jobs:
             echo "no window on this runner"
           fi
           kill %1 || true
+          # What the server said (its per-second stats left out): the encoder, each viewer, adapting.
+          grep -v '^rein-remote: {' serve.log || true
   wasm:
     runs-on: ubuntu-latest
     steps:

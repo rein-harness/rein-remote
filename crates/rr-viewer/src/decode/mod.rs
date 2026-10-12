@@ -113,7 +113,7 @@ pub fn no_hardware_why() -> String {
     #[cfg(windows)]
     return "the GPU lists no DXVA decoder for H.264 or HEVC (Media Foundation; RR_DECODER=mediafoundation uses its software decoder)".into();
     #[cfg(target_os = "linux")]
-    return format!("VA-API: {}", vaapi::probe().err().unwrap_or_else(|| "no H.264 decoder".into()));
+    return vaapi::probe().err().unwrap_or_else(|| "VA-API: no H.264 decoder".into());
     #[allow(unreachable_code)]
     "no hardware decoder on this platform".into()
 }
