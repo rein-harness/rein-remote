@@ -694,6 +694,8 @@ fn session(
     // The pointer as last sent: its place, and its image's serial (the image goes only when it changes).
     let mut cursor_sent: Option<(u16, u16, u32, bool)> = None;
     let mut seen_generation: Option<u64> = None;
+    // The client's decode times (ms) over the last second.
+    let mut decode_times: std::collections::VecDeque<(Instant, f64)> = Default::default();
     // Whether a frame has gone in where it was (said once in the log).
     let mut zero_copy = false;
     // Frames in the encoder: their capture time (the tag), when they were read, and how long reading took.
@@ -723,10 +725,18 @@ fn session(
                                 if let Some(&(_, at_us, sent, bytes)) = captured.iter().find(|(n, _, _, _)| *n == f.frame) {
                                     // The frame's round trip on this machine's clock alone (the client's can
                                     // be offset and drift, as a VM's does): queuing shows as it growing.
-                                    // Less the client's own time decoding it (both its times are on its clock):
-                                    // what's left is the network's, which is what the bitrate can change.
+                                    // Less the client's usual time decoding a frame (both its times are on its
+                                    // clock): its lowest over the last second, so decoding's own wander isn't
+                                    // taken for queuing, while a decoder falling behind (frames waiting for it)
+                                    // still is: that's a reason to send less too.
+                                    let now = Instant::now();
                                     let decode_ms = f.decoded_us.saturating_sub(f.received_us) as f64 / 1000.0;
-                                    let rtt = sent.elapsed().as_secs_f64() * 1000.0 - decode_ms.min(1000.0);
+                                    decode_times.push_back((now, decode_ms.min(1000.0)));
+                                    while decode_times.front().is_some_and(|(t, _)| now.duration_since(*t) > Duration::from_secs(1)) {
+                                        decode_times.pop_front();
+                                    }
+                                    let usual = decode_times.iter().map(|(_, d)| *d).fold(f64::INFINITY, f64::min);
+                                    let rtt = sent.elapsed().as_secs_f64() * 1000.0 - usual;
                                     adapt.feedback(rtt.max(0.0), bytes, Instant::now());
                                     let mut s = stats.lock().unwrap();
                                     let l = (now_us().saturating_sub(at_us)) as f64 / 1000.0 - s.rtt_ms / 2.0;
