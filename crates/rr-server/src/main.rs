@@ -29,12 +29,14 @@ mod encode_mf;
 mod encode_vaapi;
 #[cfg(target_os = "macos")]
 mod encode_vt;
+mod fleet;
 mod gamepad;
 #[cfg(target_os = "linux")]
 mod h264;
 mod identity;
 mod link;
 mod links;
+mod metrics;
 mod pairing;
 mod relay;
 mod serve;
@@ -45,7 +47,7 @@ use capture::{Source, TestPattern};
 
 fn usage() -> ! {
     eprintln!(
-        "rein-remote {}\n\nusage:\n  rein-remote serve [--display :N | --window APP|TITLE|ID | --app NAME | --kms [CONNECTOR] | --vnc HOST:PORT [--vnc-password P] | --pipe WxH | --test-pattern [WxH] [--motion full]] [--listen ADDR] [--fps auto|N] [--codec h264|h265|auto] [--bitrate KBPS] [--token T] [--webtransport on|off] [--tls-cert PEM --tls-key PEM] [--tailscale-cert on|off] [--mdns on|off] [--pair on|off] [--relay ws(s)://HOST:PORT [--room CODE] [--relay-secret S]] [--audio on|off]\n  rein-remote relay [--listen ADDR] [--secret S]\n  rein-remote windows [--json]\n  rein-remote displays\n  rein-remote discover [SECONDS]\n  rein-remote paired | unpair ID\n  rein-remote connect URL|NAME [--seconds N] [--pair CODE] [--json] [--webtransport on|off] [--datagrams on|off] [--direct on|off]\n  rein-remote selftest [--window Q | --display :N | --kms [CONNECTOR] | --test-pattern [WxH]] [--type TEXT] [--encode OUT.h264 [--frames N]]\n  rein-remote --version",
+        "rein-remote {}\n\nusage:\n  rein-remote serve [--display :N | --window APP|TITLE|ID | --app NAME | --kms [CONNECTOR] | --vnc HOST:PORT [--vnc-password P] | --pipe WxH | --test-pattern [WxH] [--motion full]] [--listen ADDR] [--fps auto|N] [--codec h264|h265|auto] [--bitrate KBPS] [--token T] [--webtransport on|off] [--tls-cert PEM --tls-key PEM] [--tailscale-cert on|off] [--mdns on|off] [--pair on|off] [--relay ws(s)://HOST:PORT ... [--room CODE] [--relay-secret S]] [--audio on|off]\n  rein-remote relay [--listen ADDR] [--secret S] [--metrics-listen ADDR|PORT|off]\n  rein-remote windows [--json]\n  rein-remote displays\n  rein-remote discover [SECONDS]\n  rein-remote paired | unpair ID\n  rein-remote connect URL|NAME [--seconds N] [--pair CODE] [--json] [--webtransport on|off] [--datagrams on|off] [--direct on|off]\n  rein-remote selftest [--window Q | --display :N | --kms [CONNECTOR] | --test-pattern [WxH]] [--type TEXT] [--encode OUT.h264 [--frames N]]\n  rein-remote --version",
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(2);
@@ -121,15 +123,20 @@ fn main() {
         }
         Some("relay") => {
             let (mut listen, mut secret) = ("0.0.0.0:7990".to_string(), std::env::var("REIN_REMOTE_RELAY_SECRET").ok());
+            // Metrics on this machine only, unless asked: a port number alone is 127.0.0.1's.
+            let mut metrics = Some("127.0.0.1:7991".to_string());
             let mut it = args[1..].iter();
             while let Some(a) = it.next() {
                 match (a.as_str(), it.next()) {
                     ("--listen", Some(v)) => listen = v.clone(),
                     ("--secret", Some(v)) => secret = Some(v.clone()),
+                    ("--metrics-listen", Some(v)) if v == "off" => metrics = None,
+                    ("--metrics-listen", Some(v)) if v.parse::<u16>().is_ok() => metrics = Some(format!("127.0.0.1:{v}")),
+                    ("--metrics-listen", Some(v)) => metrics = Some(v.clone()),
                     _ => usage(),
                 }
             }
-            if let Err(e) = relay::run(&listen, secret) {
+            if let Err(e) = relay::run(&listen, secret, metrics.as_deref()) {
                 eprintln!("rein-remote: {e}");
                 std::process::exit(1);
             }
@@ -178,7 +185,7 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
             k
         },
     };
-    let (mut relay, mut room, mut relay_secret) = (None, None, std::env::var("REIN_REMOTE_RELAY_SECRET").ok());
+    let (mut relay, mut room, mut relay_secret) = (Vec::new(), None, std::env::var("REIN_REMOTE_RELAY_SECRET").ok());
     let (mut tls_cert, mut tls_key) = (None, None);
     let mut display: Option<String> = None;
     let mut window: Option<String> = None;
@@ -226,7 +233,8 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
             }
             "--vnc-password" => vnc_password = Some(val()?),
             "--token" => opts.token = Some(val()?),
-            "--relay" => relay = Some(val()?),
+            // Again (or A,B): a fleet.
+            "--relay" => relay.push(val()?),
             "--tls-cert" => tls_cert = Some(std::path::PathBuf::from(val()?)),
             "--tls-key" => tls_key = Some(std::path::PathBuf::from(val()?)),
             "--tailscale-cert" => opts.tailscale_cert = !matches!(val()?.as_str(), "off" | "false" | "no"),
@@ -260,7 +268,8 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
         const ALPHABET: &[u8] = b"abcdefghijkmnpqrstuvwxyz23456789";
         opts.token = Some(b.iter().map(|x| ALPHABET[*x as usize % 32] as char).collect());
     }
-    if let Some(r) = relay {
+    let relay = fleet::relays(&relay);
+    if !relay.is_empty() {
         // A room code nobody can guess: 24 characters from the system's randomness.
         let room = room.unwrap_or_else(|| {
             let mut b = [0u8; 24];
@@ -271,7 +280,7 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
         if room.len() < 16 {
             return Err("--room needs 16 characters or more (or leave it out for a random one)".into());
         }
-        opts.relay = Some((r, room, relay_secret));
+        opts.relay = Some((relay, room, relay_secret));
     }
     let elsewhere = || if sound == Some(true) { Sound::System } else { Sound::Off };
     let (source, with): (Box<dyn Source>, Sound) = match (pattern, window) {

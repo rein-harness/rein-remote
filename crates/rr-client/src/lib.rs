@@ -10,7 +10,8 @@
 //!   `/info` (a self-signed one), or against the system's roots (a real one).
 //! - **WebSocket** (TCP), when UDP doesn't get through.
 //! - **A relay** (`http(s)://relay/?room=…#k=…`, the link `serve --relay` prints), sealed end to end
-//!   with the key after `#` (the relay can't read or change what it passes). From there, a **direct
+//!   with the key after `#` (the relay can't read or change what it passes); a fleet's other relays
+//!   after it (`&alt=`), tried in turn when the first isn't there. From there, a **direct
 //!   path** through NAT when there is one ([`direct`]): the session moves to it, and stays on the relay
 //!   when there isn't.
 //!
@@ -287,12 +288,35 @@ pub fn connect(target: &str, opts: Options) -> Result<Session, String> {
         let key: [u8; 32] = e2e::b64url_decode(k)
             .and_then(|k| k.try_into().ok())
             .ok_or("the link's key (#k=…) isn't a key")?;
-        let ws = format!("{ws_scheme}://{}/stream?room={room}", url.origin.authority());
-        relayed = Some(Relayed {
-            reflector: direct::reflector(&target),
-            room: room.to_string(),
-        });
-        link::websocket(&ws, tx.clone(), Transport::Relay)?.sealed(key)
+        // The relay the link names, then the others of its fleet (after #, `alt=`), in order: the
+        // machine waits in its room on each.
+        let mut relays = vec![format!("{ws_scheme}://{}{}", url.origin.authority(), url.path.trim_end_matches('/'))];
+        relays.extend(
+            http::param(&url.fragment, "alt")
+                .into_iter()
+                .flat_map(|a| a.split(','))
+                .filter(|a| !a.is_empty())
+                .map(|a| a.trim_end_matches('/').to_string()),
+        );
+        let mut tried = Vec::new();
+        let mut link = None;
+        for relay in &relays {
+            match link::websocket(&format!("{relay}/stream?room={room}"), tx.clone(), Transport::Relay) {
+                Ok(l) => {
+                    relayed = Some(Relayed {
+                        reflector: direct::reflector(relay),
+                        room: room.to_string(),
+                    });
+                    if !tried.is_empty() {
+                        notes.push(format!("through {relay} ({})", tried.join("; ")));
+                    }
+                    link = Some(l);
+                    break;
+                }
+                Err(e) => tried.push(format!("{relay}: {e}")),
+            }
+        }
+        link.ok_or_else(|| tried.join("; "))?.sealed(key)
     } else if target.starts_with("ws") {
         link::websocket(&target, tx.clone(), Transport::WebSocket)?
     } else {

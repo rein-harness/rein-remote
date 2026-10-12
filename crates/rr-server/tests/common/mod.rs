@@ -51,6 +51,12 @@ impl Proc {
         panic!("rein-remote didn't print {what:?} in {within:?}; it printed:\n{}", self.seen.join("\n"));
     }
 
+    /// Ends it now (as a crash or `kill -9` would: no goodbye to anyone).
+    pub fn kill(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
     /// The address from its "on http://ADDR" line (what Rein reads too).
     pub fn listening(&mut self) -> String {
         let l = self.wait_for("on http://", Duration::from_secs(30));
@@ -86,4 +92,17 @@ pub fn frames(s: &rr_client::Session, n: usize, within: Duration) -> bool {
         }
         got >= n
     })
+}
+
+/// A plain GET (`headers` added as they are): the status and the body.
+pub fn get(addr: &str, path: &str, headers: &str) -> (u16, String) {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(addr).expect("connects");
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    write!(s, "GET {path} HTTP/1.1\r\nHost: {addr}\r\n{headers}Connection: close\r\n\r\n").unwrap();
+    let mut out = String::new();
+    let _ = s.read_to_string(&mut out);
+    let status = out.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    let body = out.split_once("\r\n\r\n").map_or(String::new(), |(_, b)| b.to_string());
+    (status, body)
 }
