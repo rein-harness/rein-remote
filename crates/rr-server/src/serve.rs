@@ -5,8 +5,9 @@
 use crate::capture::Source;
 use crate::link::{E2eLink, Link, Recv, WsLink};
 use rr_proto::{
-    Codec, Config, Cursor, DirectOffer, Hello, Message, Video, FEATURE_AUDIO_DATAGRAMS, FEATURE_DIRECT, FEATURE_VIDEO_DATAGRAMS, INPUT_GAMEPAD, INPUT_KEYBOARD,
-    INPUT_POINTER, INPUT_TOUCH, VERSION_MAX, VERSION_MIN,
+    Access, Codec, Config, Cursor, DirectOffer, Hello, Message, Notice, Video, ACCESS_NO_AUDIO, ACCESS_NO_CLIPBOARD, ACCESS_RECORDED, ACCESS_VIEW_ONLY,
+    FEATURE_AUDIO_DATAGRAMS, FEATURE_DIRECT, FEATURE_PASTE, FEATURE_VIDEO_DATAGRAMS, INPUT_GAMEPAD, INPUT_KEYBOARD, INPUT_POINTER, INPUT_TOUCH, NOTICE_REFUSED,
+    NOTICE_TIME_LIMIT, VERSION_MAX, VERSION_MIN,
 };
 use std::io::Write;
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -57,6 +58,16 @@ pub struct Options {
     pub pair: Option<bool>,
     /// The sound that goes with the video, for viewers that play it (`--audio off`: none).
     pub audio: Option<Arc<crate::audio::Audio>>,
+    /// Sign-in with an identity provider (`--oidc-issuer`, `--saml-idp-metadata`).
+    pub signin: Option<Arc<crate::auth::SignIn>>,
+    /// Who may do what (`--policy`); None: everyone let in may do everything.
+    pub policy: Option<crate::policy::Policy>,
+    /// `--audit FILE` (off: logs nothing).
+    pub audit: Arc<crate::audit::Audit>,
+    /// `--record DIR`: sessions recorded there (as the policy says, all of them without one).
+    pub record: Option<std::path::PathBuf>,
+    /// What this server shows, as a policy's `sources` name it (`display`, `window:Simulator`…).
+    pub source_label: String,
 }
 
 /// Latency and throughput, kept per session and shown by /stats.
@@ -143,7 +154,32 @@ pub fn run(source: Box<dyn Source>, opts: Options) -> Result<(), String> {
     }
     // Who may connect: the token in the link, or a device paired with a code.
     let reachable = listener.local_addr().is_ok_and(|a| a.ip().is_unspecified());
-    let gate = Arc::new(crate::pairing::Gate::new(opts.token.clone(), opts.pair.unwrap_or(reachable)));
+    // With sign-in, pairing only when asked for (the identity provider says who may connect).
+    let pairing = opts.pair.unwrap_or(reachable && opts.signin.is_none());
+    let gate = Arc::new(crate::pairing::Gate::new(opts.token.clone(), pairing).with_access(
+        opts.signin.clone(),
+        opts.policy.take(),
+        opts.audit.clone(),
+        opts.source_label.clone(),
+    ));
+    if let Some(s) = &opts.signin {
+        eprintln!(
+            "rein-remote: sign-in with {} at {}/ ({})",
+            s.kind(),
+            s.public_url,
+            if gate.policy.is_some() {
+                "the policy decides who may do what"
+            } else {
+                "no --policy: everyone the identity provider signs in may watch and control"
+            }
+        );
+    }
+    if opts.audit.on() {
+        opts.audit.log(
+            "server_start",
+            serde_json::json!({"source": opts.source_label, "signin": opts.signin.as_ref().map(|s| s.kind()), "policy": gate.policy.is_some(), "record": opts.record.as_ref().map(|d| d.display().to_string()), "version": env!("CARGO_PKG_VERSION")}),
+        );
+    }
     if let (Some(code), Ok(at)) = (gate.new_code(), listener.local_addr()) {
         let host = crate::links::places()
             .into_iter()
@@ -172,14 +208,14 @@ pub fn run(source: Box<dyn Source>, opts: Options) -> Result<(), String> {
     // Through a relay: connected out to it first (its room open), so it answers this machine's probe.
     let direct: Arc<OnceLock<Direct>> = Arc::default();
     if let Some((relay, room, secret)) = opts.relay.clone() {
-        let (source, stats, opts, direct) = (source.clone(), stats.clone(), opts.clone(), direct.clone());
+        let (source, stats, opts, direct, gate) = (source.clone(), stats.clone(), opts.clone(), direct.clone(), gate.clone());
         let page = relay.replacen("ws", "http", 1);
         eprintln!(
             "rein-remote: through the relay: open {}/?room={room}#k={}",
             page.trim_end_matches('/'),
             rr_client::e2e::b64url(&opts.e2e_key)
         );
-        std::thread::spawn(move || through_relay(&relay, &room, secret.as_deref(), source, stats, &opts, &direct));
+        std::thread::spawn(move || through_relay(&relay, &room, secret.as_deref(), source, stats, &opts, &direct, &gate));
     }
     // WebTransport on the same port over UDP: the page connects with it when the browser can.
     let wt: Arc<Option<(u16, Option<[u8; 32]>)>> = Arc::new(match (opts.webtransport, listener.local_addr()) {
@@ -189,8 +225,8 @@ pub fn run(source: Box<dyn Source>, opts: Options) -> Result<(), String> {
                 // Through a relay: this socket's address beyond NAT, learned before QUIC takes it.
                 let relayed = opts.relay.as_ref().map(|(relay, room, _)| beyond_nat(&udp, relay, room));
                 let punch = udp.try_clone().ok();
-                let hash = crate::link::webtransport(udp, gate.clone(), opts.tls.clone(), move |link| {
-                    if let Err(e) = session(link, source.clone(), stats.clone(), &o, None) {
+                let hash = crate::link::webtransport(udp, gate.clone(), opts.tls.clone(), move |link, adm| {
+                    if let Err(e) = session(link, source.clone(), stats.clone(), &o, None, adm) {
                         eprintln!("rein-remote: {e}");
                     }
                 })?;
@@ -272,6 +308,7 @@ fn beyond_nat(udp: &UdpSocket, relay: &str, room: &str) -> Option<SocketAddr> {
 }
 
 /// Connected out to a relay: one viewer at a time, then the room again for the next.
+#[allow(clippy::too_many_arguments)]
 fn through_relay(
     relay: &str,
     room: &str,
@@ -280,6 +317,7 @@ fn through_relay(
     stats: Arc<Mutex<Stats>>,
     opts: &Options,
     direct: &OnceLock<Direct>,
+    gate: &crate::pairing::Gate,
 ) {
     let url = format!(
         "{}/host?room={room}{}",
@@ -307,7 +345,15 @@ fn through_relay(
                         continue;
                     }
                 };
-                if let Err(e) = session(Box::new(link), source.clone(), stats.clone(), opts, Some(direct)) {
+                // A viewer through the relay is whoever has the link's key: the policy's `via = ["relay"]`.
+                let adm = match gate.admission(crate::auth::Principal::new("relay viewer", "relay"), "relay", relay.to_string()) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        eprintln!("rein-remote: no viewers through the relay ({e})");
+                        return;
+                    }
+                };
+                if let Err(e) = session(Box::new(link), source.clone(), stats.clone(), opts, Some(direct), adm) {
                     eprintln!("rein-remote: {e}");
                 }
             }
@@ -329,6 +375,7 @@ fn handle(
     tls: Option<&Arc<rustls::ServerConfig>>,
     gate: &crate::pairing::Gate,
 ) -> Result<(), String> {
+    let peer = stream.peer_addr().map_or_else(|_| "?".to_string(), |a| a.to_string());
     let mut conn = crate::conn::Conn::accept(stream, tls)?;
     let head = conn.read_head()?;
     let req = String::from_utf8_lossy(&head).to_string();
@@ -337,17 +384,63 @@ fn handle(
     let path = target.split(['?', '#']).next().unwrap_or("/").to_string();
     let upgrade = req.to_ascii_lowercase().contains("upgrade: websocket");
     let query = target.split_once('?').map_or("", |(_, q)| q.split('#').next().unwrap_or(""));
-    // The token or a paired device's ticket (compared in full, not stopping at the first difference).
-    let token_ok = gate.allows(query);
-    // Pairing and signing in: small forms, answered here.
     let method = req.split_whitespace().next().unwrap_or("GET").to_string();
+    let (cookies, origin, host) = (header(&req, "cookie"), header(&req, "origin"), header(&req, "host"));
+    // Signing in with the identity provider (a SAML response is a big form: 64 KB).
+    if path.starts_with("/sso/") {
+        let body = if method == "POST" {
+            read_body(&head, &req, &mut conn, 64 * 1024)?
+        } else {
+            String::new()
+        };
+        let r = crate::auth::Req {
+            method: &method,
+            path: &path,
+            query,
+            body: &body,
+            cookies: cookies.unwrap_or(""),
+            origin,
+            host,
+            peer: peer.clone(),
+        };
+        if let Some(resp) = gate.sso(&r) {
+            let extra: String = resp.headers.iter().map(|h| format!("{h}\r\n")).collect();
+            let out = format!(
+                "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\n{extra}Connection: close\r\n\r\n{}",
+                resp.status,
+                resp.kind,
+                resp.body.len(),
+                resp.body
+            );
+            return conn.write_all(out.as_bytes()).map_err(|e| e.to_string());
+        }
+    }
+    // Who it is: the token or a ticket (compared in full, not stopping at the first difference), or a
+    // signed-in browser's cookie, from this server's own page only (a page elsewhere on this machine
+    // could otherwise open the stream with this browser's sign-in).
+    let own_page = gate.signin.as_ref().is_some_and(|s| crate::auth::same_origin(origin, host, &s.public_url));
+    let principal = gate.admit(query, cookies.filter(|_| own_page));
+    // Pairing and signing in: small forms, answered here.
     if path.starts_with("/pair/") || path.starts_with("/auth") {
         let body = if method == "POST" {
-            read_body(&head, &req, &mut conn)?
+            read_body(&head, &req, &mut conn, 8192)?
         } else {
             String::new()
         };
         if let Some((status, json)) = gate.handle(&method, &path, query, &body) {
+            // Pairing and a paired device signing in, for the audit log (never the answer: it has the ticket).
+            let ok = status.starts_with("200");
+            match path.as_str() {
+                "/pair/finish" => gate.audit.log(
+                    if ok { "pair" } else { "pair_failed" },
+                    serde_json::json!({"addr": peer, "device": rr_client::http::json_str(&json, "id"), "reason": rr_client::http::json_str(&json, "error")}),
+                ),
+                "/auth" => gate.audit.log(
+                    if ok { "device_signin" } else { "device_signin_failed" },
+                    serde_json::json!({"addr": peer, "reason": rr_client::http::json_str(&json, "error")}),
+                ),
+                _ => {}
+            }
             let resp = format!(
                 "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{json}",
                 json.len()
@@ -355,11 +448,26 @@ fn handle(
             return conn.write_all(resp.as_bytes()).map_err(|e| e.to_string());
         }
     }
-    if (path.starts_with("/stream") || path == "/stats") && !token_ok {
+    if (path.starts_with("/stream") || path == "/stats") && principal.is_none() {
+        gate.audit.log(
+            "session_refused",
+            serde_json::json!({"addr": peer, "transport": if upgrade { "websocket" } else { "http" }, "reason": "no valid token, ticket or sign-in"}),
+        );
         let _ = conn.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         return Ok(());
     }
     if path.starts_with("/stream") && upgrade {
+        let adm = match gate.admission(principal.unwrap(), "websocket", peer) {
+            Ok(a) => a,
+            Err(why) => {
+                let resp = format!(
+                    "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{why}",
+                    why.len()
+                );
+                let _ = conn.write_all(resp.as_bytes());
+                return Ok(());
+            }
+        };
         // Frames go at once, and the kernel holds only ~50 ms of them at the top bitrate: a slow link
         // shows up as a connection that backs up within a frame or two (keyframe-and-skip, and the
         // controller backs off), instead of a second of video queued where neither can see it.
@@ -367,7 +475,7 @@ fn handle(
         let _ = conn.tcp().set_nodelay(true);
         let _ = socket2::SockRef::from(conn.tcp()).set_send_buffer_size((opts.bitrate_kbps as usize * 1000 / 8 / 20).max(64 * 1024));
         let ws = tungstenite::accept(crate::conn::Replay::new(head, conn)).map_err(|e| format!("websocket: {e}"))?;
-        return session(Box::new(WsLink::new(ws)), source, stats, opts, None);
+        return session(Box::new(WsLink::new(ws)), source, stats, opts, None, adm);
     }
     let (status, kind, body) = match path.as_str() {
         p if web_file(p).is_some() => {
@@ -385,7 +493,9 @@ fn handle(
             };
             // This machine's fingerprint (the page signs in to the one it paired with) when it pairs.
             let id = gate.fingerprint().map_or("null".to_string(), |f| format!("\"{f}\""));
-            format!(r#"{{"webtransport":{wt},"id":{id}}}"#)
+            // How the page signs in, when it signs in with an identity provider.
+            let signin = gate.signin.as_ref().map_or("null".to_string(), |s| format!("\"{}\"", s.kind()));
+            format!(r#"{{"webtransport":{wt},"id":{id},"signin":{signin}}}"#)
         }),
         _ => ("404 Not Found", "text/plain", "not found".to_string()),
     };
@@ -396,8 +506,16 @@ fn handle(
     conn.write_all(resp.as_bytes()).map_err(|e| e.to_string())
 }
 
-/// A POST's form body (what came with the head, then the rest up to its Content-Length, 8 KB at most).
-fn read_body(head: &[u8], req: &str, conn: &mut crate::conn::Conn) -> Result<String, String> {
+/// A header's value (the first one by that name).
+fn header<'a>(req: &'a str, name: &str) -> Option<&'a str> {
+    req.lines()
+        .skip(1)
+        .take_while(|l| !l.is_empty())
+        .find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case(name)).map(|(_, v)| v.trim()))
+}
+
+/// A POST's form body (what came with the head, then the rest up to its Content-Length, `max` at most).
+fn read_body(head: &[u8], req: &str, conn: &mut crate::conn::Conn, max: usize) -> Result<String, String> {
     use std::io::Read;
     let len: usize = req
         .lines()
@@ -407,7 +525,7 @@ fn read_body(head: &[u8], req: &str, conn: &mut crate::conn::Conn) -> Result<Str
                 .map(|(_, v)| v.trim().parse().unwrap_or(0))
         })
         .unwrap_or(0);
-    if len > 8192 {
+    if len > max {
         return Err("a request body too big".into());
     }
     let at = head.windows(4).position(|w| w == b"\r\n\r\n").map_or(head.len(), |p| p + 4);
@@ -470,6 +588,27 @@ fn send_frame(
         }
     }
     Ok(())
+}
+
+/// A recording that ends (its file finished, its size said) however the session does.
+struct RecordOnDrop(crate::record::Recorder);
+
+impl Drop for RecordOnDrop {
+    fn drop(&mut self) {
+        match self.0.finish() {
+            Ok(n) => eprintln!("rein-remote: recorded {} ({:.1} MB)", self.0.path.display(), n as f64 / 1e6),
+            Err(e) => eprintln!("rein-remote: the recording {}: {e}", self.0.path.display()),
+        }
+    }
+}
+
+/// A frame for the recording, and the session's count of what it sent.
+fn record(r: &Option<RecordOnDrop>, e: &crate::encode::Encoded, out: &mut Outcome) {
+    out.frames += 1;
+    out.bytes += e.data.len() as u64;
+    if let Some(r) = r {
+        r.0.video(&e.data, e.keyframe, e.tag);
+    }
 }
 
 /// The picture's size at `scale` of `full` (even, at least 160×90).
@@ -561,14 +700,61 @@ fn stats_json(s: &Stats, audio: Option<&crate::audio::Audio>) -> String {
     )
 }
 
+/// What a session did, for the audit log when it ends.
+#[derive(Default)]
+struct Outcome {
+    frames: u64,
+    bytes: u64,
+    input_dropped: u64,
+    pastes_dropped: u64,
+    recording: Option<String>,
+    recording_bytes: u64,
+    ended: Option<&'static str>,
+}
+
+/// One viewer's session, let in as `adm` says: said in the audit log when it starts and ends.
 fn session(
-    mut link: Box<dyn Link + Send>,
+    link: Box<dyn Link + Send>,
     source: Arc<Mutex<Box<dyn Source>>>,
     stats: Arc<Mutex<Stats>>,
     opts: &Options,
     // Some for a session through the relay: what it can offer for a direct path, once there is that.
     direct: Option<&OnceLock<Direct>>,
+    adm: crate::auth::Admission,
 ) -> Result<(), String> {
+    let started = Instant::now();
+    let mut start = adm.audit_fields();
+    start["source"] = opts.source_label.clone().into();
+    opts.audit.log("session_start", start);
+    let mut out = Outcome::default();
+    let r = stream(link, source, stats, opts, direct, &adm, &mut out);
+    // The recording is finished by now (its writer joined when the session's stream ended).
+    if let Some(p) = &out.recording {
+        out.recording_bytes = std::fs::metadata(p).map_or(0, |m| m.len());
+    }
+    opts.audit.log(
+        "session_end",
+        serde_json::json!({
+            "session": adm.id, "user": adm.principal.user, "via": adm.principal.via, "addr": adm.addr, "transport": adm.transport,
+            "seconds": (started.elapsed().as_secs_f64() * 10.0).round() / 10.0, "frames": out.frames, "bytes": out.bytes,
+            "input_dropped": out.input_dropped, "pastes_dropped": out.pastes_dropped,
+            "recording": out.recording, "recording_bytes": (out.recording_bytes > 0).then_some(out.recording_bytes),
+            "reason": out.ended.unwrap_or(if r.is_ok() { "closed" } else { "error" }), "error": r.as_ref().err(),
+        }),
+    );
+    r
+}
+
+fn stream(
+    mut link: Box<dyn Link + Send>,
+    source: Arc<Mutex<Box<dyn Source>>>,
+    stats: Arc<Mutex<Stats>>,
+    opts: &Options,
+    direct: Option<&OnceLock<Direct>>,
+    adm: &crate::auth::Admission,
+    out: &mut Outcome,
+) -> Result<(), String> {
+    let perms = &adm.perms;
     let (w, h) = source.lock().unwrap().size();
     // What this machine encodes, the codec asked for first (H.264 by default: every device decodes
     // it); with `auto`, HEVC first when this machine encodes it in hardware.
@@ -587,11 +773,16 @@ fn session(
         max_width: w as u16,
         max_height: h as u16,
         max_fps: if opts.fps == 0 { MAX_FPS } else { opts.fps } as u16,
-        audio: opts.audio.is_some(),
-        // Gamepads too, where this machine can make a virtual one.
-        input: INPUT_POINTER | INPUT_KEYBOARD | INPUT_TOUCH | if crate::gamepad::available().is_ok() { INPUT_GAMEPAD } else { 0 },
+        // No sound for a viewer the policy gives none.
+        audio: opts.audio.is_some() && perms.audio,
+        // Gamepads too, where this machine can make a virtual one; none for a viewer who may only watch.
+        input: if perms.input {
+            INPUT_POINTER | INPUT_KEYBOARD | INPUT_TOUCH | if crate::gamepad::available().is_ok() { INPUT_GAMEPAD } else { 0 }
+        } else {
+            0
+        },
         refresh_mhz: 0,
-        features: 0,
+        features: FEATURE_PASTE,
     };
     link.send(&Message::Hello(hello.clone()))?;
     link.flushed()?;
@@ -616,6 +807,8 @@ fn session(
             Recv::Nothing => {}
         }
     };
+    // When the policy ends it.
+    let deadline = adm.deadline();
     // The viewer's gamepads, as virtual pads for as long as the session lasts (why not, said when
     // the first comes).
     let mut pads = crate::gamepad::Pads::default();
@@ -654,19 +847,72 @@ fn session(
     let mut loss = 0.0f32;
     // Sound, to a client that plays it (one that doesn't say so, an older one, gets none): as
     // datagrams of its own when it takes them (a lost packet is a gap, never a wait), else in order.
-    let audio = opts.audio.as_ref().filter(|_| client.audio).map(|a| a.listen());
-    let audio_datagrams = audio.is_some() && client.features & FEATURE_AUDIO_DATAGRAMS != 0 && link.use_audio_datagrams();
+    // Recorded when the server records and the policy (or no policy) says so; with the sound when there is.
+    let record_dir = opts.record.as_ref().filter(|_| perms.record.unwrap_or(true));
+    let recorder = match record_dir {
+        Some(dir) => match crate::record::Recorder::start(dir, &adm.principal.user, &adm.id, codec, ew as u16, eh as u16, opts.audio.is_some()) {
+            Ok(r) => {
+                eprintln!("rein-remote: recording {}'s session to {}", adm.principal.user, r.path.display());
+                out.recording = Some(r.path.display().to_string());
+                Some(r)
+            }
+            Err(e) => {
+                // A session the policy says to record isn't streamed unrecorded.
+                link.send(&Message::Notice(Notice {
+                    code: NOTICE_REFUSED,
+                    text: format!("this session must be recorded, and can't be: {e}"),
+                }))?;
+                link.flushed()?;
+                out.ended = Some("recording failed");
+                return Err(format!("{}: not recorded ({e}), so not streamed", adm.principal.user));
+            }
+        },
+        None => None,
+    };
+    let recorder = recorder.map(RecordOnDrop);
+    let play = client.audio && perms.audio;
+    let audio = opts.audio.as_ref().filter(|_| play || recorder.is_some()).map(|a| a.listen());
+    let audio_datagrams = play && audio.is_some() && client.features & FEATURE_AUDIO_DATAGRAMS != 0 && link.use_audio_datagrams();
+    // What this viewer may do, so the page can say so (an older client skips it).
+    let mut flags = 0;
+    if !perms.input {
+        flags |= ACCESS_VIEW_ONLY;
+    }
+    if !perms.clipboard {
+        flags |= ACCESS_NO_CLIPBOARD;
+    }
+    if !perms.audio {
+        flags |= ACCESS_NO_AUDIO;
+    }
+    if recorder.is_some() {
+        flags |= ACCESS_RECORDED;
+    }
+    link.send(&Message::Access(Access {
+        user: adm.principal.user.clone(),
+        flags,
+        seconds_left: deadline.map_or(0, |d| d.saturating_duration_since(Instant::now()).as_secs().max(1) as u32),
+    }))?;
     eprintln!(
         "rein-remote: {} connected ({:?} {ew}×{eh} at {fps} fps{refresh}{}{})",
         client.name,
         codec,
         if datagrams { ", video as datagrams" } else { "" },
-        match (&audio, audio_datagrams) {
-            (None, _) => "",
-            (Some(_), true) => ", sound as datagrams",
-            (Some(_), false) => ", with sound",
+        match (play && audio.is_some(), audio_datagrams) {
+            (false, _) => "",
+            (true, true) => ", sound as datagrams",
+            (true, false) => ", with sound",
         }
     );
+    if !perms.input || adm.principal.via != "open" && adm.principal.via != "token" {
+        eprintln!(
+            "rein-remote: {} is {} ({}, policy rule {}){}",
+            client.name,
+            adm.principal.user,
+            adm.principal.via,
+            adm.rule,
+            if perms.input { "" } else { ", view only" }
+        );
+    }
     // A viewer through the relay that can go direct: where to find this machine, the certificate to
     // expect, a ticket for one session. Sealed like everything else here, so the relay can't use it.
     // (Read now, not when the session began: a relayed session waits for its viewer from before
@@ -674,7 +920,7 @@ fn session(
     let direct = direct.and_then(OnceLock::get);
     let mut punch_tag = None;
     if let Some(d) = direct.filter(|_| client.features & FEATURE_DIRECT != 0) {
-        let ticket = d.gate.ticket_once();
+        let ticket = d.gate.ticket_once(adm.principal.clone());
         punch_tag = Some(rr_proto::punch::tag(&ticket));
         link.send(&Message::DirectOffer(DirectOffer {
             candidates: d.candidates.clone(),
@@ -713,6 +959,20 @@ fn session(
                     while at < b.len() {
                         let Ok((m, used)) = Message::decode(&b[at..]) else { break };
                         at += used;
+                        // A viewer who may only watch: no input at all reaches the machine.
+                        if !perms.input && matches!(m, Some(Message::Input(_))) {
+                            out.input_dropped += 1;
+                            continue;
+                        }
+                        // The clipboard off: no pastes (a viewer who may control can still type).
+                        let m = match m {
+                            Some(Message::Input(rr_proto::Input::Paste { .. })) | Some(Message::Clipboard { .. }) if !perms.clipboard => {
+                                out.pastes_dropped += 1;
+                                continue;
+                            }
+                            Some(Message::Input(rr_proto::Input::Paste { text })) => Some(Message::Input(rr_proto::Input::Text { text })),
+                            m => m,
+                        };
                         match m {
                             Some(Message::Input(rr_proto::Input::Gamepad {
                                 pad,
@@ -801,6 +1061,14 @@ fn session(
         if let Some(l) = &audio {
             let mut sent = false;
             while let Ok(frame) = l.packets.try_recv() {
+                if let Some(r) = &recorder {
+                    if let Ok((Some(Message::Audio(a)), _)) = Message::decode(&frame) {
+                        r.0.audio(&a.data, a.timestamp_us);
+                    }
+                }
+                if !play {
+                    continue;
+                }
                 link.send_audio(frame.to_vec())?;
                 sent = true;
             }
@@ -822,6 +1090,18 @@ fn session(
                     shape,
                 }))?;
             }
+        }
+        // The policy's time limit: the viewer is told why, then the session ends.
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            let mins = perms.max_session.map_or(0, |m| m.as_secs().div_ceil(60));
+            link.send(&Message::Notice(Notice {
+                code: NOTICE_TIME_LIMIT,
+                text: format!("the session reached its time limit ({mins} min): sign in again for another"),
+            }))?;
+            let _ = link.flushed();
+            eprintln!("rein-remote: {}'s session reached its time limit", adm.principal.user);
+            out.ended = Some("time limit");
+            return Ok(());
         }
         if last_ping.elapsed() > Duration::from_secs(1) {
             last_ping = Instant::now();
@@ -883,6 +1163,7 @@ fn session(
                         }
                     };
                     for e in done {
+                        record(&recorder, &e, out);
                         send_frame(e, &mut *link, &mut encoding, &mut captured, &mut frame_no, &stats)?;
                     }
                 }
@@ -891,6 +1172,7 @@ fn session(
         // Frames a pipelined encoder finished since: out at once.
         if enc.in_flight() > 0 || !encoding.is_empty() {
             for e in enc.poll()? {
+                record(&recorder, &e, out);
                 send_frame(e, &mut *link, &mut encoding, &mut captured, &mut frame_no, &stats)?;
             }
         }
@@ -994,10 +1276,18 @@ mod tests {
             mdns: false,
             pair: None,
             audio: crate::audio::Audio::new(sound),
+            signin: None,
+            policy: None,
+            audit: Default::default(),
+            record: None,
+            source_label: "test-pattern".into(),
         };
         tx.send(hello).unwrap();
         let source: Arc<Mutex<Box<dyn Source>>> = Arc::new(Mutex::new(Box::new(crate::capture::TestPattern::new(320, 240))));
-        let run = std::thread::spawn(move || session(Box::new(link), source, Arc::new(Mutex::new(Stats::default())), &opts, None));
+        let adm = crate::pairing::Gate::new(None, false)
+            .admission(crate::auth::Principal::new("anyone", "open"), "memory", "test".into())
+            .unwrap();
+        let run = std::thread::spawn(move || session(Box::new(link), source, Arc::new(Mutex::new(Stats::default())), &opts, None, adm));
         let start = Instant::now();
         while !sent.lock().unwrap().iter().any(|f| f[0] == rr_proto::kind::VIDEO) && start.elapsed() < Duration::from_secs(30) {
             std::thread::sleep(Duration::from_millis(20));
@@ -1063,6 +1353,301 @@ mod tests {
         let (kinds, server) = session_with(Message::Hello(client_hello(true)).encode(), Sound::Off, 0.5);
         assert!(!server.audio);
         assert_eq!(count(&kinds, kind::AUDIO), 0);
+    }
+
+    /// The test pattern, with the input that reaches it kept (to see what a policy let through).
+    struct Spy(crate::capture::TestPattern, Arc<Mutex<Vec<rr_proto::Input>>>);
+
+    impl Source for Spy {
+        fn size(&self) -> (usize, usize) {
+            self.0.size()
+        }
+        fn grab(&mut self) -> Result<crate::capture::Frame<'_>, String> {
+            self.0.grab()
+        }
+        fn input(&mut self, ev: &rr_proto::Input) -> Result<(), String> {
+            self.1.lock().unwrap().push(ev.clone());
+            Ok(())
+        }
+    }
+
+    /// One HTTP request: status, headers (names lowercased), body.
+    fn http(port: u16, method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> (u16, Vec<(String, String)>, String) {
+        use std::io::Read;
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let extra: String = headers.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect();
+        write!(
+            c,
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut out = String::new();
+        c.read_to_string(&mut out).unwrap();
+        let (head, body) = out.split_once("\r\n\r\n").unwrap();
+        let mut lines = head.lines();
+        let status = lines.next().unwrap().split_whitespace().nth(1).unwrap().parse().unwrap();
+        let hs = lines
+            .filter_map(|l| l.split_once(':'))
+            .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+            .collect();
+        (status, hs, body.to_string())
+    }
+
+    fn get<'a>(hs: &'a [(String, String)], name: &str) -> Vec<&'a str> {
+        hs.iter().filter(|(k, _)| k == name).map(|(_, v)| v.as_str()).collect()
+    }
+
+    /// Signs `user` in through the (mock) provider, as a browser would: the session cookie, or the page
+    /// the server answered with (refused).
+    fn sign_in(port: u16, idp: &crate::auth::oidc::mock::Idp, key: &crate::auth::jwt::testing::Signer, user: &str, groups: &[&str]) -> Result<String, String> {
+        let (st, hs, _) = http(port, "GET", "/sso/login?next=/%3Fmeasure", &[], "");
+        assert_eq!(st, 302);
+        let to = get(&hs, "location")[0].to_string();
+        assert!(to.starts_with(&format!("{}/authorize?", idp.issuer)), "{to}");
+        let login = get(&hs, "set-cookie").into_iter().find(|c| c.starts_with("rr_login=")).unwrap();
+        assert!(login.contains("HttpOnly") && login.contains("SameSite=Lax"));
+        let login = login.split(';').next().unwrap().to_string();
+        let q = crate::pairing::form(to.split_once('?').unwrap().1);
+        let t = std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let claims = serde_json::json!({"iss": idp.issuer, "aud": "rr-test", "sub": user, "email": user, "groups": groups,
+            "nonce": q["nonce"], "iat": t, "exp": t + 300});
+        *idp.next.lock().unwrap() = (200, serde_json::json!({"id_token": key.sign(&claims)}).to_string());
+        let (st, hs, body) = http(
+            port,
+            "GET",
+            &format!("/sso/oidc/callback?code=c-{user}&state={}", q["state"]),
+            &[("Cookie", &login)],
+            "",
+        );
+        if st != 302 {
+            return Err(body);
+        }
+        assert_eq!(get(&hs, "location"), vec!["/?measure"]);
+        let c = get(&hs, "set-cookie").into_iter().find(|c| c.starts_with("rr_session=")).unwrap();
+        Ok(c.split(';').next().unwrap().to_string())
+    }
+
+    /// A viewer on /stream?ticket=…: what the server said (Access, Notice) and how many frames came in
+    /// `secs`, after sending `input` (a key, a click, a paste) once the stream started.
+    fn watch(port: u16, query: &str, extra: &[(&str, &str)], input: &[rr_proto::Input], secs: f32) -> Result<(Vec<Message>, usize), u16> {
+        use tungstenite::client::IntoClientRequest;
+        let mut req = format!("ws://127.0.0.1:{port}/stream?{query}").into_client_request().unwrap();
+        for (k, v) in extra {
+            req.headers_mut()
+                .insert(tungstenite::http::HeaderName::from_bytes(k.as_bytes()).unwrap(), v.parse().unwrap());
+        }
+        let (mut ws, _) = match tungstenite::connect(req) {
+            Ok(x) => x,
+            Err(tungstenite::Error::Http(r)) => return Err(r.status().as_u16()),
+            Err(e) => panic!("{e}"),
+        };
+        ws.send(tungstenite::Message::binary(Message::Hello(client_hello(true)).encode())).unwrap();
+        let (mut said, mut frames) = (vec![], 0);
+        let start = Instant::now();
+        let mut sent = false;
+        while start.elapsed() < Duration::from_secs_f32(secs) {
+            let Ok(m) = ws.read() else { break };
+            let tungstenite::Message::Binary(b) = m else { continue };
+            let mut at = 0;
+            while let Ok((m, used)) = Message::decode(&b[at..]) {
+                at += used;
+                match m {
+                    Some(Message::Video(_)) => {
+                        frames += 1;
+                        if !sent {
+                            sent = true;
+                            for ev in input {
+                                ws.send(tungstenite::Message::binary(Message::Input(ev.clone()).encode())).unwrap();
+                            }
+                        }
+                    }
+                    Some(m @ (Message::Access(_) | Message::Notice(_))) => said.push(m),
+                    _ => {}
+                }
+                if at >= b.len() {
+                    break;
+                }
+            }
+        }
+        let _ = ws.close(None);
+        Ok((said, frames))
+    }
+
+    /// Sign-in with an identity provider, a policy, the audit log and recording, from end to end over
+    /// HTTP and the WebSocket: two users let in with different rights, one refused.
+    #[test]
+    fn signed_in_viewers_get_what_the_policy_gives_them() {
+        use crate::auth::jwt::testing::Signer;
+        let dir = std::env::temp_dir().join(format!("rr-sso-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let idp = crate::auth::oidc::mock::start(vec![Signer::rsa("k1")]);
+        let key = Signer::rsa("k1");
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let public = format!("http://127.0.0.1:{port}");
+        let mut signin = crate::auth::SignIn::new(&public);
+        signin.oidc = Some(
+            crate::auth::oidc::Oidc::discover(crate::auth::oidc::Config {
+                issuer: idp.issuer.clone(),
+                client_id: "rr-test".into(),
+                client_secret: Some("shh".into()),
+                redirect_uri: format!("{public}/sso/oidc/callback"),
+                scopes: "openid email".into(),
+                user_claim: "email".into(),
+                groups_claim: "groups".into(),
+            })
+            .unwrap(),
+        );
+        let policy: crate::policy::Policy = toml::from_str(
+            r#"
+[[rule]]
+name = "admins"
+groups = ["rr-admins"]
+record = true
+[[rule]]
+name = "viewers"
+groups = ["rr-viewers"]
+view_only = true
+clipboard = false
+record = false
+max_session_minutes = 0.05
+"#,
+        )
+        .unwrap();
+        let audit_path = dir.join("audit.jsonl");
+        let inputs = Arc::new(Mutex::new(vec![]));
+        let opts = Options {
+            listen: format!("127.0.0.1:{port}"),
+            fps: 30,
+            codec: Some(Codec::H264),
+            bitrate_kbps: 1000,
+            token: None,
+            webtransport: false,
+            relay: None,
+            e2e_key: [0; 32],
+            tls: None,
+            tailscale_cert: false,
+            mdns: false,
+            pair: Some(false),
+            audio: crate::audio::Audio::new(crate::audio::Sound::Tone),
+            signin: Some(Arc::new(signin)),
+            policy: Some(policy),
+            audit: Arc::new(crate::audit::Audit::open(&audit_path).unwrap()),
+            record: Some(dir.join("rec")),
+            source_label: "test-pattern".into(),
+        };
+        let spy = Spy(crate::capture::TestPattern::new(320, 240), inputs.clone());
+        std::thread::spawn(move || run(Box::new(spy), opts));
+        while TcpStream::connect(("127.0.0.1", port)).is_err() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // The page says to sign in; without it, no ticket and no stream.
+        let (_, _, info) = http(port, "GET", "/info", &[], "");
+        assert!(info.contains(r#""signin":"oidc""#), "{info}");
+        let origin = public.as_str();
+        assert_eq!(http(port, "POST", "/sso/ticket", &[("Origin", origin)], "").0, 401);
+        assert_eq!(watch(port, "", &[], &[], 1.0).unwrap_err(), 403);
+        assert_eq!(watch(port, "ticket=00", &[], &[], 1.0).unwrap_err(), 403);
+
+        let key_a = rr_proto::Input::Key {
+            hid: 4,
+            down: true,
+            key: "a".into(),
+        };
+        let paste = rr_proto::Input::Paste { text: "pasted".into() };
+        // Alice (rr-admins): everything; her session recorded.
+        let alice = sign_in(port, &idp, &key, "alice@corp.example", &["rr-admins"]).unwrap();
+        // A page elsewhere (another port on this machine) can't trade her cookie for a ticket.
+        assert_eq!(
+            http(port, "POST", "/sso/ticket", &[("Cookie", &alice), ("Origin", "http://127.0.0.1:1")], "").0,
+            403
+        );
+        let (st, _, t) = http(port, "POST", "/sso/ticket", &[("Cookie", &alice), ("Origin", origin)], "");
+        assert_eq!(st, 200, "{t}");
+        let ticket = rr_client::http::json_str(&t, "ticket").unwrap();
+        let (said, frames) = watch(port, &format!("ticket={ticket}"), &[], &[key_a.clone(), paste.clone()], 2.0).unwrap();
+        assert!(frames > 10, "{frames} frames");
+        let Some(Message::Access(a)) = said.first() else { panic!("{said:?}") };
+        assert_eq!((a.user.as_str(), a.flags, a.seconds_left), ("alice@corp.example", rr_proto::ACCESS_RECORDED, 0));
+        std::thread::sleep(Duration::from_millis(300));
+        let got = inputs.lock().unwrap().clone();
+        assert!(got.contains(&key_a), "{got:?}");
+        assert!(
+            got.contains(&rr_proto::Input::Text { text: "pasted".into() }),
+            "a paste reaches the source as text: {got:?}"
+        );
+        // The WebSocket also takes her cookie, from this server's page (Origin), and not from elsewhere.
+        assert!(watch(port, "", &[("Cookie", &alice), ("Origin", origin)], &[], 0.5).is_ok());
+        assert_eq!(
+            watch(port, "", &[("Cookie", &alice), ("Origin", "http://evil.example")], &[], 0.5).unwrap_err(),
+            403
+        );
+
+        // Bob (rr-viewers): sees, can't type or paste, no recording, and 3 s from signing in.
+        inputs.lock().unwrap().clear();
+        let bob = sign_in(port, &idp, &key, "bob@corp.example", &["rr-viewers"]).unwrap();
+        let (_, _, t) = http(port, "POST", "/sso/ticket", &[("Cookie", &bob), ("Origin", origin)], "");
+        let ticket = rr_client::http::json_str(&t, "ticket").unwrap();
+        let (said, frames) = watch(port, &format!("ticket={ticket}"), &[], &[key_a.clone(), paste.clone()], 6.0).unwrap();
+        assert!(frames > 10, "{frames} frames");
+        let Some(Message::Access(a)) = said.first() else { panic!("{said:?}") };
+        assert_eq!(a.flags, rr_proto::ACCESS_VIEW_ONLY | rr_proto::ACCESS_NO_CLIPBOARD);
+        assert!((1..=3).contains(&a.seconds_left), "{}", a.seconds_left);
+        assert!(
+            matches!(said.last(), Some(Message::Notice(n)) if n.code == rr_proto::NOTICE_TIME_LIMIT),
+            "the session ended at its limit, saying why: {said:?}"
+        );
+        assert!(inputs.lock().unwrap().is_empty(), "a viewer's input never reaches the machine");
+
+        // Carol (no group the policy names): refused at sign-in, with the reason.
+        let refused = sign_in(port, &idp, &key, "carol@corp.example", &[]).unwrap_err();
+        assert!(refused.contains("no rule in the policy lets carol@corp.example in"), "{refused}");
+
+        // Signing out ends the cookie.
+        http(port, "POST", "/sso/logout", &[("Cookie", &alice), ("Origin", origin)], "");
+        assert_eq!(http(port, "POST", "/sso/ticket", &[("Cookie", &alice), ("Origin", origin)], "").0, 401);
+
+        // The audit log: every event, nothing secret.
+        std::thread::sleep(Duration::from_millis(500));
+        let log = std::fs::read_to_string(&audit_path).unwrap();
+        let events: Vec<serde_json::Value> = log.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let find = |e: &str, user: &str| events.iter().filter(|x| x["event"] == e && x["user"] == user).cloned().collect::<Vec<_>>();
+        assert_eq!(find("signin", "alice@corp.example").len(), 1);
+        assert_eq!(find("signin", "bob@corp.example")[0]["rule"], "viewers");
+        assert_eq!(find("signin_denied", "carol@corp.example").len(), 1);
+        let ends = find("session_end", "alice@corp.example");
+        assert!(
+            ends.iter()
+                .any(|e| e["recording"].is_string() && e["recording_bytes"].as_u64().unwrap_or(0) > 1000),
+            "{ends:?}"
+        );
+        let end = &find("session_end", "bob@corp.example")[0];
+        assert_eq!(end["reason"], "time limit");
+        assert!(end["input_dropped"].as_u64().unwrap() >= 2, "{end}");
+        assert!(end.get("recording").is_none());
+        let start = &find("session_start", "bob@corp.example")[0];
+        assert_eq!(
+            (start["view_only"].as_bool(), start["transport"].as_str(), start["source"].as_str()),
+            (Some(true), Some("websocket"), Some("test-pattern"))
+        );
+        assert!(events.iter().any(|e| e["event"] == "session_refused"));
+        assert_eq!(find("signout", "alice@corp.example").len(), 1);
+        for secret in [ticket.as_str(), alice.split('=').nth(1).unwrap(), bob.split('=').nth(1).unwrap(), "shh"] {
+            assert!(!log.contains(secret), "the audit log has a secret in it");
+        }
+        // Alice's recording is there (and plays: see record's own test).
+        let recs: Vec<String> = std::fs::read_dir(dir.join("rec"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(recs.len(), 2, "{recs:?}");
+        assert!(
+            recs.iter().all(|r| r.contains("-alice@corp.example-")),
+            "only alice's sessions are recorded: {recs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

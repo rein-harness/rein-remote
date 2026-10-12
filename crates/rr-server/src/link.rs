@@ -272,7 +272,7 @@ pub fn webtransport<F>(
     session: F,
 ) -> Result<Option<[u8; 32]>, String>
 where
-    F: Fn(Box<dyn Link + Send>) + Send + Sync + 'static,
+    F: Fn(Box<dyn Link + Send>, crate::auth::Admission) + Send + Sync + 'static,
 {
     use wtransport::{Endpoint, Identity, ServerConfig};
     let mut names = vec!["localhost".to_string(), "127.0.0.1".to_string(), "::1".to_string()];
@@ -322,12 +322,22 @@ where
                 let (session, gate) = (session.clone(), gate.clone());
                 tokio::spawn(async move {
                     let Ok(request) = incoming.await else { return };
-                    // The same gate as the WebSocket's: the token, or a paired device's ticket.
+                    // The same gate as the WebSocket's: the token, a paired device's ticket, or a ticket a
+                    // signed-in page got (browsers send no cookies with WebTransport); then the policy.
                     let query = request.path().split_once('?').map_or("", |(_, q)| q).to_string();
-                    if !gate.allows(&query) {
+                    let addr = request.remote_address().to_string();
+                    let Some(who) = gate.admit(&query, None) else {
+                        gate.audit.log(
+                            "session_refused",
+                            serde_json::json!({"addr": addr, "transport": "webtransport", "reason": "no valid token, ticket or sign-in"}),
+                        );
                         request.forbidden().await;
                         return;
-                    }
+                    };
+                    let Ok(adm) = gate.admission(who, "webtransport", addr) else {
+                        request.forbidden().await;
+                        return;
+                    };
                     if rr_client::http::param(&query, "direct") == Some("1") {
                         eprintln!(
                             "rein-remote: a viewer came straight here from {} (a direct path, punched through NAT)",
@@ -354,7 +364,7 @@ where
                         max_datagram: max_datagram.clone(),
                         audio_datagrams: false,
                     };
-                    std::thread::spawn(move || session(Box::new(link)));
+                    std::thread::spawn(move || session(Box::new(link), adm));
                     // From the client: whole protocol frames, from however the stream cut them.
                     let reader = tokio::spawn(async move {
                         let mut buf = Vec::new();
