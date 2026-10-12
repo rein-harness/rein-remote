@@ -56,13 +56,20 @@ pub struct Spec {
 pub struct Step {
     pub argv: Vec<String>,
     pub may_fail: bool,
+    /// Its failure is the usual case (clearing what an earlier install may have left): not said.
+    pub quiet: bool,
 }
 
 fn step(argv: &[&str]) -> Step {
     Step {
         argv: argv.iter().map(|s| s.to_string()).collect(),
         may_fail: false,
+        quiet: false,
     }
+}
+
+fn quietly(argv: &[&str]) -> Step {
+    Step { quiet: true, ..may_fail(argv) }
 }
 
 fn may_fail(argv: &[&str]) -> Step {
@@ -244,7 +251,7 @@ pub fn install_plan(s: &Spec, os: Os) -> Plan {
             let path_s = path.display().to_string();
             p.files.push((path, launchd_plist(s)));
             let domain = if s.system { "system".to_string() } else { format!("gui/{}", s.uid) };
-            p.steps.push(may_fail(&["launchctl", "bootout", &format!("{domain}/{}", s.label())]));
+            p.steps.push(quietly(&["launchctl", "bootout", &format!("{domain}/{}", s.label())]));
             p.steps.push(step(&["launchctl", "bootstrap", &domain, &path_s]));
         }
         Os::Windows if s.system => {
@@ -376,7 +383,7 @@ fn carry_out(p: &Plan) -> Result<(), String> {
             .args(&s.argv[1..])
             .output()
             .map_err(|e| format!("{}: {e}", s.argv[0]))?;
-        if !out.status.success() && s.may_fail {
+        if !out.status.success() && s.may_fail && !s.quiet {
             eprintln!(
                 "rein-remote: `{}`: {}",
                 s.argv.join(" "),
