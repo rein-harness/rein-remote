@@ -1645,6 +1645,7 @@ mod tests {
         match Vaapi::new(Codec::H264, 320, 240, 30.0, 2000) {
             Err(e) => assert!(e.starts_with("VA-API"), "{e}"),
             Ok(mut enc) => {
+                println!("encoder: {}", enc.name());
                 let frame = vec![80u8; 320 * 240 * 4];
                 let first = enc.encode(&frame, 320 * 4, 1).unwrap();
                 assert!(first[0].keyframe && nal_types(&first[0].data).any(|t| t == 7), "SPS before the keyframe");
@@ -1652,7 +1653,14 @@ mod tests {
                 assert!(next.iter().all(|e| !e.keyframe));
                 enc.set_bitrate(500).unwrap();
                 enc.keyframe();
-                assert!(enc.encode(&frame, 320 * 4, 3).unwrap()[0].keyframe);
+                let key = enc.encode(&frame, 320 * 4, 3).unwrap();
+                assert!(key[0].keyframe);
+                println!(
+                    "keyframe {} bytes, then {} bytes, forced keyframe {} bytes",
+                    first[0].data.len(),
+                    next.iter().map(|e| e.data.len()).sum::<usize>(),
+                    key[0].data.len()
+                );
             }
         }
         assert!(Vaapi::new(Codec::H265, 320, 240, 30.0, 2000).is_err());
