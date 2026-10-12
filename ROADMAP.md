@@ -131,6 +131,14 @@ has been verified.
     5% loss: p95 110 against 126. On a clean link the same as the WebSocket (14 ms glass to glass at
     720p on a Mac). Rein's web UI keeps the WebSocket (through its own HTTPS proxy). Next: video as
     datagrams with forward error correction, so a lost packet costs no retransmission.
+  - **Status (datagrams, native QUIC):** video goes as WebTransport datagrams with forward error
+    correction (Reed-Solomon over GF(256), Cauchy parity; the same code in Rust and in the page,
+    checked against shared vectors in CI), each datagram numbered so the client counts loss and
+    reports it (Feedback v1); the server sends parity for it (3× the loss, 10–50%). BBR congestion
+    control (a lossy link no longer stalls whole frames). A lost frame the parity can't make up for
+    asks for a keyframe. Native clients get the same over QUIC (`crates/rr-client`, `rein-remote
+    connect`), tested end to end in CI on all three. On this Mac, Chrome over datagrams: 60 fps,
+    10 ms glass to glass.
 - LAN discovery (mDNS), pairing codes, mutual keys.
   - **Status:** no setup on a tailnet or a local network: `serve` listens on every interface behind a
     random token and prints a link per way in (tailnet name, tailnet address, local network,
@@ -140,6 +148,13 @@ has been verified.
     on a tailnet: the https:// tailnet link 15 ms glass to glass over WebTransport; the http://
     tailnet and LAN links ~31 fps at 46–53 ms through Media Source; no token, 403. mDNS discovery is
     next.
+  - **Status (mDNS, pairing):** `serve` advertises itself over mDNS (`--mdns on|off`) and
+    `rein-remote discover` (and the desktop, iOS and Android clients) find it: verified on this
+    Mac's LAN. Pairing: a 6-digit code (10 minutes, one pairing, 5 tries) printed with a QR code;
+    SPAKE2 over P-256 (RFC 9382's M and N) then each side's key, so a paired device signs in with
+    its key (ECDSA), no token. `rein-remote paired` / `unpair`. Verified in headless Chrome over the
+    LAN on a plain-HTTP page (all 8 checks of `tools/pair-e2e.mjs`), and by the iOS and Android
+    clients in their simulators.
 - Rendezvous with NAT hole punching; the relay (self-hostable).
   - **Status:** the relay is in: `rein-remote relay` (self-hosted, `--secret` for who may host) pairs
     a machine that connected out (`serve --relay ws(s)://…`, a random 24-character room) with a
@@ -150,6 +165,11 @@ has been verified.
     and changes refused; verified: the right key streams (14 ms glass to glass), a wrong key is
     refused at both ends, a link without its key says so. Still to do: NAT hole punching
     (straight over QUIC when it works).
+  - **Status (hole punching):** the relay also brokers a direct path: both ends learn their public
+    UDP address from it and punch (DirectOffer / DirectAnswer), then the session moves onto QUIC
+    directly. In Docker behind two NATs: direct after 0.5–1.2 s, round trip 97 → 45 ms; it stays
+    on the relay when UDP is blocked or a NAT is symmetric. Real NATs:
+    [manual test](docs/verification/nat-hole-punching.md).
 - Delay-based bitrate controller; frame rate and resolution adaptation; intra refresh.
   - **Status:** a delay-based controller (each frame's round trip on the server's own clock, its
     rise over the lowest of the last 10 s is queuing; a backed-up socket counts too) cuts the
@@ -162,7 +182,18 @@ has been verified.
     random text over 1.5 Mbit/s (more than the link can carry): 229 ms p50 adapting against 505 ms
     not. Still to tune: the target oscillates above capacity on such content, and the first keyframe
     takes a second on a 300 kbit/s link (resolution adaptation and a smaller first keyframe are next).
+  - **Status (adaptation):** starts at 800 kbit/s with a ×1.5 slow start (a small first keyframe),
+    cuts to 85% of what was delivered and probes back up under a ceiling; the picture scales to ¾
+    below 22% of the top bitrate and to ½ below 10% (2 s hysteresis; input mapped back), the
+    client's own decoding time left out of the delay. openh264 with long-term references, so full
+    motion stays P-frames. On this Mac's loopback, full motion at 720p: 53 fps, 22 ms glass to
+    glass, 7.7 Mbit/s.
 - Opus audio, synchronized with video.
+  - **Status:** Opus (libopus) from the system's sound: ScreenCaptureKit on macOS, PulseAudio on
+    Linux, WASAPI loopback on Windows (`--audio on|off`). In Chrome on this Mac the sound plays
+    10.4 ms after its picture (median; 13.8 ms p95) over WebTransport, 10.5 / 12.6 over the
+    WebSocket; the picture waits for the sound while it plays (`?sync=off` to not). Windows' real
+    capture: [manual test](docs/verification/audio.md).
 - **Verified:** latency and quality measured on LAN, on a throttled link (tc netem: loss, delay,
   low bandwidth) and through the relay; a fast-moving game scene stays smooth on the bad link.
 
