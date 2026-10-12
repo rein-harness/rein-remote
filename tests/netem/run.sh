@@ -5,7 +5,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 docker run --rm -v "$ROOT":/src -w /src \
-  -v rr-netem-registry:/usr/local/cargo/registry -v rr-netem-target:/target -e CARGO_TARGET_DIR=/target \
+  -v rr-netem-registry:/usr/local/cargo/registry -v rr-netem-target:/target -e CARGO_TARGET_DIR=/target -e CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" \
   rust:1-bookworm sh -c 'apt-get update -qq && apt-get install -y -qq cmake nasm > /dev/null && cargo build --release -p rr-server && cp /target/release/rein-remote /src/tests/netem/rein-remote.linux' >&2
 docker build -q -f "$ROOT/tests/netem/Dockerfile" -t rr-netem "$ROOT" >/dev/null
 rm -f "$ROOT/tests/netem/rein-remote.linux"

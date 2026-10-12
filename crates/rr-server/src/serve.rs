@@ -1059,7 +1059,10 @@ fn stream(
                                 let ev = if (ew, eh) == enc_full { ev } else { unscale(ev, (ew, eh), (w, h)) };
                                 let _ = source.lock().unwrap().input(&ev);
                             }
-                            Some(Message::KeyframeRequest) => enc.keyframe(),
+                            Some(Message::KeyframeRequest) => {
+                                adapt.frame_lost(Instant::now());
+                                enc.keyframe()
+                            }
                             Some(Message::Feedback(f)) => {
                                 if datagrams {
                                     // Parity for the loss seen lately: three times the loss rate, at least a tenth.

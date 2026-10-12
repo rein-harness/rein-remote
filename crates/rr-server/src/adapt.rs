@@ -37,6 +37,8 @@ pub struct Adapt {
     /// Bytes the client confirmed getting, and when: what the link delivers.
     delivered: VecDeque<(Instant, usize)>,
     backed_up: bool,
+    /// The client lost a frame while nothing it got was coming back: nothing gets through.
+    starved: bool,
     last_cut: Instant,
     last_step: Instant,
     /// Until the first congestion: climbing fast.
@@ -50,6 +52,8 @@ pub struct Adapt {
 const BASELINE_WINDOW: Duration = Duration::from_secs(10);
 const RECENT: Duration = Duration::from_millis(500);
 const DELIVERED_WINDOW: Duration = Duration::from_secs(1);
+/// No feedback for this long: nothing is known about the link now.
+const STALE: Duration = Duration::from_millis(500);
 /// Queuing that means the link is full, and queuing low enough to try more.
 const CONGESTED_MS: f64 = 40.0;
 /// (The round trip includes the client's decoding, which wanders by 10–15 ms with the content.)
@@ -83,6 +87,7 @@ impl Adapt {
             queuing: VecDeque::new(),
             delivered: VecDeque::new(),
             backed_up: false,
+            starved: false,
             last_cut: long_ago,
             last_step: long_ago,
             starting: true,
@@ -121,6 +126,19 @@ impl Adapt {
         }
     }
 
+    /// The client asked for a keyframe (it lost a frame). With feedback coming back that's the odd
+    /// lost frame (random loss, which parity is for); with none for a while, nothing is getting
+    /// through: as congested as it gets, even before the first feedback.
+    pub fn frame_lost(&mut self, at: Instant) {
+        if !self.feedback_lately(at) {
+            self.starved = true;
+        }
+    }
+
+    fn feedback_lately(&self, at: Instant) -> bool {
+        self.delivered.back().is_some_and(|(t, _)| at.duration_since(*t) < STALE)
+    }
+
     /// Queuing now: the median of the last half second (ms).
     pub fn queuing_ms(&self) -> f64 {
         let mut v: Vec<f64> = self.queuing.iter().map(|(_, q)| *q).collect();
@@ -143,7 +161,7 @@ impl Adapt {
     pub fn tick(&mut self, at: Instant) -> Option<Target> {
         let q = self.queuing_ms();
         let before = self.now;
-        if (self.backed_up || q > CONGESTED_MS) && at.duration_since(self.last_cut) > Duration::from_millis(300) {
+        if (self.backed_up || self.starved || q > CONGESTED_MS) && at.duration_since(self.last_cut) > Duration::from_millis(300) {
             // Congested: to a little under what got through (or by 30% when that's not known yet).
             let got = self.delivered_kbps(at);
             let to = if got > 0 {
@@ -162,6 +180,9 @@ impl Adapt {
             self.room_since = None;
         } else if q < CLEAR_MS
             && !self.backed_up
+            && !self.starved
+            // Only on what came back: with no feedback, no queuing shows, which says nothing.
+            && self.feedback_lately(at)
             && at.duration_since(self.last_cut) > Duration::from_secs(1)
             && at.duration_since(self.last_step) > Duration::from_millis(250)
         {
@@ -180,6 +201,7 @@ impl Adapt {
             self.last_step = at;
         }
         self.backed_up = false;
+        self.starved = false;
         // Starting, the picture stays whole (its first keyframe is small by its bitrate already).
         if !self.starting {
             self.now.scale = self.scale_for(at);
@@ -240,6 +262,34 @@ mod tests {
     /// The same over a link with room for everything.
     fn run(a: &mut Adapt, t: &mut Instant, secs: f64, delay: impl Fn(f64) -> f64) -> Target {
         run_on(a, t, secs, u32::MAX, delay)
+    }
+
+    #[test]
+    fn no_feedback_no_climbing_and_lost_frames_with_none_cut() {
+        // A link so full nothing comes back: the first keyframe never arrives. Climbing on silence
+        // sent 8 Mbit/s into a 1.5 Mbit/s link and stayed there (tests/netem).
+        let mut a = Adapt::new(8000, 60);
+        let mut t = Instant::now();
+        for _ in 0..40 {
+            t += Duration::from_millis(250);
+            a.tick(t);
+        }
+        assert_eq!(a.target().kbps, START_KBPS, "no feedback, no climbing");
+        // The client keeps losing frames and asking for keyframes: each is a cut.
+        for _ in 0..8 {
+            t += Duration::from_millis(400);
+            a.frame_lost(t);
+            a.tick(t);
+        }
+        assert_eq!(a.target().kbps, 250, "down to the floor");
+        // With feedback coming back, a lost frame is random loss (parity's job), not congestion.
+        let mut a = Adapt::new(8000, 60);
+        let mut t = Instant::now();
+        run(&mut a, &mut t, 10.0, |_| 20.0);
+        let before = a.target().kbps;
+        a.frame_lost(t);
+        a.tick(t);
+        assert_eq!(a.target().kbps, before);
     }
 
     #[test]

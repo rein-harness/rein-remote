@@ -889,10 +889,14 @@ export function connect(url, canvas, opts = {}) {
     }
     ctx.drawImage(frame.image ?? frame, 0, 0);
     frame.close();
-    if (measure && canvas.height >= 24 && canvas.width >= 34 * 24) {
-      const row = ctx.getImageData(0, canvas.height - 12, 34 * 24, 1).data;
-      const bit = (k) => row[(k * 24 + 12) * 4 + 1] > 128;
-      if (bit(0) && !bit(1)) {
+    if (measure && canvas.height >= 8 && canvas.width >= 34 * 4) {
+      // The block's size from the white sync block (24 px, less on a small or scaled-down picture).
+      const row = ctx.getImageData(0, canvas.height - 2, canvas.width, 1).data;
+      let white = 0;
+      while (white < 30 && row[white * 4 + 1] > 128) white++;
+      const bs = white;
+      const bit = (k) => row[Math.round(k * bs + bs / 2) * 4 + 1] > 128;
+      if (bs >= 4 && bs < 30 && 34 * bs <= canvas.width && bit(0) && !bit(1)) {
         let ms = 0;
         for (let k = 2; k < 34; k++) ms = ms * 2 + (bit(k) ? 1 : 0);
         const now = Date.now() % 2 ** 32;
