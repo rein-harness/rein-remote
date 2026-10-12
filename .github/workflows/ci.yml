@@ -374,3 +374,74 @@ jobs:
         if: always()
         run: |
           grep -v '^rein-remote: {' serve.log || true
+  # The Android app: the Rust core (crates/rr-jni) built with cargo-ndk for a phone and the emulator,
+  # the APK, and the unit tests (gestures, keys, gamepads, the barcode reader, links).
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target aarch64-linux-android,x86_64-linux-android && rustup default stable
+          cargo install cargo-ndk --locked
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: The core for Android (arm64-v8a, x86_64)
+        run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" clients/android/build-core.sh arm64-v8a x86_64
+      - name: Unit tests and the APK
+        working-directory: clients/android
+        run: ./gradlew --no-daemon testDebugUnitTest assembleDebug
+  # The app in the emulator (x86_64, KVM) against a server on the runner, which it reaches at 10.0.2.2:
+  # frames decoded by MediaCodec, the pointer's cross seen coming back, a tap through the input system.
+  android-emulator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target x86_64-linux-android && rustup default stable
+          cargo install cargo-ndk --locked
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: The server, and the core for the emulator
+        run: |
+          cargo build --release -p rr-server
+          ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" clients/android/build-core.sh x86_64
+      - name: The APKs (a release build signed with the debug key, as measured)
+        working-directory: clients/android
+        run: ./gradlew --no-daemon -Prr.testBuildType=release assembleRelease assembleReleaseAndroidTest
+      - name: The server
+        run: |
+          ./target/release/rein-remote serve --test-pattern 1280x720 --listen 127.0.0.1:7979 --token ci --mdns off 2> serve.log &
+          sleep 2
+      - name: Instrumented tests in the emulator
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: 34
+          target: default
+          arch: x86_64
+          ram-size: 2048M
+          disable-animations: true
+          emulator-options: -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect
+          working-directory: clients/android
+          script: |
+            adb install -r -t app/build/outputs/apk/release/app-release.apk
+            adb install -r -t app/build/outputs/apk/androidTest/release/app-release-androidTest.apk
+            adb logcat -c
+            adb shell am instrument -w -r -e rrUrl 'http://10.0.2.2:7979/?token=ci' dev.reinharness.remote.test/androidx.test.runner.AndroidJUnitRunner | tee instrument.log
+            adb logcat -d -s rein-remote | grep -E 'selftest:|android test:|video:' | tail -40
+            grep -q '^OK (' instrument.log
+      - name: The server's log
+        if: always()
+        run: |
+          grep -v '^rein-remote: {' serve.log || true
