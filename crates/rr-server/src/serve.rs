@@ -279,6 +279,8 @@ fn through_relay(
                 use crate::link::Sock;
                 let _ = ws.get_ref().tcp().set_nodelay(true);
                 let _ = socket2::SockRef::from(ws.get_ref().tcp()).set_send_buffer_size((opts.bitrate_kbps as usize * 1000 / 8 / 20).max(64 * 1024));
+                // It may wait a long time for a viewer: TCP keepalive finds a connection that died quietly.
+                let _ = socket2::SockRef::from(ws.get_ref().tcp()).set_tcp_keepalive(&socket2::TcpKeepalive::new().with_time(Duration::from_secs(30)));
                 // Sealed end to end: the relay passes what it can't read.
                 let link = match E2eLink::host(Box::new(WsLink(ws)), &opts.e2e_key) {
                     Ok(l) => l,
@@ -287,7 +289,7 @@ fn through_relay(
                         continue;
                     }
                 };
-                if let Err(e) = session(Box::new(link), source.clone(), stats.clone(), opts, direct.get()) {
+                if let Err(e) = session(Box::new(link), source.clone(), stats.clone(), opts, Some(direct)) {
                     eprintln!("rein-remote: {e}");
                 }
             }
@@ -537,7 +539,8 @@ fn session(
     source: Arc<Mutex<Box<dyn Source>>>,
     stats: Arc<Mutex<Stats>>,
     opts: &Options,
-    direct: Option<&Direct>,
+    // Some for a session through the relay: what it can offer for a direct path, once there is that.
+    direct: Option<&OnceLock<Direct>>,
 ) -> Result<(), String> {
     let (w, h) = source.lock().unwrap().size();
     // What this machine encodes, the codec asked for first (H.264 by default: every device decodes
@@ -564,10 +567,12 @@ fn session(
     };
     link.send(&Message::Hello(hello.clone()))?;
     link.flushed()?;
-    // The client's Hello (with a deadline), then the stream's config.
+    // The client's Hello (with a deadline), then the stream's config. Through the relay, the session
+    // starts when this machine connects there, and the viewer comes when it comes: no deadline (the
+    // relay closing the connection ends it).
     let deadline = Instant::now() + Duration::from_secs(10);
     let client = loop {
-        if Instant::now() > deadline {
+        if direct.is_none() && Instant::now() > deadline {
             return Err("the client didn't say hello".into());
         }
         match link.recv_wait(Duration::from_millis(200))? {
@@ -621,6 +626,9 @@ fn session(
     );
     // A viewer through the relay that can go direct: where to find this machine, the certificate to
     // expect, a ticket for one session. Sealed like everything else here, so the relay can't use it.
+    // (Read now, not when the session began: a relayed session waits for its viewer from before
+    // WebTransport is up.)
+    let direct = direct.and_then(OnceLock::get);
     let mut punch_tag = None;
     if let Some(d) = direct.filter(|_| client.features & FEATURE_DIRECT != 0) {
         let ticket = d.gate.ticket_once();

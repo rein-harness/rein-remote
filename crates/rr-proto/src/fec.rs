@@ -274,6 +274,9 @@ pub struct Reassembler {
     done_up_to: Option<u32>,
     pub lost: u64,
     pub recovered: u64,
+    /// Datagrams expected and received, all told (summed over each `loss_permille` window).
+    pub expected_total: u64,
+    pub received_total: u64,
     /// Datagrams that came, and the sequence span they cover (first and highest), since `loss()`.
     received: u32,
     span: Option<(u16, u16)>,
@@ -287,6 +290,8 @@ impl Reassembler {
             done_up_to: None,
             lost: 0,
             recovered: 0,
+            expected_total: 0,
+            received_total: 0,
             received: 0,
             span: None,
         }
@@ -298,6 +303,8 @@ impl Reassembler {
         let Some((first, last)) = self.span.take() else { return 0 };
         let expected = last.wrapping_sub(first) as u32 + 1;
         let got = std::mem::take(&mut self.received).min(expected);
+        self.expected_total += expected as u64;
+        self.received_total += got as u64;
         ((expected - got) * 1000 / expected) as u16
     }
 

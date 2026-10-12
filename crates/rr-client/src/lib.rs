@@ -144,6 +144,9 @@ pub struct Stats {
     pub fec_recovered: u64,
     pub fec_lost: u64,
     pub loss_permille: u16,
+    /// Datagrams the server sent (by their sequence numbers) and those that came, all told.
+    pub datagrams_expected: u64,
+    pub datagrams_received: u64,
     /// The last round trip (our pings), and the lowest seen.
     pub rtt_ms: f64,
     pub rtt_min_ms: f64,
@@ -508,6 +511,7 @@ impl Run {
             if let Some(f) = &self.link.fec {
                 let f = f.lock().unwrap();
                 (s.fec_recovered, s.fec_lost) = (f.recovered, f.lost);
+                (s.datagrams_expected, s.datagrams_received) = (f.expected_total, f.received_total);
             }
             if let Some(d) = &self.link.datagrams {
                 s.transport = self.link.transport.label(d.load(std::sync::atomic::Ordering::Relaxed));

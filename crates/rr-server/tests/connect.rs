@@ -69,6 +69,8 @@ fn through_the_relay_then_straight_there() {
     let line = server.wait_for("through the relay: open ", T);
     let link = line.split("open ").nth(1).unwrap().trim().to_string();
     server.wait_for("the relay sees WebTransport's socket as", T);
+    // The host waits in its room as long as it takes: a viewer more than 10 s later still gets in.
+    std::thread::sleep(Duration::from_secs(11));
 
     // The relay answers probes for its open rooms only (the room is in the link).
     let room = rr_client::http::param(&rr_client::http::parse(&link).unwrap().query, "room")

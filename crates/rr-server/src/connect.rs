@@ -24,12 +24,13 @@ struct Phase {
     latency: Vec<f64>,
     latency_same_clock: Vec<f64>,
     rtt: Vec<f64>,
-    loss: Vec<f64>,
-    /// The session's counters when this path began (they run across paths).
+    /// The session's counters when this path began (they run across paths), and since.
     lost_at_start: u64,
     fec_at_start: (u64, u64),
+    datagrams_at_start: (u64, u64),
     lost: u64,
     fec: (u64, u64),
+    datagrams: (u64, u64),
 }
 
 impl Phase {
@@ -44,11 +45,12 @@ impl Phase {
             latency: vec![],
             latency_same_clock: vec![],
             rtt: vec![],
-            loss: vec![],
             lost_at_start: s.frames_lost,
             fec_at_start: (s.fec_recovered, s.fec_lost),
+            datagrams_at_start: (s.datagrams_expected, s.datagrams_received),
             lost: 0,
             fec: (0, 0),
+            datagrams: (0, 0),
         }
     }
 
@@ -58,6 +60,20 @@ impl Phase {
             s.fec_recovered.saturating_sub(self.fec_at_start.0),
             s.fec_lost.saturating_sub(self.fec_at_start.1),
         );
+        self.datagrams = (
+            s.datagrams_expected.saturating_sub(self.datagrams_at_start.0),
+            s.datagrams_received.saturating_sub(self.datagrams_at_start.1),
+        );
+    }
+
+    /// Of the datagrams sent on this path, the share lost on the way, in thousandths.
+    fn loss_permille(&self) -> f64 {
+        let (expected, got) = self.datagrams;
+        if expected == 0 {
+            0.0
+        } else {
+            (expected - got.min(expected)) as f64 * 1000.0 / expected as f64
+        }
     }
 
     /// The time frames came over (first to last), seconds.
@@ -72,7 +88,7 @@ impl Phase {
         let secs = self.seconds();
         let per = |n: f64| if secs > 0.0 { n / secs } else { 0.0 };
         format!(
-            r#"{{"transport":"{}","seconds":{:.1},"frames":{},"keyframes":{},"fps":{:.1},"kbps":{:.0},"frames_lost":{},"fec_recovered":{},"fec_lost":{},"loss_permille":{:.1},"rtt_ms":{{"p50":{:.1},"min":{:.1}}},"latency_ms":{{"p50":{:.1},"p95":{:.1},"samples":{}}},"latency_same_clock_ms":{{"p50":{:.1},"p95":{:.1}}}}}"#,
+            r#"{{"transport":"{}","seconds":{:.1},"frames":{},"keyframes":{},"fps":{:.1},"kbps":{:.0},"frames_lost":{},"fec_recovered":{},"fec_lost":{},"datagrams_lost_permille":{:.1},"rtt_ms":{{"p50":{:.1},"min":{:.1}}},"latency_ms":{{"p50":{:.1},"p95":{:.1},"samples":{}}},"latency_same_clock_ms":{{"p50":{:.1},"p95":{:.1}}}}}"#,
             self.transport,
             secs,
             self.frames,
@@ -82,7 +98,7 @@ impl Phase {
             self.lost,
             self.fec.0,
             self.fec.1,
-            mean(&self.loss),
+            self.loss_permille(),
             pct(&self.rtt, 0.5),
             self.rtt.iter().copied().fold(f64::NAN, f64::min).max(0.0),
             pct(&self.latency, 0.5),
@@ -105,7 +121,7 @@ impl Phase {
             self.lost,
             self.fec.0,
             self.fec.1,
-            mean(&self.loss),
+            self.loss_permille(),
             pct(&self.rtt, 0.5),
             pct(&self.latency, 0.5),
             pct(&self.latency, 0.95),
@@ -122,14 +138,6 @@ fn pct(v: &[f64], p: f64) -> f64 {
     let mut v = v.to_vec();
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     v[((v.len() - 1) as f64 * p) as usize]
-}
-
-fn mean(v: &[f64]) -> f64 {
-    if v.is_empty() {
-        0.0
-    } else {
-        v.iter().sum::<f64>() / v.len() as f64
-    }
 }
 
 pub fn run(args: &[String]) -> Result<(), String> {
@@ -217,7 +225,6 @@ pub fn run(args: &[String]) -> Result<(), String> {
             if s.rtt_ms > 0.0 {
                 phase.rtt.push(s.rtt_ms);
             }
-            phase.loss.push(s.loss_permille as f64);
             phase.update(&s);
             if !json {
                 eprintln!("  {}", phase.text());
