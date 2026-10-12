@@ -83,6 +83,12 @@ pub fn run(source: Box<dyn Source>, opts: Options) -> Result<(), String> {
         }
     }
     let (w, h) = source.size();
+    // Which encoders this machine has, found now, and one opened and closed: the first a process opens
+    // takes a second or two (the system loads it), which the first viewer would otherwise wait for.
+    std::thread::spawn(move || {
+        crate::encode::capabilities();
+        let _ = crate::encode::open(Codec::H264, w, h, 60.0, 1000);
+    });
     // The address it got (a port of 0 picks a free one): a program that started it reads this line.
     let addr = listener.local_addr().map_or(opts.listen.clone(), |a| a.to_string());
     eprintln!("rein-remote: streaming a {w}×{h} screen on http://{addr} (open it in a browser)");

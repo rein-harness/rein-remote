@@ -20,7 +20,7 @@ type SampleBuffer = *mut c_void;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct CMTime {
+pub struct CMTime {
     value: i64,
     timescale: i32,
     flags: u32,
@@ -55,6 +55,9 @@ extern "C" {
         refcon: *mut c_void,
         out: *mut Session,
     ) -> i32;
+    fn VTCopyVideoEncoderList(options: *const c_void, out: *mut *const c_void) -> i32;
+    static kVTVideoEncoderList_CodecType: CFStringRef;
+    static kVTVideoEncoderList_IsHardwareAccelerated: CFStringRef;
     fn VTSessionSetProperty(session: Session, key: CFStringRef, value: CFTypeRef) -> i32;
     fn VTCompressionSessionPrepareToEncodeFrames(session: Session) -> i32;
     fn VTCompressionSessionEncodeFrame(
@@ -206,8 +209,35 @@ unsafe fn annex_b(sample: SampleBuffer, hevc: bool) -> Result<Encoded, String> {
     Ok(Encoded { data, keyframe, tag: 0 })
 }
 
+/// Whether this Mac lists a hardware encoder for `codec` (without opening one: that takes a second).
+pub fn listed(codec: Codec) -> bool {
+    let want = match codec {
+        Codec::H264 => H264,
+        Codec::H265 => HEVC,
+        _ => return false,
+    };
+    unsafe {
+        let mut list = std::ptr::null();
+        if VTCopyVideoEncoderList(std::ptr::null(), &mut list) != 0 || list.is_null() {
+            return false;
+        }
+        let found = (0..CFArrayGetCount(list)).any(|i| {
+            let d = CFArrayGetValueAtIndex(list, i);
+            let ty = CFDictionaryGetValue(d, kVTVideoEncoderList_CodecType as *const c_void);
+            let hw = CFDictionaryGetValue(d, kVTVideoEncoderList_IsHardwareAccelerated as *const c_void);
+            !ty.is_null() && CFNumber::wrap_under_get_rule(ty as _).to_i64() == Some(want as i64) && hw == kCFBooleanTrue
+        });
+        CFRelease(list);
+        found
+    }
+}
+
 pub struct VideoToolbox {
     session: Session,
+    /// Asks the session to finish each frame as soon as it's in (VideoToolbox otherwise keeps the last
+    /// frame until the next one comes: on a still screen, for good). On a thread of its own, so the
+    /// server goes on while the hardware works.
+    flush: Option<(std::sync::mpsc::Sender<CMTime>, std::thread::JoinHandle<()>)>,
     codec: Codec,
     width: usize,
     height: usize,
@@ -287,8 +317,22 @@ impl VideoToolbox {
             set(kVTCompressionPropertyKey_MaxKeyFrameInterval, CFNumber::from(i32::MAX as i64).as_CFTypeRef());
             VTCompressionSessionPrepareToEncodeFrames(session);
         }
+        let flush = {
+            let (tx, rx) = std::sync::mpsc::channel::<CMTime>();
+            let s = session as usize;
+            let t = std::thread::Builder::new()
+                .name("vt-flush".into())
+                .spawn(move || {
+                    for until in rx {
+                        unsafe { VTCompressionSessionCompleteFrames(s as Session, until) };
+                    }
+                })
+                .map_err(|e| e.to_string())?;
+            Some((tx, t))
+        };
         Ok(Self {
             session,
+            flush,
             codec,
             width,
             height,
@@ -425,6 +469,9 @@ impl VideoToolbox {
             return Err(format!("VideoToolbox: encode failed ({status})"));
         }
         self.submitted += 1;
+        if let Some((tx, _)) = &self.flush {
+            let _ = tx.send(pts);
+        }
         self.poll()
     }
 }
@@ -467,6 +514,10 @@ impl VideoEncoder for VideoToolbox {
 
 impl Drop for VideoToolbox {
     fn drop(&mut self) {
+        if let Some((tx, t)) = self.flush.take() {
+            drop(tx);
+            let _ = t.join();
+        }
         unsafe {
             VTCompressionSessionCompleteFrames(self.session, INVALID_TIME);
             VTCompressionSessionInvalidate(self.session);
@@ -525,6 +576,15 @@ mod tests {
         let types: Vec<u8> = first.data.windows(5).filter(|w| w[..4] == [0, 0, 0, 1]).map(|w| (w[4] >> 1) & 0x3f).collect();
         assert_eq!(&types[..3], &[32, 33, 34], "{types:?}");
         assert!(!one(&mut enc, &frame, w * 4, 5).is_some_and(|d| d.keyframe));
+    }
+
+    #[test]
+    fn lists_hardware_encoders_like_it_opens_them() {
+        for codec in [Codec::H264, Codec::H265] {
+            if listed(codec) {
+                assert!(VideoToolbox::new(codec, 320, 240, 30.0, 1000).is_ok(), "{codec:?} listed but doesn't open");
+            }
+        }
     }
 
     #[test]

@@ -283,14 +283,24 @@ pub fn open(codec: Codec, width: usize, height: usize, fps: f32, kbps: u32) -> R
     })
 }
 
-/// What this machine encodes, each codec once, hardware first (for the server's Hello): found by
-/// opening each encoder once, small, the first time it's asked.
+/// Whether a hardware encoder for `codec` opens here: asked of the system where it can say without
+/// opening one (macOS lists its encoders), else by opening each, small.
+fn has_hardware(codec: Codec) -> bool {
+    #[cfg(target_os = "macos")]
+    if matches!(choice().as_str(), "" | "auto" | "hardware" | "videotoolbox") {
+        return crate::encode_vt::listed(codec);
+    }
+    hardware(codec, 256, 144, 30.0, 500).into_iter().any(|e| e.is_ok())
+}
+
+/// What this machine encodes, each codec once, hardware first (for the server's Hello): found the
+/// first time it's asked (the server asks as it starts).
 pub fn capabilities() -> &'static [CodecCap] {
     static CAPS: std::sync::OnceLock<Vec<CodecCap>> = std::sync::OnceLock::new();
     CAPS.get_or_init(|| {
         let mut caps = Vec::new();
         for codec in [Codec::H264, Codec::H265] {
-            if choice() != "software" && hardware(codec, 256, 144, 30.0, 500).into_iter().any(|e| e.is_ok()) {
+            if choice() != "software" && has_hardware(codec) {
                 caps.push(CodecCap { codec, hardware: true });
             } else if codec == Codec::H264 && !matches!(choice().as_str(), "hardware" | "videotoolbox" | "mediafoundation" | "vaapi") {
                 caps.push(CodecCap { codec, hardware: false });
