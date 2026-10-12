@@ -197,10 +197,10 @@ pub struct WindowInfo {
 }
 
 /// Objective-C objects handed between threads: only ever used by one at a time.
-struct Sendable<T>(T);
+pub(crate) struct Sendable<T>(pub T);
 unsafe impl<T> Send for Sendable<T> {}
 
-fn error_text(err: *mut NSError) -> String {
+pub(crate) fn error_text(err: *mut NSError) -> String {
     if err.is_null() {
         "unknown error".into()
     } else {
@@ -209,7 +209,7 @@ fn error_text(err: *mut NSError) -> String {
 }
 
 /// What's on screen now (ScreenCaptureKit answers on its own queue).
-fn content() -> Result<Retained<SCShareableContent>, String> {
+pub(crate) fn content() -> Result<Retained<SCShareableContent>, String> {
     let (tx, rx) = mpsc::channel();
     let block = RcBlock::new(move |c: *mut SCShareableContent, err: *mut NSError| {
         let r = unsafe { Retained::retain(c) }.map(Sendable).ok_or_else(|| error_text(err));
@@ -261,7 +261,7 @@ pub fn windows() -> Result<Vec<WindowInfo>, String> {
 }
 
 /// A display by its number (1 is the main one, then in ScreenCaptureKit's order) or its id; none: the main one.
-fn pick_display(c: &SCShareableContent, which: Option<&str>) -> Result<Retained<SCDisplay>, String> {
+pub(crate) fn pick_display(c: &SCShareableContent, which: Option<&str>) -> Result<Retained<SCDisplay>, String> {
     let list = unsafe { c.displays() };
     let main = CGDisplay::main().id;
     let mut ordered: Vec<Retained<SCDisplay>> = list.iter().collect();
@@ -379,6 +379,8 @@ pub struct MacWindow {
     stride: usize,
     _stream: Retained<SCStream>,
     _output: Retained<Output>,
+    /// What's captured, kept for the sound (audio::mac captures it with the same filter).
+    filter: Retained<SCContentFilter>,
     buttons: [bool; 3],
     /// The app that owns the window: events go to it, so your own pointer and keyboard stay yours
     /// (and a window behind others still gets them).
@@ -518,12 +520,19 @@ impl MacWindow {
             stride: w * 4,
             _stream: stream,
             _output: output,
+            filter: objc2::Message::retain(filter),
             buttons: [false; 3],
             pid,
             pointer: CGPoint::new(frame.origin.x, frame.origin.y),
             shape: None,
             shape_at: Instant::now() - Duration::from_secs(1),
         })
+    }
+
+    /// The sound that goes with this: what the app plays (a window or an app shown), or the whole
+    /// machine's (a display).
+    pub fn sound(&self) -> crate::audio::mac::Filter {
+        crate::audio::mac::Filter::new(self.filter.clone(), self.pid != 0)
     }
 
     /// The window's place on screen now (it may have moved), at most twice a second.

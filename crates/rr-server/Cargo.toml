@@ -13,6 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 openh264-sys2 = "0.6.6"
+# libopus (BSD), built from its source by CMake and linked in statically.
+opusic-sys = "0.7.5"
 rr-proto = {path = "../rr-proto"}
 aes-gcm = "0.10.3"
 des = "0.9.0"
@@ -51,5 +53,5 @@ objc2-core-foundation = "0.3.2"
 objc2-screen-capture-kit = "0.3.2"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Media_Audio", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Performance", "Win32_System_Variant", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
 windows-capture = "2.0.1"

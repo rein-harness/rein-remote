@@ -4,7 +4,10 @@
 
 use crate::capture::Source;
 use crate::link::{E2eLink, Link, Recv, WsLink};
-use rr_proto::{Codec, Config, Cursor, Hello, Message, Video, FEATURE_VIDEO_DATAGRAMS, INPUT_KEYBOARD, INPUT_POINTER, INPUT_TOUCH, VERSION_MAX, VERSION_MIN};
+use rr_proto::{
+    Codec, Config, Cursor, Hello, Message, Video, FEATURE_AUDIO_DATAGRAMS, FEATURE_VIDEO_DATAGRAMS, INPUT_KEYBOARD, INPUT_POINTER, INPUT_TOUCH, VERSION_MAX,
+    VERSION_MIN,
+};
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -41,6 +44,8 @@ pub struct Options {
     /// Pairing (a code to enter once, then each device signs in with its key): `None` is on when it
     /// listens beyond this computer.
     pub pair: Option<bool>,
+    /// The sound that goes with the video, for viewers that play it (`--audio off`: none).
+    pub audio: Option<Arc<crate::audio::Audio>>,
 }
 
 /// Latency and throughput, kept per session and shown by /stats.
@@ -284,7 +289,7 @@ fn handle(
         "/" | "/index.html" => ("200 OK", "text/html; charset=utf-8", INDEX.to_string()),
         "/rein-remote.js" => ("200 OK", "text/javascript; charset=utf-8", CLIENT_JS.to_string()),
         "/pair.js" => ("200 OK", "text/javascript; charset=utf-8", PAIR_JS.to_string()),
-        "/stats" => ("200 OK", "application/json", stats_json(&stats.lock().unwrap())),
+        "/stats" => ("200 OK", "application/json", stats_json(&stats.lock().unwrap(), opts.audio.as_deref())),
         // Where WebTransport is, and its certificate's SHA-256 when the browser has to be given it
         // (a self-signed one; a real certificate needs nothing).
         "/info" => ("200 OK", "application/json", {
@@ -429,7 +434,7 @@ pub fn pace(asked: u32, refresh_mhz: u32, hardware: bool) -> u32 {
     refresh.clamp(10, if hardware { MAX_FPS } else { SOFTWARE_FPS })
 }
 
-fn stats_json(s: &Stats) -> String {
+fn stats_json(s: &Stats, audio: Option<&crate::audio::Audio>) -> String {
     let pct = |v: &[f64], p: f64| -> f64 {
         if v.is_empty() {
             return 0.0;
@@ -438,8 +443,16 @@ fn stats_json(s: &Stats) -> String {
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         v[((v.len() - 1) as f64 * p) as usize]
     };
+    // The sound: packets made, how many weren't silence, the last second's loudest (dBFS).
+    let audio = match audio.map(|a| a.stats.lock().unwrap().clone()) {
+        Some(a) => format!(
+            r#"{{"packets":{},"bytes":{},"loud_packets":{},"level_db":{:.1},"listeners":{},"error":{:?}}}"#,
+            a.packets, a.bytes, a.loud_packets, a.level_db, a.listeners, a.error
+        ),
+        None => "null".into(),
+    };
     format!(
-        r#"{{"frames":{},"keyframes":{},"skipped_backed_up":{},"bytes":{},"rtt_ms":{:.1},"latency_ms":{{"p50":{:.1},"p95":{:.1},"samples":{}}},"encode_ms":{{"p50":{:.1},"p95":{:.1}}},"grab_ms":{{"p50":{:.1},"p95":{:.1}}},"still":{},"kbps":{},"fps":{},"queuing_ms":{:.1}}}"#,
+        r#"{{"frames":{},"keyframes":{},"skipped_backed_up":{},"bytes":{},"rtt_ms":{:.1},"latency_ms":{{"p50":{:.1},"p95":{:.1},"samples":{}}},"encode_ms":{{"p50":{:.1},"p95":{:.1}}},"grab_ms":{{"p50":{:.1},"p95":{:.1}}},"still":{},"kbps":{},"fps":{},"queuing_ms":{:.1},"audio":{audio}}}"#,
         s.frames,
         s.keyframes,
         s.skipped_backed_up,
@@ -478,7 +491,7 @@ fn session(mut link: Box<dyn Link + Send>, source: Arc<Mutex<Box<dyn Source>>>, 
         max_width: w as u16,
         max_height: h as u16,
         max_fps: if opts.fps == 0 { MAX_FPS } else { opts.fps } as u16,
-        audio: false,
+        audio: opts.audio.is_some(),
         input: INPUT_POINTER | INPUT_KEYBOARD | INPUT_TOUCH,
         refresh_mhz: 0,
         features: 0,
@@ -534,11 +547,20 @@ fn session(mut link: Box<dyn Link + Send>, source: Arc<Mutex<Box<dyn Source>>>, 
     // them: a lost packet then costs nothing (parity rebuilds it), not a retransmission.
     let datagrams = client.features & FEATURE_VIDEO_DATAGRAMS != 0 && link.use_datagrams();
     let mut loss = 0.0f32;
+    // Sound, to a client that plays it (one that doesn't say so, an older one, gets none): as
+    // datagrams of its own when it takes them (a lost packet is a gap, never a wait), else in order.
+    let audio = opts.audio.as_ref().filter(|_| client.audio).map(|a| a.listen());
+    let audio_datagrams = audio.is_some() && client.features & FEATURE_AUDIO_DATAGRAMS != 0 && link.use_audio_datagrams();
     eprintln!(
-        "rein-remote: {} connected ({:?} {ew}×{eh} at {fps} fps{refresh}{})",
+        "rein-remote: {} connected ({:?} {ew}×{eh} at {fps} fps{refresh}{}{})",
         client.name,
         codec,
-        if datagrams { ", video as datagrams" } else { "" }
+        if datagrams { ", video as datagrams" } else { "" },
+        match (&audio, audio_datagrams) {
+            (None, _) => "",
+            (Some(_), true) => ", sound as datagrams",
+            (Some(_), false) => ", with sound",
+        }
     );
 
     let mut frame_time = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
@@ -607,6 +629,19 @@ fn session(mut link: Box<dyn Link + Send>, source: Arc<Mutex<Box<dyn Source>>>, 
                 }
                 Recv::Nothing => break,
                 Recv::Closed => return Ok(()),
+            }
+        }
+        // Sound as it comes (small, and never held back with the video when the link backs up: a late
+        // packet is the client's to drop).
+        if let Some(l) = &audio {
+            let mut sent = false;
+            while let Ok(frame) = l.packets.try_recv() {
+                link.send_audio(frame.to_vec())?;
+                sent = true;
+            }
+            // Out now, not with the next frame (a WebSocket writes what's queued when flushed).
+            if sent {
+                link.flushed()?;
             }
         }
         let pointer = source.lock().unwrap().cursor();
@@ -692,7 +727,7 @@ fn session(mut link: Box<dyn Link + Send>, source: Arc<Mutex<Box<dyn Source>>>, 
         }
         if last_report.elapsed() > Duration::from_secs(5) {
             last_report = Instant::now();
-            eprintln!("rein-remote: {}", stats_json(&stats.lock().unwrap()));
+            eprintln!("rein-remote: {}", stats_json(&stats.lock().unwrap(), opts.audio.as_deref()));
         }
         // A few times a second: what the link takes now.
         if last_adapt.elapsed() > Duration::from_millis(250) {
@@ -730,6 +765,10 @@ fn session(mut link: Box<dyn Link + Send>, source: Arc<Mutex<Box<dyn Source>>>, 
         let mut rest = next_frame.saturating_duration_since(Instant::now());
         if enc.in_flight() > 0 {
             rest = rest.min(Duration::from_millis(1));
+        }
+        // With sound, a look every 2 ms: a packet comes every 10, and waits here no longer than that.
+        if audio.is_some() {
+            rest = rest.min(Duration::from_millis(2));
         }
         link.wait(rest);
     }
