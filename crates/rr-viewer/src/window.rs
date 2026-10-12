@@ -441,7 +441,12 @@ impl App {
                 } else {
                     out.push(("Machines on this network:".into(), DIM));
                     for (i, f) in self.found.iter().take(9).enumerate() {
-                        let at = f.addrs.first().map_or(String::new(), |a| format!("{a}:{}", f.port));
+                        // Where its link goes (host and port).
+                        let at = f
+                            .link()
+                            .ok()
+                            .and_then(|l| l.strip_prefix("http://").map(|h| h.trim_end_matches('/').to_string()))
+                            .unwrap_or_default();
                         out.push((format!("{}  {}  {at}", i + 1, f.name), WHITE));
                     }
                     out.push(("Press its number (or click it) to connect. Esc: quit".into(), DIM));
