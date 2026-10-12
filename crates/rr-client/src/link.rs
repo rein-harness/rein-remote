@@ -141,7 +141,7 @@ fn tcp(s: &tungstenite::stream::MaybeTlsStream<TcpStream>) -> &TcpStream {
 /// A WebSocket to `url` (ws:// or wss://), its pump on a thread of its own: it reads with a short
 /// wait, and sends what the session queued in between (a WebSocket is one stream both ways).
 pub(crate) fn websocket(url: &str, inbox: mpsc::Sender<Ev>, transport: Transport) -> Result<Link, String> {
-    let (mut ws, _) = tungstenite::connect(url).map_err(|e| format!("{}: {e}", redact(url)))?;
+    let (mut ws, _) = ws_connect(url).map_err(|e| format!("{}: {e}", redact(url)))?;
     let _ = tcp(ws.get_ref()).set_nodelay(true);
     let id = NEXT_LINK.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
@@ -156,6 +156,26 @@ pub(crate) fn websocket(url: &str, inbox: mpsc::Sender<Ev>, transport: Transport
         _rt: None,
         closer: None,
     })
+}
+
+/// A WebSocket (wss:// checked against the same roots as everything else: see `http::root_store`).
+fn ws_connect(
+    url: &str,
+) -> Result<
+    (
+        WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+        tungstenite::handshake::client::Response,
+    ),
+    String,
+> {
+    use tungstenite::client::IntoClientRequest;
+    let req = url.into_client_request().map_err(|e| e.to_string())?;
+    let uri = req.uri();
+    let host = uri.host().ok_or("no host")?.trim_start_matches('[').trim_end_matches(']').to_string();
+    let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("wss") { 443 } else { 80 });
+    let tcp = TcpStream::connect((host.as_str(), port)).map_err(|e| e.to_string())?;
+    let connector = tungstenite::Connector::Rustls(crate::http::tls_config());
+    tungstenite::client_tls_with_config(req, tcp, None, Some(connector)).map_err(|e| e.to_string())
 }
 
 fn pump(ws: &mut WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>, rx: mpsc::Receiver<Vec<u8>>, inbox: mpsc::Sender<Ev>, id: u64) {
@@ -232,7 +252,7 @@ fn endpoint(
     };
     let cfg = match cert {
         Cert::Hash(h) => roots.with_server_certificate_hashes([wtransport::tls::Sha256Digest::new(h)]),
-        Cert::Roots => roots.with_native_certs(),
+        Cert::Roots => roots.with_custom_tls(wtransport::tls::client::build_default_tls_config(Arc::new(crate::http::root_store()), None)),
     }
     .keep_alive_interval(Some(Duration::from_secs(3)))
     .max_idle_timeout(Some(Duration::from_secs(15)))

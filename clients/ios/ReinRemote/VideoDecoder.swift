@@ -281,9 +281,12 @@ final class VideoDecoder {
         VTSessionSetProperty(s, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         session = s
         let dims = CMVideoFormatDescriptionGetDimensions(format)
-        var hw: CFBoolean?
-        VTSessionCopyProperty(s, key: kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder, allocator: nil, valueOut: &hw)
-        description = "\(hevc ? "HEVC" : "H.264") \(dims.width)×\(dims.height)\(hw == kCFBooleanTrue ? " (hardware)" : "")"
+        var hw: Unmanaged<CFTypeRef>?
+        let got = withUnsafeMutablePointer(to: &hw) {
+            VTSessionCopyProperty(s, key: kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder, allocator: nil, valueOut: UnsafeMutableRawPointer($0))
+        }
+        let hardware = got == noErr && (hw?.takeRetainedValue() as? Bool) == true
+        description = "\(hevc ? "HEVC" : "H.264") \(dims.width)×\(dims.height)\(hardware ? " (hardware)" : "")"
     }
 
     private static func sample(_ body: Data, format: CMVideoFormatDescription) -> CMSampleBuffer? {

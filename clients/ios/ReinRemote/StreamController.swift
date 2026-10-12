@@ -57,7 +57,7 @@ final class InputTap: InputSink {
 }
 
 /// One stream: the session, decoding, sound, gamepads, and what's measured.
-final class StreamController: ObservableObject {
+final class StreamController: NSObject, ObservableObject {
     /// Measuring: where the pointer was last sent, once the test pattern's cross shows there.
     @Published private(set) var inputSeen = ""
     private(set) var input: InputTap?
@@ -95,7 +95,8 @@ final class StreamController: ObservableObject {
         return lastImage
     }
 
-    init() {
+    override init() {
+        super.init()
         decoder.onFrame = { [weak self] f in self?.decoded(f) }
         decoder.onNeedKeyframe = { [weak self] in
             guard let self else { return }
@@ -133,7 +134,9 @@ final class StreamController: ObservableObject {
                     self.session?.gamepad(g)
                 }
             }
-            timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.tick() }
+            let t = Timer(timeInterval: 0.5, target: self, selector: #selector(tick), userInfo: nil, repeats: true)
+            RunLoop.main.add(t, forMode: .common)
+            timer = t
         }
         s.start { [weak self] ev in self?.event(ev) }
     }
@@ -260,7 +263,7 @@ final class StreamController: ObservableObject {
         r.enqueue(sample)
     }
 
-    private func tick() {
+    @objc private func tick() {
         guard let s = session else { return }
         let st = s.stats
         lock.lock()

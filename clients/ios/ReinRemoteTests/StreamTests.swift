@@ -43,3 +43,18 @@ final class StreamTests: XCTestCase {
         }
     }
 }
+
+/// A real certificate checks out on iOS (the core brings Mozilla's roots: an app can't read the
+/// system's): an HTTPS server that isn't rein-remote answers pairing with an HTTP error, not a
+/// certificate one. Needs the internet: RR_NET=1.
+final class TlsTests: XCTestCase {
+    func testRealCertificatesCheckOut() throws {
+        guard ProcessInfo.processInfo.environment["RR_NET"] == "1" else { throw XCTSkip("set RR_NET=1") }
+        XCTAssertThrowsError(try Core.pair(url: "https://example.com/", code: "000-000", name: "t")) { e in
+            let m = e.localizedDescription
+            XCTAssertTrue(m.contains("HTTP") || m.contains("pairing"), m)
+            XCTAssertFalse(m.lowercased().contains("certificate"), m)
+            print("tls test: \(m)")
+        }
+    }
+}
