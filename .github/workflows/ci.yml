@@ -155,7 +155,8 @@ jobs:
         run: brew install xcodegen && cd clients/ios && xcodegen
       - name: Build and test in the simulator
         run: |
-          ./target/release/rein-remote serve --test-pattern 1280x720 --listen 127.0.0.1:7979 --token ci --mdns off 2> serve.log &
+          # Full size throughout (a busy runner would have the server lower it, and the cross with it).
+          RR_ADAPT=off ./target/release/rein-remote serve --test-pattern 1280x720 --listen 127.0.0.1:7979 --token ci --mdns off 2> serve.log &
           sleep 2
           udid=$(clients/ios/simulator.sh)
           echo "simulator $udid"
