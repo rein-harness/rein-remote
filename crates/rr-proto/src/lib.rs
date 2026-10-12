@@ -101,6 +101,9 @@ pub const FEATURE_DIRECT: u32 = 2;
 /// video's by the first byte: the frame's kind), when the transport has datagrams: a lost packet is a
 /// gap, never a wait. Without it, audio goes in order with the control messages.
 pub const FEATURE_AUDIO_DATAGRAMS: u32 = 4;
+/// A server that takes [`Input::Paste`] (a paste, told apart from typing so a policy can turn the
+/// clipboard off). A client sends a paste as `Paste` only to a server that says so, else as `Text`.
+pub const FEATURE_PASTE: u32 = 8;
 
 pub const INPUT_POINTER: u8 = 1;
 pub const INPUT_KEYBOARD: u8 = 2;
@@ -192,7 +195,7 @@ pub enum Input {
         down: bool,
         key: String,
     },
-    /// Text typed (an IME, a phone keyboard, a paste).
+    /// Text typed (an IME, a phone keyboard; a paste to a server without [`FEATURE_PASTE`]).
     Text {
         text: String,
     },
@@ -213,6 +216,11 @@ pub enum Input {
         ry: i16,
         lt: u8,
         rt: u8,
+    },
+    /// Text pasted from the client's clipboard (input kind 9; only to a server with
+    /// [`FEATURE_PASTE`]: an older server skips input kinds it doesn't know).
+    Paste {
+        text: String,
     },
 }
 
@@ -280,6 +288,41 @@ pub struct DirectAnswer {
     pub candidates: Vec<std::net::SocketAddr>,
 }
 
+/// What this viewer may do in this session, as the server's policy decided (server → client, after
+/// `Config`): so a client can say "view only" or "this session is recorded" instead of leaving the
+/// viewer to guess. The server enforces all of it whatever the client does with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Access {
+    /// Who the server took the viewer for (a signed-in user's name, "token", a paired device).
+    pub user: String,
+    /// Bit set of `ACCESS_*`.
+    pub flags: u32,
+    /// Seconds until the session ends by policy; 0: no limit.
+    pub seconds_left: u32,
+}
+
+/// Input is dropped: the viewer sees, and can't control.
+pub const ACCESS_VIEW_ONLY: u32 = 1;
+/// Pastes and clipboard messages are dropped.
+pub const ACCESS_NO_CLIPBOARD: u32 = 2;
+/// No sound for this viewer.
+pub const ACCESS_NO_AUDIO: u32 = 4;
+/// The session is being recorded.
+pub const ACCESS_RECORDED: u32 = 8;
+
+/// Something the viewer should be told, usually why the server is about to close the session
+/// (server → client). A client shows `text`; `code` is one of `NOTICE_*` (unknown codes: just show it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    pub code: u16,
+    pub text: String,
+}
+
+/// The session reached its policy's time limit and ends (sign in again for another).
+pub const NOTICE_TIME_LIMIT: u16 = 1;
+/// The viewer isn't allowed (any more) and the session ends.
+pub const NOTICE_REFUSED: u16 = 2;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
     Hello(Hello),
@@ -296,6 +339,8 @@ pub enum Message {
     Pong { id: u32, sent_us: u64 },
     DirectOffer(DirectOffer),
     DirectAnswer(DirectAnswer),
+    Access(Access),
+    Notice(Notice),
 }
 
 /// Frame kinds on the wire.
@@ -314,6 +359,8 @@ pub mod kind {
     pub const PONG: u8 = 12;
     pub const DIRECT_OFFER: u8 = 13;
     pub const DIRECT_ANSWER: u8 = 14;
+    pub const ACCESS: u8 = 15;
+    pub const NOTICE: u8 = 16;
 }
 
 /// Each message's version, written in its frame header: raised when a field is added at the end.
@@ -334,6 +381,8 @@ pub mod version {
     pub const PONG: u8 = 0;
     pub const DIRECT_OFFER: u8 = 0;
     pub const DIRECT_ANSWER: u8 = 0;
+    pub const ACCESS: u8 = 0;
+    pub const NOTICE: u8 = 0;
 
     /// The version this build writes for a kind.
     pub fn of(kind: u8) -> u8 {
@@ -352,6 +401,8 @@ pub mod version {
             k::PING => PING,
             k::DIRECT_OFFER => DIRECT_OFFER,
             k::DIRECT_ANSWER => DIRECT_ANSWER,
+            k::ACCESS => ACCESS,
+            k::NOTICE => NOTICE,
             _ => PONG,
         }
     }
@@ -541,6 +592,10 @@ impl Message {
                         w.u8(*lt);
                         w.u8(*rt);
                     }
+                    Input::Paste { text } => {
+                        w.u8(9);
+                        w.str(text);
+                    }
                 }
                 (kind::INPUT, 0)
             }
@@ -576,6 +631,17 @@ impl Message {
             Message::DirectAnswer(a) => {
                 w.addrs(&a.candidates);
                 (kind::DIRECT_ANSWER, 0)
+            }
+            Message::Access(a) => {
+                w.str(&a.user);
+                w.u32(a.flags);
+                w.u32(a.seconds_left);
+                (kind::ACCESS, 0)
+            }
+            Message::Notice(n) => {
+                w.u16(n.code);
+                w.str(&n.text);
+                (kind::NOTICE, 0)
             }
         }
     }
@@ -692,6 +758,7 @@ impl Message {
                     lt: r.u8()?,
                     rt: r.u8()?,
                 },
+                9 => Input::Paste { text: r.str()? },
                 // An input kind this build doesn't know (a newer peer): skipped, not an error.
                 _ => return Ok((None, HEADER_LEN + len)),
             })),
@@ -722,6 +789,15 @@ impl Message {
                 ticket: r.str()?,
             })),
             kind::DIRECT_ANSWER => Some(Message::DirectAnswer(DirectAnswer { candidates: r.addrs()? })),
+            kind::ACCESS => Some(Message::Access(Access {
+                user: r.str()?,
+                flags: r.u32()?,
+                seconds_left: r.u32()?,
+            })),
+            kind::NOTICE => Some(Message::Notice(Notice {
+                code: r.u16()?,
+                text: r.str()?,
+            })),
             _ => None,
         };
         Ok((msg, HEADER_LEN + len))

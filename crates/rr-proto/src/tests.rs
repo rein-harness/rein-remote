@@ -35,8 +35,22 @@ fn offer() -> DirectOffer {
     }
 }
 
+fn access() -> Access {
+    Access {
+        user: "alice@example.com".into(),
+        flags: ACCESS_VIEW_ONLY | ACCESS_RECORDED,
+        seconds_left: 3600,
+    }
+}
+
 #[test]
 fn every_message_round_trips() {
+    round_trip(Message::Access(access()));
+    round_trip(Message::Notice(Notice {
+        code: NOTICE_TIME_LIMIT,
+        text: "the session's hour is up".into(),
+    }));
+    round_trip(Message::Input(Input::Paste { text: "pasted ✓".into() }));
     round_trip(Message::DirectOffer(offer()));
     round_trip(Message::DirectOffer(DirectOffer {
         candidates: vec![],
@@ -298,6 +312,12 @@ fn a_newer_peers_messages_still_read() {
         Message::DirectAnswer(DirectAnswer {
             candidates: offer().candidates,
         }),
+        Message::Access(access()),
+        Message::Notice(Notice {
+            code: 99,
+            text: "a newer reason".into(),
+        }),
+        Message::Input(Input::Paste { text: "x".into() }),
         Message::Cursor(Cursor {
             x: 1,
             y: 2,
@@ -364,6 +384,8 @@ fn an_older_peers_messages_get_defaults_for_fields_added_since() {
         Message::Resize { width: 1, height: 1 },
         Message::DirectOffer(offer()),
         Message::DirectAnswer(DirectAnswer { candidates: vec![] }),
+        Message::Access(access()),
+        Message::Notice(Notice { code: 1, text: String::new() }),
     ] {
         let f = m.encode();
         assert_eq!(Header::read(&f).unwrap().version, version::of(f[0]));
@@ -373,11 +395,30 @@ fn an_older_peers_messages_get_defaults_for_fields_added_since() {
 #[test]
 fn feature_bits_are_distinct() {
     // Two features on the same bit would each be taken for the other.
-    let bits = [FEATURE_VIDEO_DATAGRAMS, FEATURE_DIRECT, FEATURE_AUDIO_DATAGRAMS];
+    let bits = [FEATURE_VIDEO_DATAGRAMS, FEATURE_DIRECT, FEATURE_AUDIO_DATAGRAMS, FEATURE_PASTE];
     for (i, a) in bits.iter().enumerate() {
         assert_eq!(a.count_ones(), 1);
         for b in &bits[i + 1..] {
             assert_eq!(a & b, 0);
         }
     }
+}
+
+#[test]
+fn a_peer_from_before_access_skips_it_and_pastes_read_as_skipped_input() {
+    // An older reader (one that knows kinds up to 14) skips Access and Notice by their length: here
+    // simulated by a frame of an unknown kind with the same body, then the next frame still reads.
+    let mut both = Message::Access(access()).encode();
+    both[0] = 200;
+    let ping = Message::Ping { id: 1, sent_us: 2 }.encode();
+    both.extend_from_slice(&ping);
+    let (m, used) = Message::decode(&both).unwrap();
+    assert_eq!(m, None);
+    assert_eq!(Message::decode(&both[used..]).unwrap().0, Some(Message::Ping { id: 1, sent_us: 2 }));
+    // A paste is input kind 9: a server from before it skips it as an input kind it doesn't know.
+    let paste = Message::Input(Input::Paste { text: "hi".into() }).encode();
+    assert_eq!(paste[HEADER_LEN], 9);
+    // The access bits are distinct.
+    let bits = [ACCESS_VIEW_ONLY, ACCESS_NO_CLIPBOARD, ACCESS_NO_AUDIO, ACCESS_RECORDED];
+    assert_eq!(bits.iter().fold(0, |a, b| a | b).count_ones(), 4);
 }
