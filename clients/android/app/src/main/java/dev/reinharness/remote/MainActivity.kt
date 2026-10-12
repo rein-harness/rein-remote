@@ -156,7 +156,14 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(16), dp(16), dp(16))
         }
-        setContentView(ScrollView(this).apply { addView(list) })
+        val scroll = ScrollView(this).apply { addView(list) }
+        // Edge to edge (Android 15 draws every app so): the list clear of the status and navigation bars.
+        scroll.setOnApplyWindowInsetsListener { v, insets ->
+            @Suppress("DEPRECATION")
+            v.setPadding(insets.systemWindowInsetLeft, insets.systemWindowInsetTop, insets.systemWindowInsetRight, insets.systemWindowInsetBottom)
+            insets
+        }
+        setContentView(scroll)
         discovery = Discovery(this) {
             found = it
             render()
