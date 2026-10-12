@@ -91,6 +91,30 @@ has been verified.
   costs rein-remote 1.5% of one core (4.8% in software). The pointer's real shape on macOS too
   (the system's arrow, I-beam…), sent apart and hidden off the window. Next: Media
   Foundation/NVENC on Windows and VA-API on Linux.
+- **Status (phase 3 finished):** macOS streams a whole display (`serve` alone, or `--display N`;
+  `rein-remote displays`) or an app's windows (`--app NAME`), at the display's real pixel scale: a
+  3274×2048 display goes from ScreenCaptureKit into VideoToolbox with no copy, 3.3% of one core
+  while the screen changes, 22 ms to encode. HEVC (`--codec h265`): Chrome decodes it in hardware,
+  60 fps, 21 ms glass to glass. Hardware detection: `encode::open` tries the hardware encoders the
+  machine lists (VTCopyVideoEncoderList, Media Foundation's hardware MFTs, VA-API's entry points)
+  and falls back to openh264; the encoder is warmed up at start (the first VideoToolbox session
+  takes 1.2–2 s). VideoToolbox at 1080p: 12.2 ms a frame, 2.1 ms of it CPU. High refresh: the
+  client measures its display's refresh and tells the server (Hello v1), which paces to it (`--fps
+  auto`, up to 240; 60 in software): a 59.9 Hz display got 60 fps. 200 fps from the test pattern on
+  this Mac's VideoToolbox (A18 Pro, headless Chrome, which shows frames faster than its 60 Hz
+  screen): 198 fps, 15 ms p50 glass to glass, under light load; 148 fps, 16 / 24 ms p50 / p95 with
+  the server at 9% of one core, measured again at load average 63 (other builds running). A still
+  screen sends and encodes nothing: a still `--pipe` source sent 0–1 frames in 10–30 s (the old
+  build sent 10 every 10 s) and used 0.3% of one core. Windows (Graphics Capture + SendInput +
+  Media Foundation, D3D11 textures straight into the encoder) and Linux VA-API (`serve --kms`,
+  DMA-BUF into the encoder, its H.264 headers checked by ffmpeg in CI) are in; Windows works on CI
+  runners with Microsoft's encoder. Needs hardware, with exact manual tests:
+  [GPU encoders and zero copy on Windows](docs/verification/windows-hardware-encoders.md),
+  [VA-API and KMS on Linux](docs/verification/linux-vaapi-kms.md),
+  [a real 200 Hz display](docs/verification/high-refresh.md),
+  [macOS display and app input](docs/verification/macos-display-app-input.md) (needs the
+  Accessibility permission). Not done: PipeWire capture (KMS was chosen), NVENC on Linux (VA-API
+  was chosen), and change detection under KMS (a still screen is encoded again there).
 - **Verified:** a window on each streams with input (macOS on a real Mac; Windows on CI runners and a
   real machine), hardware and software paths both; 200 fps measured glass to glass on a machine
   with a hardware encoder, with the server's CPU use written down (idle and under motion).
