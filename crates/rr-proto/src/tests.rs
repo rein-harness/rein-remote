@@ -23,8 +23,29 @@ fn hello(codecs: &[(Codec, bool)]) -> Hello {
     }
 }
 
+fn offer() -> DirectOffer {
+    DirectOffer {
+        candidates: vec![
+            "203.0.113.7:7979".parse().unwrap(),
+            "192.168.1.20:7979".parse().unwrap(),
+            "[2001:db8::5]:7979".parse().unwrap(),
+        ],
+        cert_sha256: vec![0xab; 32],
+        ticket: "0123456789abcdef".into(),
+    }
+}
+
 #[test]
 fn every_message_round_trips() {
+    round_trip(Message::DirectOffer(offer()));
+    round_trip(Message::DirectOffer(DirectOffer {
+        candidates: vec![],
+        cert_sha256: vec![],
+        ticket: String::new(),
+    }));
+    round_trip(Message::DirectAnswer(DirectAnswer {
+        candidates: vec!["198.51.100.2:50000".parse().unwrap()],
+    }));
     round_trip(Message::Hello(hello(&[(Codec::H264, true), (Codec::Av1, false)])));
     round_trip(Message::Config(Config {
         codec: Codec::H265,
@@ -183,6 +204,25 @@ fn unknown_kinds_are_skipped_and_bad_frames_refused() {
 }
 
 #[test]
+fn a_peer_from_before_direct_paths_skips_the_offer() {
+    // A viewer built before DirectOffer existed reads it as a kind it doesn't know: skipped by its
+    // length, and the next frame reads. (A host offers only to a viewer that said FEATURE_DIRECT.)
+    let mut stream = Message::DirectOffer(offer()).encode();
+    stream[0] = 250; // as an unknown kind
+    let n = stream.len();
+    stream.extend(Message::Ping { id: 1, sent_us: 2 }.encode());
+    assert_eq!(Message::decode(&stream).unwrap(), (None, n));
+    assert_eq!(Message::decode(&stream[n..]).unwrap().0, Some(Message::Ping { id: 1, sent_us: 2 }));
+    // An address of a family this build doesn't know is refused, not misread.
+    let mut bad = Message::DirectAnswer(DirectAnswer {
+        candidates: vec!["1.2.3.4:5".parse().unwrap()],
+    })
+    .encode();
+    bad[HEADER_LEN + 1] = 9;
+    assert!(matches!(Message::decode(&bad), Err(Error::Malformed(_))));
+}
+
+#[test]
 fn versions_and_codecs_are_negotiated() {
     let server = hello(&[(Codec::H265, true), (Codec::H264, true), (Codec::Vp9, false)]);
     // A phone that decodes H.264 in hardware, VP9 only in software: H.264 wins over VP9.
@@ -254,6 +294,10 @@ fn a_newer_peers_messages_still_read() {
             down: true,
             key: "a".into(),
         }),
+        Message::DirectOffer(offer()),
+        Message::DirectAnswer(DirectAnswer {
+            candidates: offer().candidates,
+        }),
         Message::Cursor(Cursor {
             x: 1,
             y: 2,
@@ -315,7 +359,12 @@ fn an_older_peers_messages_get_defaults_for_fields_added_since() {
     };
     assert_eq!((read.refresh_mhz, read.features, read.max_fps), (0, 0, 120));
     // Every kind has a version this build writes, in the header.
-    for m in [Message::KeyframeRequest, Message::Resize { width: 1, height: 1 }] {
+    for m in [
+        Message::KeyframeRequest,
+        Message::Resize { width: 1, height: 1 },
+        Message::DirectOffer(offer()),
+        Message::DirectAnswer(DirectAnswer { candidates: vec![] }),
+    ] {
         let f = m.encode();
         assert_eq!(Header::read(&f).unwrap().version, version::of(f[0]));
     }

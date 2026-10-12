@@ -43,8 +43,8 @@ impl E2e {
         )
     }
 
-    /// The viewer's end (tests: the browser does this in rein-remote.js).
-    #[cfg(test)]
+    /// The viewer's end, with the salt the machine sent first (native clients; the browser does the
+    /// same in rein-remote.js).
     pub fn viewer(k: &[u8; 32], salt: &[u8; 16]) -> Self {
         Self::with(k, salt, b"rein-remote e2e: viewer to machine", b"rein-remote e2e: machine to viewer")
     }
@@ -99,6 +99,38 @@ pub fn b64url(b: &[u8]) -> String {
     out
 }
 
+/// The key from a viewer's link (`#k=…`, base64url without padding): 32 bytes, or none.
+pub fn b64url_decode(s: &str) -> Option<Vec<u8>> {
+    let val = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'-' | b'+' => 62,
+            b'_' | b'/' => 63,
+            _ => return None,
+        } as u32)
+    };
+    let s = s.trim_end_matches('=').as_bytes();
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    for c in s.chunks(4) {
+        let mut v = 0u32;
+        for (i, &x) in c.iter().enumerate() {
+            v |= val(x)? << (18 - 6 * i);
+        }
+        if c.len() == 1 {
+            return None;
+        }
+        out.extend_from_slice(&v.to_be_bytes()[1..c.len()]);
+    }
+    Some(out)
+}
+
+/// The salt, if `first` is a sealed session's first message (the prefix, then 16 bytes).
+pub fn salt_of(first: &[u8]) -> Option<[u8; 16]> {
+    first.strip_prefix(SALT_PREFIX)?.try_into().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,5 +157,14 @@ mod tests {
     fn base64url_without_padding() {
         assert_eq!(b64url(b"hello"), "aGVsbG8");
         assert_eq!(b64url(&[0xfb, 0xff]), "-_8");
+        for n in 0..40u8 {
+            let b: Vec<u8> = (0..n).map(|i| i.wrapping_mul(97)).collect();
+            assert_eq!(b64url_decode(&b64url(&b)).unwrap(), b);
+        }
+        assert_eq!(b64url_decode("a"), None);
+        assert_eq!(b64url_decode("a*bc"), None);
+        let (_, salt) = E2e::host(&[1; 32]);
+        assert_eq!(salt_of(&[SALT_PREFIX, &salt].concat()), Some(salt));
+        assert_eq!(salt_of(b"RRE2E1short"), None);
     }
 }

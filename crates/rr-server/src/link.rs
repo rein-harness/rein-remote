@@ -202,12 +202,13 @@ impl Link for WtLink {
     }
 }
 
-/// A WebTransport endpoint on `addr` (UDP), with a certificate made for it (valid 14 days, as browsers
-/// require for a certificate they're given by hash). Each session runs `session` on a thread of its
-/// own; returns the certificate's SHA-256 for the page.
-/// With `tls` (a real certificate), the browser checks it as for any site and there's no hash.
+/// A WebTransport endpoint on `socket` (UDP: bound by the caller, so it can first learn the socket's
+/// address beyond NAT), with a certificate made for it (valid 14 days, as browsers require for a
+/// certificate they're given by hash). Each session runs `session` on a thread of its own; returns the
+/// certificate's SHA-256 for the page. With `tls` (a real certificate), the browser checks it as for
+/// any site and there's no hash.
 pub fn webtransport<F>(
-    addr: std::net::SocketAddr,
+    socket: std::net::UdpSocket,
     gate: Arc<crate::pairing::Gate>,
     tls: Option<(std::path::PathBuf, std::path::PathBuf)>,
     session: F,
@@ -237,8 +238,11 @@ where
             (id, Some(h))
         }
     };
+    let addr = socket.local_addr().map_err(|e| e.to_string())?;
+    let _ = socket.set_read_timeout(None);
+    socket.set_nonblocking(true).map_err(|e| e.to_string())?;
     let config = ServerConfig::builder()
-        .with_bind_address(addr)
+        .with_bind_socket(socket)
         .with_identity(identity)
         .keep_alive_interval(Some(Duration::from_secs(3)))
         .build();
@@ -258,6 +262,12 @@ where
                     if !gate.allows(&query) {
                         request.forbidden().await;
                         return;
+                    }
+                    if rr_client::http::param(&query, "direct") == Some("1") {
+                        eprintln!(
+                            "rein-remote: a viewer came straight here from {} (a direct path, punched through NAT)",
+                            request.remote_address()
+                        );
                     }
                     let Ok(conn) = request.accept().await else { return };
                     // The client opens the control stream first.
@@ -351,14 +361,14 @@ fn whole_frame(b: &[u8]) -> Option<usize> {
 /// messages it can't read or change.
 pub struct E2eLink {
     inner: Box<dyn Link + Send>,
-    e2e: crate::e2e::E2e,
+    e2e: rr_client::e2e::E2e,
 }
 
 impl E2eLink {
     /// The machine's end: sends the session's salt first, in the clear.
     pub fn host(mut inner: Box<dyn Link + Send>, key: &[u8; 32]) -> Result<Self, String> {
-        let (e2e, salt) = crate::e2e::E2e::host(key);
-        inner.send_bytes([crate::e2e::SALT_PREFIX, &salt].concat(), false)?;
+        let (e2e, salt) = rr_client::e2e::E2e::host(key);
+        inner.send_bytes([rr_client::e2e::SALT_PREFIX, &salt].concat(), false)?;
         Ok(Self { inner, e2e })
     }
 }

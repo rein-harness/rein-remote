@@ -4,10 +4,13 @@
 
 use crate::capture::Source;
 use crate::link::{E2eLink, Link, Recv, WsLink};
-use rr_proto::{Codec, Config, Cursor, Hello, Message, Video, FEATURE_VIDEO_DATAGRAMS, INPUT_KEYBOARD, INPUT_POINTER, INPUT_TOUCH, VERSION_MAX, VERSION_MIN};
+use rr_proto::{
+    Codec, Config, Cursor, DirectOffer, Hello, Message, Video, FEATURE_DIRECT, FEATURE_VIDEO_DATAGRAMS, INPUT_KEYBOARD, INPUT_POINTER, INPUT_TOUCH,
+    VERSION_MAX, VERSION_MIN,
+};
 use std::io::Write;
-use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const INDEX: &str = include_str!("../../../clients/web/index.html");
@@ -62,6 +65,17 @@ pub struct Stats {
     pub kbps: u32,
     pub fps: u32,
     pub queuing_ms: f64,
+}
+
+/// What a session through the relay can offer a viewer that takes a direct path (FEATURE_DIRECT):
+/// where WebTransport's socket may be reached (beyond NAT as the relay saw it, and on this machine's
+/// networks), its certificate's hash, and the gate that gives one-time tickets. Punch packets go from
+/// a clone of that socket (QUIC reads it; this only sends).
+pub struct Direct {
+    socket: UdpSocket,
+    candidates: Vec<SocketAddr>,
+    cert: [u8; 32],
+    gate: Arc<crate::pairing::Gate>,
 }
 
 fn now_us() -> u64 {
@@ -142,15 +156,48 @@ pub fn run(source: Box<dyn Source>, opts: Options) -> Result<(), String> {
     let source = Arc::new(Mutex::new(source));
     let stats = Arc::new(Mutex::new(Stats::default()));
     let opts = Arc::new(opts);
+    // Through a relay: connected out to it first (its room open), so it answers this machine's probe.
+    let direct: Arc<OnceLock<Direct>> = Arc::default();
+    if let Some((relay, room, secret)) = opts.relay.clone() {
+        let (source, stats, opts, direct) = (source.clone(), stats.clone(), opts.clone(), direct.clone());
+        let page = relay.replacen("ws", "http", 1);
+        eprintln!(
+            "rein-remote: through the relay: open {}/?room={room}#k={}",
+            page.trim_end_matches('/'),
+            rr_client::e2e::b64url(&opts.e2e_key)
+        );
+        std::thread::spawn(move || through_relay(&relay, &room, secret.as_deref(), source, stats, &opts, &direct));
+    }
     // WebTransport on the same port over UDP: the page connects with it when the browser can.
     let wt: Arc<Option<(u16, Option<[u8; 32]>)>> = Arc::new(match (opts.webtransport, listener.local_addr()) {
         (true, Ok(at)) => {
             let (source, stats, o) = (source.clone(), stats.clone(), opts.clone());
-            match crate::link::webtransport(at, gate.clone(), opts.tls.clone(), move |link| {
-                if let Err(e) = session(link, source.clone(), stats.clone(), &o) {
-                    eprintln!("rein-remote: {e}");
+            let started = UdpSocket::bind(at).map_err(|e| e.to_string()).and_then(|udp| {
+                // Through a relay: this socket's address beyond NAT, learned before QUIC takes it.
+                let relayed = opts.relay.as_ref().map(|(relay, room, _)| beyond_nat(&udp, relay, room));
+                let punch = udp.try_clone().ok();
+                let hash = crate::link::webtransport(udp, gate.clone(), opts.tls.clone(), move |link| {
+                    if let Err(e) = session(link, source.clone(), stats.clone(), &o, None) {
+                        eprintln!("rein-remote: {e}");
+                    }
+                })?;
+                if let (Some(mapped), Some(cert), Some(socket)) = (relayed, hash, punch) {
+                    let mut candidates: Vec<SocketAddr> = mapped.into_iter().collect();
+                    if at.ip().is_unspecified() {
+                        candidates.extend(rr_client::direct::local_candidates(at.port(), true));
+                    } else if !at.ip().is_loopback() || candidates.is_empty() {
+                        candidates.push(at);
+                    }
+                    let _ = direct.set(Direct {
+                        socket,
+                        candidates,
+                        cert,
+                        gate: gate.clone(),
+                    });
                 }
-            }) {
+                Ok(hash)
+            });
+            match started {
                 Ok(hash) => {
                     eprintln!("rein-remote: WebTransport on udp {at}");
                     Some((at.port(), hash))
@@ -167,24 +214,18 @@ pub fn run(source: Box<dyn Source>, opts: Options) -> Result<(), String> {
     let _advert = match listener.local_addr() {
         Ok(at) if opts.mdns && at.ip().is_unspecified() => crate::identity::Identity::load_or_create()
             .and_then(|id| {
-                let a = crate::discover::advertise(at.port(), &id.fingerprint(), wt.as_ref().as_ref().map(|w| w.0), opts.tls.is_some())?;
-                eprintln!("rein-remote: on this network as {} (id {})", crate::discover::machine_name(), id.fingerprint());
+                let a = rr_client::discover::advertise(at.port(), &id.fingerprint(), wt.as_ref().as_ref().map(|w| w.0), opts.tls.is_some())?;
+                eprintln!(
+                    "rein-remote: on this network as {} (id {})",
+                    rr_client::discover::machine_name(),
+                    id.fingerprint()
+                );
                 Ok(a)
             })
             .map_err(|e| eprintln!("rein-remote: not found by name on this network ({e})"))
             .ok(),
         _ => None,
     };
-    if let Some((relay, room, secret)) = opts.relay.clone() {
-        let (source, stats, opts) = (source.clone(), stats.clone(), opts.clone());
-        let page = relay.replacen("ws", "http", 1);
-        eprintln!(
-            "rein-remote: through the relay: open {}/?room={room}#k={}",
-            page.trim_end_matches('/'),
-            crate::e2e::b64url(&opts.e2e_key)
-        );
-        std::thread::spawn(move || through_relay(&relay, &room, secret.as_deref(), source, stats, &opts));
-    }
     for conn in listener.incoming() {
         let Ok(stream) = conn else { continue };
         let (source, stats, opts, wt, tls, gate) = (source.clone(), stats.clone(), opts.clone(), wt.clone(), tls.clone(), gate.clone());
@@ -197,8 +238,36 @@ pub fn run(source: Box<dyn Source>, opts: Options) -> Result<(), String> {
     Ok(())
 }
 
+/// The address `udp` has beyond this machine's NAT, as the relay sees it (asked over UDP, for this
+/// machine's room), and a keepalive from then on so the NAT keeps it. None when the relay doesn't
+/// answer on UDP (an older relay, a proxy that passes no UDP): then only this machine's own networks
+/// are offered.
+fn beyond_nat(udp: &UdpSocket, relay: &str, room: &str) -> Option<SocketAddr> {
+    let reflector = rr_client::direct::reflector(relay)?;
+    // The room opens once the relay connection is up (on its own thread): a few seconds at most.
+    let seen = rr_client::direct::probe(udp, reflector, room, Duration::from_secs(5));
+    match seen {
+        Some(a) => {
+            eprintln!("rein-remote: the relay sees WebTransport's socket as {a} (offered to native viewers for a direct path)");
+            if let Ok(clone) = udp.try_clone() {
+                rr_client::direct::keep_alive(clone, reflector);
+            }
+        }
+        None => eprintln!("rein-remote: the relay ({reflector}) didn't answer over UDP: a direct path only on this machine's networks"),
+    }
+    seen
+}
+
 /// Connected out to a relay: one viewer at a time, then the room again for the next.
-fn through_relay(relay: &str, room: &str, secret: Option<&str>, source: Arc<Mutex<Box<dyn Source>>>, stats: Arc<Mutex<Stats>>, opts: &Options) {
+fn through_relay(
+    relay: &str,
+    room: &str,
+    secret: Option<&str>,
+    source: Arc<Mutex<Box<dyn Source>>>,
+    stats: Arc<Mutex<Stats>>,
+    opts: &Options,
+    direct: &OnceLock<Direct>,
+) {
     let url = format!(
         "{}/host?room={room}{}",
         relay.trim_end_matches('/'),
@@ -218,7 +287,7 @@ fn through_relay(relay: &str, room: &str, secret: Option<&str>, source: Arc<Mute
                         continue;
                     }
                 };
-                if let Err(e) = session(Box::new(link), source.clone(), stats.clone(), opts) {
+                if let Err(e) = session(Box::new(link), source.clone(), stats.clone(), opts, direct.get()) {
                     eprintln!("rein-remote: {e}");
                 }
             }
@@ -278,7 +347,7 @@ fn handle(
         let _ = conn.tcp().set_nodelay(true);
         let _ = socket2::SockRef::from(conn.tcp()).set_send_buffer_size((opts.bitrate_kbps as usize * 1000 / 8 / 20).max(64 * 1024));
         let ws = tungstenite::accept(crate::conn::Replay::new(head, conn)).map_err(|e| format!("websocket: {e}"))?;
-        return session(Box::new(WsLink(ws)), source, stats, opts);
+        return session(Box::new(WsLink(ws)), source, stats, opts, None);
     }
     let (status, kind, body) = match path.as_str() {
         "/" | "/index.html" => ("200 OK", "text/html; charset=utf-8", INDEX.to_string()),
@@ -408,6 +477,10 @@ fn unscale(ev: rr_proto::Input, pic: (usize, usize), src: (usize, usize)) -> rr_
     }
 }
 
+fn addrs(a: &[SocketAddr]) -> String {
+    a.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
+}
+
 /// Parity shards per data shard for a datagram loss rate: enough that a frame very rarely loses more
 /// than its parity covers (3× the loss rate, at least 10%, at most half).
 pub fn parity_for(loss: f32) -> f32 {
@@ -459,7 +532,13 @@ fn stats_json(s: &Stats) -> String {
     )
 }
 
-fn session(mut link: Box<dyn Link + Send>, source: Arc<Mutex<Box<dyn Source>>>, stats: Arc<Mutex<Stats>>, opts: &Options) -> Result<(), String> {
+fn session(
+    mut link: Box<dyn Link + Send>,
+    source: Arc<Mutex<Box<dyn Source>>>,
+    stats: Arc<Mutex<Stats>>,
+    opts: &Options,
+    direct: Option<&Direct>,
+) -> Result<(), String> {
     let (w, h) = source.lock().unwrap().size();
     // What this machine encodes, the codec asked for first (H.264 by default: every device decodes
     // it); with `auto`, HEVC first when this machine encodes it in hardware.
@@ -540,6 +619,19 @@ fn session(mut link: Box<dyn Link + Send>, source: Arc<Mutex<Box<dyn Source>>>, 
         codec,
         if datagrams { ", video as datagrams" } else { "" }
     );
+    // A viewer through the relay that can go direct: where to find this machine, the certificate to
+    // expect, a ticket for one session. Sealed like everything else here, so the relay can't use it.
+    let mut punch_tag = None;
+    if let Some(d) = direct.filter(|_| client.features & FEATURE_DIRECT != 0) {
+        let ticket = d.gate.ticket_once();
+        punch_tag = Some(rr_proto::punch::tag(&ticket));
+        link.send(&Message::DirectOffer(DirectOffer {
+            candidates: d.candidates.clone(),
+            cert_sha256: d.cert.to_vec(),
+            ticket,
+        }))?;
+        eprintln!("rein-remote: offered {} a direct path ({})", client.name, addrs(&d.candidates));
+    }
 
     let mut frame_time = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
     let mut adapt = crate::adapt::Adapt::new(opts.bitrate_kbps, fps);
@@ -601,6 +693,17 @@ fn session(mut link: Box<dyn Link + Send>, source: Arc<Mutex<Box<dyn Source>>>, 
                                 }
                             }
                             Some(Message::Ping { id, sent_us }) => link.send(&Message::Pong { id, sent_us })?,
+                            Some(Message::DirectAnswer(a)) => {
+                                // Punch packets to where the viewer may be, from WebTransport's own socket:
+                                // this NAT then lets the viewer's QUIC in, as an answer to them.
+                                if let (Some(d), Some(tag)) = (direct, punch_tag) {
+                                    let to: Vec<SocketAddr> = a.candidates.into_iter().filter(SocketAddr::is_ipv4).collect();
+                                    eprintln!("rein-remote: punching toward the viewer ({})", addrs(&to));
+                                    if let Ok(sock) = d.socket.try_clone() {
+                                        std::thread::spawn(move || rr_client::direct::punch(&sock, &to, tag, Duration::from_secs(5)));
+                                    }
+                                }
+                            }
                             _ => {}
                         }
                     }

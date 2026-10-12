@@ -23,6 +23,7 @@
 
 pub mod fec;
 pub mod pair;
+pub mod punch;
 mod wire;
 
 pub use wire::{Reader, Writer};
@@ -90,6 +91,10 @@ pub struct Hello {
 /// A client that takes video as datagrams with forward error correction (see [`fec`]), when the
 /// transport has datagrams (WebTransport, QUIC).
 pub const FEATURE_VIDEO_DATAGRAMS: u32 = 1;
+/// A viewer that can take a direct path when it came through a relay: it can punch through NAT and
+/// open QUIC itself (native clients; a browser can't, it has no UDP of its own). The host may then
+/// send a [`DirectOffer`].
+pub const FEATURE_DIRECT: u32 = 2;
 
 pub const INPUT_POINTER: u8 = 1;
 pub const INPUT_KEYBOARD: u8 = 2;
@@ -215,6 +220,28 @@ pub struct Feedback {
     pub loss_permille: u16,
 }
 
+/// A way around the relay, offered by the host inside a sealed relayed session (so the relay, which
+/// can't read it, can't use or change any of it): where its QUIC socket may be reached, the
+/// certificate to expect there, and a ticket good for one session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectOffer {
+    /// The host's WebTransport socket as the relay saw it (its address on the far side of its NAT),
+    /// then its addresses on its own networks.
+    pub candidates: Vec<std::net::SocketAddr>,
+    /// The SHA-256 of the host's WebTransport certificate: the viewer accepts that one and no other.
+    pub cert_sha256: Vec<u8>,
+    /// What the host's gate lets in once (`?ticket=`), for a minute.
+    pub ticket: String,
+}
+
+/// The viewer's side of it: where its own QUIC socket may be reached (as the relay saw it, then on its
+/// networks). Both then send punch packets ([`punch`]) to the other's candidates, and the viewer opens
+/// WebTransport straight to the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectAnswer {
+    pub candidates: Vec<std::net::SocketAddr>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
     Hello(Hello),
@@ -229,6 +256,8 @@ pub enum Message {
     Resize { width: u16, height: u16 },
     Ping { id: u32, sent_us: u64 },
     Pong { id: u32, sent_us: u64 },
+    DirectOffer(DirectOffer),
+    DirectAnswer(DirectAnswer),
 }
 
 /// Frame kinds on the wire.
@@ -245,6 +274,8 @@ pub mod kind {
     pub const RESIZE: u8 = 10;
     pub const PING: u8 = 11;
     pub const PONG: u8 = 12;
+    pub const DIRECT_OFFER: u8 = 13;
+    pub const DIRECT_ANSWER: u8 = 14;
 }
 
 /// Each message's version, written in its frame header: raised when a field is added at the end.
@@ -263,6 +294,8 @@ pub mod version {
     pub const RESIZE: u8 = 0;
     pub const PING: u8 = 0;
     pub const PONG: u8 = 0;
+    pub const DIRECT_OFFER: u8 = 0;
+    pub const DIRECT_ANSWER: u8 = 0;
 
     /// The version this build writes for a kind.
     pub fn of(kind: u8) -> u8 {
@@ -279,6 +312,8 @@ pub mod version {
             k::CLIPBOARD => CLIPBOARD,
             k::RESIZE => RESIZE,
             k::PING => PING,
+            k::DIRECT_OFFER => DIRECT_OFFER,
+            k::DIRECT_ANSWER => DIRECT_ANSWER,
             _ => PONG,
         }
     }
@@ -494,6 +529,16 @@ impl Message {
                 w.u64(*sent_us);
                 (if matches!(self, Message::Ping { .. }) { kind::PING } else { kind::PONG }, 0)
             }
+            Message::DirectOffer(o) => {
+                w.addrs(&o.candidates);
+                w.bytes(&o.cert_sha256);
+                w.str(&o.ticket);
+                (kind::DIRECT_OFFER, 0)
+            }
+            Message::DirectAnswer(a) => {
+                w.addrs(&a.candidates);
+                (kind::DIRECT_ANSWER, 0)
+            }
         }
     }
 
@@ -633,6 +678,12 @@ impl Message {
                 id: r.u32()?,
                 sent_us: r.u64()?,
             }),
+            kind::DIRECT_OFFER => Some(Message::DirectOffer(DirectOffer {
+                candidates: r.addrs()?,
+                cert_sha256: r.bytes()?.to_vec(),
+                ticket: r.str()?,
+            })),
+            kind::DIRECT_ANSWER => Some(Message::DirectAnswer(DirectAnswer { candidates: r.addrs()? })),
             _ => None,
         };
         Ok((msg, HEADER_LEN + len))
