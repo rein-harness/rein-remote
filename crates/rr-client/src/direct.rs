@@ -103,12 +103,17 @@ pub fn punch_and_listen(socket: &UdpSocket, to: &[SocketAddr], tag: [u8; 16], ti
             }
             next = Instant::now() + Duration::from_millis(100);
         }
-        if let Ok((n, from)) = socket.recv_from(&mut buf) {
-            if Packet::decode(&buf[..n]) == Some(Packet::Punch { tag }) {
-                // One more each way, so the host's NAT has seen this side answer too.
-                let _ = socket.send_to(&p, from);
-                return Some(from);
+        match socket.recv_from(&mut buf) {
+            Ok((n, from)) => {
+                if Packet::decode(&buf[..n]) == Some(Packet::Punch { tag }) {
+                    // One more each way, so the host's NAT has seen this side answer too.
+                    let _ = socket.send_to(&p, from);
+                    return Some(from);
+                }
             }
+            // Windows reports an earlier send's ICMP error on the next read, at once: don't spin.
+            Err(e) if !matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => std::thread::sleep(Duration::from_millis(5)),
+            Err(_) => {}
         }
     }
     None

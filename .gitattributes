@@ -1,0 +1,2 @@
+# Test vectors are compared byte for byte with what the Rust tests write: LF on every OS.
+clients/web/test/*.json text eol=lf

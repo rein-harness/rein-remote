@@ -2,3 +2,4 @@
 *.swp
 .DS_Store
 /tests/nat/rein-remote.linux
+/tests/nat/out/

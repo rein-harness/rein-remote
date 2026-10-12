@@ -330,7 +330,10 @@ fn find(name: &str) -> Result<String, String> {
         })?;
     let addr = f.addrs.first().ok_or("it gave no address")?;
     let host = if addr.is_ipv6() { format!("[{addr}]") } else { addr.to_string() };
-    Ok(format!("{}://{host}:{}/", if f.https { "https" } else { "http" }, f.port))
+    // Plain HTTP: the same port serves it next to HTTPS, and a real certificate is for the machine's
+    // name, not the address found here. (A self-signed WebTransport certificate is checked by its
+    // hash, so that works by address; with a real one, the WebSocket is used.)
+    Ok(format!("http://{host}:{}/", f.port))
 }
 
 fn hello(opts: &Options, direct: bool) -> Vec<u8> {
