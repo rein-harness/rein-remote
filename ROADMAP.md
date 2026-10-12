@@ -34,9 +34,9 @@ has been verified.
   segment passed as a file descriptor; GetImage where there's none), and XDamage skips a still
   screen: at 1920×1080 scrolling full-screen, 1.7 ms to read the screen, 16 ms to encode,
   26 ms / 36 ms capture to decoded; a still terminal sent 8 frames in 8 seconds. A display with
-  only its abstract socket (the file missing) connects too. Still to do in this phase: multi-slice
-  threaded encoding (needs our own binding to openh264's C API; the crate's wrapper encodes one
-  slice).
+  only its abstract socket (the file missing) connects too. Multi-slice threaded encoding is in
+  (our own binding to openh264's C API): a frame in 4 slices on 4 cores, 8.6 ms at 1080p where one
+  slice took 12.9 ms (measured with phase 4's controller work, below).
 
 ## Phase 2 — Rein previews through Rein Remote
 
@@ -44,6 +44,20 @@ has been verified.
 - Rein uses it for native-app and window previews (falls back to its current frames path).
 - **Verified:** a Rein web UI chat shows a native Linux app through Rein Remote, from a phone-size
   browser, through a reverse proxy.
+- **Status:** verified. The packages: `@rein-harness/remote` (the web client, with its types) and
+  `@rein-harness/remote-server` (`npx rein-remote …`, `binaryPath()` for programs), which depends on
+  one package per platform binary (optional dependencies: npm installs only the machine's own),
+  built by `npm/build.mjs`, packed, installed and checked against Rein's contract (`npm/contract.mjs`:
+  the port line on stderr, the token, `/rein-remote.js`, Hello/Config/keyframe, `--pipe`'s JPEGs in
+  and JSON input out, `windows --json`) in CI on Linux, macOS and Windows; `release.yml` publishes
+  them on a version tag. Rein's previews, end to end in Docker (`tests/e2e/rein-preview`): Rein's web
+  UI behind Caddy over HTTPS, a 390×844 phone-size Chromium (DPR 3, touch) that can reach only the
+  proxy; a chat's preview of an xterm on a VNC display streamed through Rein Remote on its first
+  open, a tap and the phone's keyboard ran a command in it, `/preview :2` streamed the same way, a
+  password-protected display fell back to Rein's frames, and the page never received rein-remote's
+  token, port or a VNC password. (This found three bugs in Rein, fixed in rein-harness#678.) In that
+  VM (4 shared cores, software decoding at DPR 3) the phone showed 2–26 fps: CPU-bound there, a lower
+  bound, not the stream's.
 
 ## Phase 3 — macOS and Windows servers
 

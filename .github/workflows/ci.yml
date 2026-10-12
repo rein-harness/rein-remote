@@ -45,6 +45,27 @@ jobs:
       - name: Selftest (macOS, test pattern; screen capture needs a permission runners can't give)
         if: runner.os == 'macOS'
         run: cargo run --release -p rr-server -- selftest --test-pattern
+      # The npm packages, installed from their tarballs, and Rein's contract with the binary (how
+      # rein-harness's src/preview/remote.ts starts and talks to it).
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: npm packages and Rein's contract
+        shell: bash
+        env:
+          DISPLAY: ':20'
+        run: |
+          case "$RUNNER_OS" in
+            Linux) t=x86_64-unknown-linux-gnu; b=target/release/rein-remote; w="--windows required" ;;
+            macOS) t=aarch64-apple-darwin; b=target/release/rein-remote; w="" ;;
+            Windows) t=x86_64-pc-windows-msvc; b=target/release/rein-remote.exe; w="--windows required" ;;
+          esac
+          node npm/build.mjs --out "$RUNNER_TEMP/npm" --bin "$t=$b"
+          mkdir "$RUNNER_TEMP/tgz" "$RUNNER_TEMP/app"
+          for d in "$RUNNER_TEMP"/npm/*; do (cd "$RUNNER_TEMP/tgz" && npm pack "$d"); done
+          cd "$RUNNER_TEMP/app" && npm init -y > /dev/null && npm install --no-audit --no-fund "$RUNNER_TEMP"/tgz/*.tgz
+          npx rein-remote --version
+          node "$GITHUB_WORKSPACE/npm/contract.mjs" $w
   wasm:
     runs-on: ubuntu-latest
     steps:
