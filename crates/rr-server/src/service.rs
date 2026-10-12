@@ -76,11 +76,13 @@ fn may_fail(argv: &[&str]) -> Step {
     Step { may_fail: true, ..step(argv) }
 }
 
-/// Files to write (or remove) and commands to run, in order.
+/// Files to write, then commands to run; files to remove once the first `remove_after` commands
+/// have run (what's running stopped first, the service manager told after).
 #[derive(Clone, Debug, Default)]
 pub struct Plan {
     pub files: Vec<(PathBuf, String)>,
     pub remove: Vec<PathBuf>,
+    pub remove_after: usize,
     pub steps: Vec<Step>,
 }
 
@@ -324,12 +326,14 @@ pub fn uninstall_plan(s: &Spec, os: Os) -> Plan {
             p.steps.push(may_fail(&[ctl, &["stop", &unit]].concat()));
             p.steps.push(may_fail(&[ctl, &["disable", &unit]].concat()));
             p.remove.push(unit_path(s, os).unwrap());
+            p.remove_after = 2;
             p.steps.push(step(&[ctl, &["daemon-reload"]].concat()));
         }
         Os::Mac => {
             let domain = if s.system { "system".to_string() } else { format!("gui/{}", s.uid) };
             p.steps.push(may_fail(&["launchctl", "bootout", &format!("{domain}/{}", s.label())]));
             p.remove.push(unit_path(s, os).unwrap());
+            p.remove_after = 1;
         }
         Os::Windows if s.system => {
             p.steps.push(may_fail(&["sc.exe", "stop", &s.name]));
@@ -349,16 +353,23 @@ pub fn describe(p: &Plan) -> String {
     for (path, body) in &p.files {
         out.push_str(&format!("# {}\n{body}\n", path.display()));
     }
-    for path in &p.remove {
-        out.push_str(&format!("# remove {}\n", path.display()));
-    }
-    for s in &p.steps {
+    for (i, s) in p.steps.iter().enumerate() {
+        if i == p.remove_after {
+            for path in &p.remove {
+                out.push_str(&format!("# remove {}\n", path.display()));
+            }
+        }
         let line: Vec<String> = s.argv.iter().map(|a| win_quote(a)).collect();
         out.push_str(&format!(
             "$ {}{}\n",
             line.join(" "),
             if s.may_fail { "   # (may fail: nothing to stop)" } else { "" }
         ));
+    }
+    if p.remove_after >= p.steps.len() {
+        for path in &p.remove {
+            out.push_str(&format!("# remove {}\n", path.display()));
+        }
     }
     out
 }
@@ -371,14 +382,20 @@ fn carry_out(p: &Plan) -> Result<(), String> {
         std::fs::write(path, body).map_err(|e| format!("{}: {e}", path.display()))?;
         eprintln!("rein-remote: wrote {}", path.display());
     }
-    for path in &p.remove {
-        match std::fs::remove_file(path) {
-            Ok(()) => eprintln!("rein-remote: removed {}", path.display()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("{}: {e}", path.display())),
+    let remove = || -> Result<(), String> {
+        for path in &p.remove {
+            match std::fs::remove_file(path) {
+                Ok(()) => eprintln!("rein-remote: removed {}", path.display()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("{}: {e}", path.display())),
+            }
         }
-    }
-    for s in &p.steps {
+        Ok(())
+    };
+    for (i, s) in p.steps.iter().enumerate() {
+        if i == p.remove_after {
+            remove()?;
+        }
         let out = std::process::Command::new(&s.argv[0])
             .args(&s.argv[1..])
             .output()
@@ -403,6 +420,9 @@ fn carry_out(p: &Plan) -> Result<(), String> {
                 String::from_utf8_lossy(&out.stdout).trim()
             ));
         }
+    }
+    if p.remove_after >= p.steps.len() {
+        remove()?;
     }
     Ok(())
 }
@@ -639,6 +659,14 @@ mod tests {
         assert_eq!(p.steps[0].argv, ["systemctl", "daemon-reload"]);
         let p = uninstall_plan(&spec("relay", false), Os::Linux);
         assert!(p.steps[0].may_fail && p.remove.len() == 1);
+        // Stopped and disabled while its file is there, removed, then systemd told.
+        let d = describe(&p);
+        let at = |what: &str| d.find(what).unwrap_or_else(|| panic!("{what} in {d}"));
+        assert!(at("$ systemctl --user stop") < at("$ systemctl --user disable"));
+        assert!(at("$ systemctl --user disable") < at("# remove /home/me/.config/systemd/user/rein-remote-relay.service"));
+        assert!(at("# remove") < at("$ systemctl --user daemon-reload"));
+        let d = describe(&uninstall_plan(&spec("relay", false), Os::Mac));
+        assert!(d.find("$ launchctl bootout").unwrap() < d.find("# remove").unwrap(), "{d}");
     }
 
     #[test]
