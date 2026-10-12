@@ -202,8 +202,10 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           $b = "$PWD\target\release\rein-remote.exe"; $d = "$env:RUNNER_TEMP\svc"
           New-Item -ItemType Directory -Force $d | Out-Null
-          $secret = "s3cret-" + (Get-Random); Set-Content -NoNewline "$d\secret" $secret
-          Set-Content "$d\relay.toml" "listen = `"127.0.0.1:7995`"`nmetrics-listen = `"127.0.0.1:7996`"`nsecret = { file = `"secret`" }"
+          $secret = "s3cret-" + (Get-Random)
+          [IO.File]::WriteAllText("$d\secret", $secret)
+          [IO.File]::WriteAllText("$d\relay.toml", "listen = `"127.0.0.1:7995`"`nmetrics-listen = `"127.0.0.1:7996`"`nsecret = { file = `"secret`" }`n")
+          Get-ChildItem $d | Format-Table Name, Length, FullName
           function Up { for ($i = 0; $i -lt 60; $i++) { try { return Invoke-RestMethod http://127.0.0.1:7995/healthz } catch { Start-Sleep -Milliseconds 250 } }; throw 'not up' }
           function Down { for ($i = 0; $i -lt 60; $i++) { try { Invoke-RestMethod -TimeoutSec 1 http://127.0.0.1:7995/healthz | Out-Null; Start-Sleep -Milliseconds 250 } catch { return } }; throw 'still up' }
           function NoSecret { $a = (Get-CimInstance Win32_Process -Filter "Name='rein-remote.exe'").CommandLine; $a; if ($a -match [regex]::Escape($secret)) { throw 'the secret is on the command line' } }
@@ -284,6 +286,8 @@ jobs:
   # docs/verification/signing.md has the same with real certificates.
   signing:
     needs: test
+    # Each OS's binary, whether or not the other OSes' tests passed.
+    if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
       matrix:

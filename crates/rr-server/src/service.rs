@@ -314,7 +314,8 @@ pub fn uninstall_plan(s: &Spec, os: Os) -> Plan {
         Os::Linux => {
             let unit = format!("{}.service", s.name);
             let ctl: &[&str] = if s.system { &["systemctl"] } else { &["systemctl", "--user"] };
-            p.steps.push(may_fail(&[ctl, &["disable", "--now", &unit]].concat()));
+            p.steps.push(may_fail(&[ctl, &["stop", &unit]].concat()));
+            p.steps.push(may_fail(&[ctl, &["disable", &unit]].concat()));
             p.remove.push(unit_path(s, os).unwrap());
             p.steps.push(step(&[ctl, &["daemon-reload"]].concat()));
         }
