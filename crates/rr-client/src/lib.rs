@@ -81,6 +81,8 @@ pub struct Options {
     pub auto_feedback: bool,
     /// Ask for a keyframe when a frame is lost (what a decoder needs to go on).
     pub keyframe_on_loss: bool,
+    /// The input kinds this client sends (`INPUT_*`): a client with gamepads adds `INPUT_GAMEPAD`.
+    pub input: u8,
 }
 
 impl Default for Options {
@@ -98,6 +100,7 @@ impl Default for Options {
             refresh_mhz: 60_000,
             auto_feedback: true,
             keyframe_on_loss: true,
+            input: INPUT_POINTER | INPUT_KEYBOARD | INPUT_TOUCH,
         }
     }
 }
@@ -175,6 +178,15 @@ impl Session {
         self.events.recv_timeout(wait).ok()
     }
 
+    /// A handle that sends to the server from any thread (a window's input, while another thread
+    /// takes the events and decodes).
+    pub fn control(&self) -> Control {
+        Control {
+            inbox: self.inbox.clone(),
+            stats: self.stats.clone(),
+        }
+    }
+
     pub fn input(&self, i: Input) {
         self.send(Message::Input(i));
     }
@@ -185,6 +197,40 @@ impl Session {
     }
 
     /// Tells the server a frame was shown (with `auto_feedback` off: after decoding it).
+    pub fn feedback(&self, f: Feedback) {
+        self.send(Message::Feedback(f));
+    }
+
+    pub fn send(&self, m: Message) {
+        let _ = self.inbox.send(Ev::Cmd(Cmd::Send(m)));
+    }
+
+    pub fn stats(&self) -> Stats {
+        self.stats.lock().unwrap().clone()
+    }
+
+    pub fn close(&self) {
+        let _ = self.inbox.send(Ev::Cmd(Cmd::Close));
+    }
+}
+
+/// Sends to the server from any thread: [`Session::control`]. The session ends when the `Session`
+/// is dropped (or [`Control::close`]), not when these are.
+#[derive(Clone)]
+pub struct Control {
+    inbox: mpsc::Sender<Ev>,
+    stats: Arc<Mutex<Stats>>,
+}
+
+impl Control {
+    pub fn input(&self, i: Input) {
+        self.send(Message::Input(i));
+    }
+
+    pub fn keyframe(&self) {
+        self.send(Message::KeyframeRequest);
+    }
+
     pub fn feedback(&self, f: Feedback) {
         self.send(Message::Feedback(f));
     }
@@ -331,12 +377,7 @@ fn find(name: &str) -> Result<String, String> {
                 if names.is_empty() { "none".into() } else { names.join(", ") }
             )
         })?;
-    let addr = f.addrs.first().ok_or("it gave no address")?;
-    let host = if addr.is_ipv6() { format!("[{addr}]") } else { addr.to_string() };
-    // Plain HTTP: the same port serves it next to HTTPS, and a real certificate is for the machine's
-    // name, not the address found here. (A self-signed WebTransport certificate is checked by its
-    // hash, so that works by address; with a real one, the WebSocket is used.)
-    Ok(format!("http://{host}:{}/", f.port))
+    f.link()
 }
 
 fn hello(opts: &Options, direct: bool) -> Vec<u8> {
@@ -349,7 +390,7 @@ fn hello(opts: &Options, direct: bool) -> Vec<u8> {
         max_height: 2160,
         max_fps: 240,
         audio: false,
-        input: INPUT_POINTER | INPUT_KEYBOARD | INPUT_TOUCH,
+        input: opts.input,
         refresh_mhz: opts.refresh_mhz,
         features: if opts.datagrams { FEATURE_VIDEO_DATAGRAMS } else { 0 } | if direct { FEATURE_DIRECT } else { 0 },
     })
@@ -518,9 +559,11 @@ impl Run {
             }
             s.clock_offset_us.map(|o| received_us as i64 - (v.timestamp_us as i64 + o))
         };
+        // The share of datagrams lost lately: in the stats either way (a client that sends its own
+        // feedback reports it from there).
+        let loss_permille = self.link.loss_permille();
+        self.stats.lock().unwrap().loss_permille = loss_permille;
         if self.opts.auto_feedback {
-            let loss_permille = self.link.loss_permille();
-            self.stats.lock().unwrap().loss_permille = loss_permille;
             self.link.send(
                 Message::Feedback(Feedback {
                     frame: v.frame,

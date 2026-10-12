@@ -22,6 +22,18 @@ pub struct Found {
     pub https: bool,
 }
 
+impl Found {
+    /// The link to connect to it (no token: a paired client signs in with its key).
+    pub fn link(&self) -> Result<String, String> {
+        let addr = self.addrs.first().ok_or("it gave no address")?;
+        let host = if addr.is_ipv6() { format!("[{addr}]") } else { addr.to_string() };
+        // Plain HTTP: the same port serves it next to HTTPS, and a real certificate is for the
+        // machine's name, not the address found here. (A self-signed WebTransport certificate is
+        // checked by its hash, so that works by address; with a real one, the WebSocket is used.)
+        Ok(format!("http://{host}:{}/", self.port))
+    }
+}
+
 /// Saying where this server is, for as long as it's kept.
 pub struct Advert {
     daemon: ServiceDaemon,
