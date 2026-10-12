@@ -140,9 +140,10 @@ console.log(
         : undefined,
       // Beep minus flash, ms (positive: the sound comes after the picture), over the measured seconds.
       avSyncMs: (() => {
-        const v = (b?.avSyncMs ?? []).slice(a?.avSyncMs?.length ?? 0).sort((x, y) => x - y);
+        const seen = (b?.avSyncMs ?? []).slice(a?.avSyncMs?.length ?? 0);
+        const v = [...seen].sort((x, y) => x - y);
         const abs = v.map(Math.abs).sort((x, y) => x - y);
-        return v.length ? {p50: pct(v, 0.5), p95abs: pct(abs, 0.95), min: v[0], max: v[v.length - 1], samples: v.length} : undefined;
+        return v.length ? {p50: pct(v, 0.5), p95abs: pct(abs, 0.95), min: v[0], max: v[v.length - 1], samples: v.length, values: seen} : undefined;
       })(),
       server,
     },

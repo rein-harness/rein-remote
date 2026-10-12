@@ -384,9 +384,10 @@ const webcodecs = typeof VideoDecoder !== 'undefined';
 /*
  * Every Audio packet carries the capture time of its first sample on the server's clock, the clock
  * video frames are stamped with. The clocks aren't synced, so sound is placed by a measured offset:
- * for each frame shown, (local time − capture time) is how late after capture the picture is seen.
- * The offset both share is the median of the last ~2 s of those, or later if sound needs more time to
- * arrive and decode (its own p90, plus a little jitter buffer). Each packet plays at capture time +
+ * for each frame decoded, (local time − capture time) is how late after capture the picture is ready.
+ * The offset both share is the median of the last ~3 s of those, or later if sound needs more time to
+ * arrive, decode and come out of the speakers (its own median, plus a 15 ms jitter buffer); then the
+ * picture waits for the sound, while there's sound (see presentAt). Each packet plays at capture time +
  * offset, mapped onto the audio clock at the moment it's heard (getOutputTimestamp, so the output's
  * own latency counts). Packets in a row play back to back; a small error is taken up by playing a
  * touch fast or slow (≤1%), one over 20 ms by dropping packets (sound behind) or a gap (ahead).
@@ -414,22 +415,27 @@ export async function canPlaySound() {
   }
 }
 
-/** The offset sound and picture share, from what each needs (µs, local clock − capture clock). */
-export function sharedOffset(videoUs, audioReadyUs, jitterUs = 5000) {
+/**
+ * The offset sound and picture share, from what each needs (µs, local clock − capture clock): the
+ * picture's median, or the sound's median and a jitter buffer when that's later. (Medians: a page
+ * that stalls for a moment delays a burst of packets, which shouldn't move everything for seconds.)
+ */
+export function sharedOffset(videoUs, audioReadyUs, jitterUs = 15_000) {
   const v = median(videoUs);
-  const a = audioReadyUs.length ? pct(audioReadyUs, 0.9) + jitterUs : undefined;
+  const a = audioReadyUs.length ? median(audioReadyUs) + jitterUs : undefined;
   if (v === undefined) return a;
   return a === undefined ? v : Math.max(v, a);
 }
 
 /**
  * Where a packet goes, given where the last one ended (`playhead`, audio-clock seconds, 0: none
- * yet), where it should be heard (`want`), how long it is, and the earliest it can still start.
- * Returns {at, rate, playhead} to play it, or {drop: true} to skip it.
+ * yet), where it should be heard (`want`), how long it is, the earliest it can still start, and
+ * whether it's (nearly) silent: a silent one moves to where it should be at once (nobody hears a
+ * gap or a skip in silence). Returns {at, rate, playhead} to play it, or {drop: true} to skip it.
  */
-export function placePacket(playhead, want, duration, earliest) {
+export function placePacket(playhead, want, duration, earliest, quiet = false) {
   const err = playhead ? playhead - want : Infinity; // > 0: the sound runs behind the picture
-  if (Math.abs(err) > 0.02) {
+  if (Math.abs(err) > 0.02 || (quiet && Math.abs(err) > 0.001)) {
     // Off by more than 20 ms: start again where it should be; too late for that, drop it (and the
     // ones after it, until the sound has caught up).
     if (want < earliest) return {drop: true, playhead: playhead && err > 0.02 ? playhead : 0};
@@ -441,13 +447,17 @@ export function placePacket(playhead, want, duration, earliest) {
   return {at, rate, playhead: at + duration / rate};
 }
 
-function makeSound(stats, measure, parent) {
+/** How far ahead of its sound the picture is drawn when it waits for it (µs). */
+const SYNC_SLACK_US = 12_000;
+
+function makeSound(stats, measure, parent, sync = true) {
   const ctx = new AudioContext({latencyHint: 'interactive', sampleRate: 48000});
   const out = ctx.createGain();
   out.connect(ctx.destination);
-  const a = (stats.audio = {state: ctx.state, decoder: 'opus (WebCodecs)', packets: 0, played: 0, dropped: 0, gaps: 0, offsetMs: null, videoMs: null, audioMs: null, outputLatencyMs: 0});
+  const a = (stats.audio = {state: ctx.state, decoder: 'opus (WebCodecs)', packets: 0, played: 0, dropped: 0, gaps: 0, offsetMs: null, videoMs: null, audioMs: null, arriveMs: null, holdMs: 0, sync, outputLatencyMs: 0});
+  // The last ~3 s of each (frames at 60 a second, packets at 100).
   const videoUs = [], readyUs = [], arriveUs = [];
-  let playhead = 0, offsetUs, base;
+  let playhead = 0, offsetUs, base, loudAt = -Infinity, running = 0;
   const update = () => {
     const o = sharedOffset(videoUs, readyUs);
     if (o === undefined) return;
@@ -471,25 +481,33 @@ function makeSound(stats, measure, parent) {
     output: (data) => {
       const n = data.numberOfFrames;
       const tsUs = data.timestamp + base;
+      let quiet = true;
       const buf = ctx.createBuffer(2, n, 48000);
       for (let c = 0; c < 2; c++) {
         const plane = new Float32Array(n);
         data.copyTo(plane, {planeIndex: Math.min(c, data.numberOfChannels - 1), format: 'f32-planar'});
         buf.copyToChannel(plane, c);
+        // Sound worth keeping the picture in time with: louder than -50 dBFS.
+        if (c === 0) {
+          quiet = plane.reduce((acc, x) => acc + x * x, 0) / n < 1e-5;
+          if (!quiet) loudAt = performance.now();
+        }
       }
       data.close();
       a.outputLatencyMs = +((ctx.outputLatency || ctx.baseLatency || 0) * 1000).toFixed(1);
       if (ctx.state !== 'running') return;
-      // The earliest this could be heard: what sound needs, for the shared offset.
+      // The earliest this could be heard: what sound needs, for the shared offset (not counting the
+      // first half second, while the output and the decoder warm up).
       const earliest = ctx.currentTime + 0.004;
-      readyUs.push(toLocalUs(earliest) - tsUs);
-      if (readyUs.length > 100) readyUs.shift();
+      if (++running > 50) readyUs.push(toLocalUs(earliest) - tsUs);
+      if (readyUs.length > 300) readyUs.shift();
       update();
-      a.audioMs = +(pct(readyUs, 0.9) / 1000).toFixed(1);
+      a.audioMs = +(median(readyUs) / 1000).toFixed(1);
       if (offsetUs === undefined) return;
-      const placed = placePacket(playhead, toCtx(tsUs + offsetUs), n / 48000, earliest);
+      const placed = placePacket(playhead, toCtx(tsUs + offsetUs), n / 48000, earliest, quiet);
       if (placed.drop) {
         a.dropped++;
+        if (!quiet) a.droppedLoud = (a.droppedLoud ?? 0) + 1;
         playhead = placed.playhead;
         return;
       }
@@ -584,13 +602,29 @@ function makeSound(stats, measure, parent) {
         a.decoder = `error: ${e.message ?? e}`;
       }
     },
-    /** A frame was drawn now, captured at `captureUs` (server clock). */
-    shown(captureUs, flash) {
+    /** A frame was decoded now, captured at `captureUs` (server clock). */
+    decoded(captureUs) {
       videoUs.push(localUs() - captureUs);
-      if (videoUs.length > 120) videoUs.shift();
+      if (videoUs.length > 180) videoUs.shift();
       a.videoMs = +(median(videoUs) / 1000).toFixed(1);
       update();
-      if (flash) (flashes.push(performance.now()), pair());
+    },
+    /**
+     * When to draw a frame captured at `captureUs` (performance.now ms), or undefined for now: while
+     * sound plays (something louder than -50 dBFS in the last 5 s) and the shared offset is longer
+     * than the picture's own, the picture waits, to SYNC_SLACK before its sound (sound a touch late
+     * is what people notice least) and 60 ms at most.
+     */
+    presentAt(captureUs) {
+      if (!sync || offsetUs === undefined || ctx.state !== 'running' || performance.now() - loudAt > 5000) return (a.holdMs = 0), undefined;
+      const wait = Math.min((captureUs + offsetUs - SYNC_SLACK_US - localUs()) / 1000, 60);
+      a.holdMs = Math.max(0, +wait.toFixed(1));
+      return wait > 0.5 ? performance.now() + wait : undefined;
+    },
+    /** The test pattern's flash was drawn now. */
+    flash() {
+      flashes.push(performance.now());
+      pair();
     },
     close() {
       gestures.forEach((g) => document.removeEventListener(g, onGesture, true));
@@ -781,6 +815,9 @@ export function connect(url, canvas, opts = {}) {
   const stats = {frames: 0, keyframes: 0, bytes: 0, decoder: '', rttMs: 0, state: 'connecting', error: '', glassMs: [], refreshHz: 0, fps: 0, audio: null};
   // Sound, unless turned off (`audio: false`) or the browser can't play it.
   const soundOk = opts.audio === false ? Promise.resolve(false) : canPlaySound();
+  // Sound and picture in time (the picture waits for the sound while it plays); `sync: false` (or
+  // ?sync=off) keeps the picture as early as it can be, the sound as it comes.
+  const syncAv = opts.sync ?? !(typeof location !== 'undefined' && new URLSearchParams(location.search).get('sync') === 'off');
   let sound = null;
   // Capture times of frames being decoded (frame number → µs, server clock), for the sound's offset.
   const captured = new Map();
@@ -812,7 +849,7 @@ export function connect(url, canvas, opts = {}) {
     const plays = await soundOk;
     if (plays) {
       try {
-        sound = makeSound(stats, measure, canvas.parentNode);
+        sound = makeSound(stats, measure, canvas.parentNode, syncAv);
       } catch {}
     }
     w.u8(sound ? 1 : 0);
@@ -826,50 +863,63 @@ export function connect(url, canvas, opts = {}) {
     return w.frame(K.HELLO, 2);
   };
 
+  // Drawing a frame: the canvas, then what's measured on it.
+  const present = (frame) => {
+    if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+      canvas.width = frame.displayWidth;
+      canvas.height = frame.displayHeight;
+    }
+    ctx.drawImage(frame.image ?? frame, 0, 0);
+    frame.close();
+    if (measure && canvas.height >= 24 && canvas.width >= 34 * 24) {
+      const row = ctx.getImageData(0, canvas.height - 12, 34 * 24, 1).data;
+      const bit = (k) => row[(k * 24 + 12) * 4 + 1] > 128;
+      if (bit(0) && !bit(1)) {
+        let ms = 0;
+        for (let k = 2; k < 34; k++) ms = ms * 2 + (bit(k) ? 1 : 0);
+        const now = Date.now() % 2 ** 32;
+        const d = (now - ms + 2 ** 32) % 2 ** 32;
+        if (d < 10_000) stats.glassMs.push(d), stats.glassMs.length > 1000 && stats.glassMs.shift();
+      }
+    }
+    // The flash in the test pattern's top left sixth (measuring sound against picture).
+    if (measure && sound && canvas.width >= 60) {
+      const px = ctx.getImageData(Math.floor(canvas.width / 12), Math.floor(canvas.height / 12), 1, 1).data;
+      const lit = px[0] > 200 && px[1] > 200 && px[2] > 200;
+      if (lit && !wasLit) sound.flash();
+      wasLit = lit;
+    }
+    stats.frames++;
+    // Frames shown in the last second.
+    const t = performance.now();
+    shown.push(t);
+    while (shown[0] < t - 1000) shown.shift();
+    stats.fps = shown.length;
+  };
+  // Frames waiting to be drawn with their sound, in order, each at its time (performance.now ms).
+  const held = [];
+  let heldTimer = 0;
+  const flush = () => {
+    clearTimeout(heldTimer);
+    while (held.length && held[0].due <= performance.now() + 0.5) present(held.shift().frame);
+    if (held.length) heldTimer = setTimeout(flush, held[0].due - performance.now());
+  };
+
   const makeDecoder = () => {
     try {
       if (decoder && decoder.state !== 'closed') decoder.close();
     } catch {}
     decoder = new (webcodecs ? VideoDecoder : MseDecoder)({
       output: (frame) => {
-        if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
-          canvas.width = frame.displayWidth;
-          canvas.height = frame.displayHeight;
-        }
-        ctx.drawImage(frame.image ?? frame, 0, 0);
-        if (measure && canvas.height >= 24 && canvas.width >= 34 * 24) {
-          const row = ctx.getImageData(0, canvas.height - 12, 34 * 24, 1).data;
-          const bit = (k) => row[(k * 24 + 12) * 4 + 1] > 128;
-          if (bit(0) && !bit(1)) {
-            let ms = 0;
-            for (let k = 2; k < 34; k++) ms = ms * 2 + (bit(k) ? 1 : 0);
-            const now = Date.now() % 2 ** 32;
-            const d = (now - ms + 2 ** 32) % 2 ** 32;
-            if (d < 10_000) stats.glassMs.push(d), stats.glassMs.length > 1000 && stats.glassMs.shift();
-          }
-        }
         const n = Number(frame.timestamp);
-        frame.close();
-        // The flash in the test pattern's top left sixth (measuring sound against picture).
-        let flash = false;
-        if (measure && sound && canvas.width >= 60) {
-          const px = ctx.getImageData(Math.floor(canvas.width / 12), Math.floor(canvas.height / 12), 1, 1).data;
-          const lit = px[0] > 200 && px[1] > 200 && px[2] > 200;
-          flash = lit && !wasLit;
-          wasLit = lit;
-        }
         const capturedUs = captured.get(n);
         captured.delete(n);
-        if (sound && capturedUs !== undefined) sound.shown(capturedUs, flash);
-        stats.frames++;
-        // Frames shown in the last second.
-        const t = performance.now();
-        shown.push(t);
-        while (shown[0] < t - 1000) shown.shift();
-        stats.fps = shown.length;
+        // How late after capture the picture is ready here: the offset the sound plays at.
+        if (sound && capturedUs !== undefined) sound.decoded(capturedUs);
         const received = sent.get(n);
         sent.delete(n);
-        // Feedback: what arrived and when it was on screen (drives the server's rate control).
+        // Feedback: what arrived and when it was decoded (drives the server's rate control), sent
+        // now, whether or not the frame waits for its sound (a wait isn't the link's).
         const w = new W();
         w.u32(n); w.u64(received ?? nowUs()); w.u64(nowUs()); w.u16(lost);
         // Version 1: the share of datagrams lost (the server sends parity for it).
@@ -877,6 +927,14 @@ export function connect(url, canvas, opts = {}) {
         if (link.fec) (stats.fecRecovered = link.fec.recovered), (stats.fecLost = link.fec.lost);
         lost = 0;
         send(w.frame(K.FEEDBACK, 1));
+        // While sound plays and needs longer than the picture to be heard, the picture waits for it
+        // (a WebCodecs frame can be held; Media Source plays live).
+        const due = webcodecs && capturedUs !== undefined ? sound?.presentAt(capturedUs) : undefined;
+        if (due === undefined && !held.length) return present(frame);
+        held.push({frame, due: due ?? 0});
+        // A hardware decoder has only a few frames to give: never hold more than 4.
+        while (held.length > 4) present(held.shift().frame);
+        flush();
       },
       error: (e) => {
         stats.error = String(e.message ?? e);
