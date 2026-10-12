@@ -8,8 +8,19 @@ use p256::ecdsa::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
+static HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Sets the config folder for this process, before anything uses it (an app keeps it in its own
+/// container: iOS gives an app no `~/.rein-remote`). False when it was already set.
+pub fn set_home(dir: PathBuf) -> bool {
+    HOME.set(dir).is_ok()
+}
+
 /// The config folder (made when first needed).
 pub fn home() -> PathBuf {
+    if let Some(h) = HOME.get() {
+        return h.clone();
+    }
     if let Some(h) = std::env::var_os("REIN_REMOTE_HOME").filter(|h| !h.is_empty()) {
         return PathBuf::from(h);
     }

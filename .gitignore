@@ -3,3 +3,5 @@
 .DS_Store
 /tests/nat/rein-remote.linux
 /tests/nat/out/
+/tests/relay-fleet/rein-remote.linux
+/tests/relay-fleet/out/

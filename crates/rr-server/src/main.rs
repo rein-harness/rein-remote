@@ -8,6 +8,8 @@
 //!   rein-remote serve --app Safari         # one app, all its windows (macOS)
 //!   rein-remote serve --display 2          # a display (macOS: its number in `displays`; Linux: :N)
 //!   rein-remote windows [--json]           # the windows it can show
+//!   rein-remote serve --config serve.toml  # flags from a file (TOML, each key a flag's name)
+//!   rein-remote install-service --config serve.toml [--print]   # started with the session (systemd, launchd, a task)
 //!   rein-remote displays                   # the displays (macOS)
 //!   rein-remote discover                   # Rein Remote servers on this network (mDNS)
 //!   rein-remote connect URL|NAME --seconds 10   # a viewer that counts what comes (transport, fps, latency)
@@ -22,6 +24,7 @@ mod audio;
 mod audit;
 mod auth;
 mod capture;
+mod config;
 mod conn;
 mod connect;
 mod encode;
@@ -31,17 +34,20 @@ mod encode_mf;
 mod encode_vaapi;
 #[cfg(target_os = "macos")]
 mod encode_vt;
+mod fleet;
 mod gamepad;
 #[cfg(target_os = "linux")]
 mod h264;
 mod identity;
 mod link;
 mod links;
+mod metrics;
 mod pairing;
 mod policy;
 mod record;
 mod relay;
 mod serve;
+mod service;
 mod yuv;
 
 use audio::Sound;
@@ -49,14 +55,28 @@ use capture::{Source, TestPattern};
 
 fn usage() -> ! {
     eprintln!(
-        "rein-remote {}\n\nusage:\n  rein-remote serve [--display :N | --window APP|TITLE|ID | --app NAME | --kms [CONNECTOR] | --vnc HOST:PORT [--vnc-password P] | --pipe WxH | --test-pattern [WxH] [--motion full]] [--listen ADDR] [--fps auto|N] [--codec h264|h265|auto] [--bitrate KBPS] [--token T] [--webtransport on|off] [--tls-cert PEM --tls-key PEM] [--tailscale-cert on|off] [--mdns on|off] [--pair on|off] [--relay ws(s)://HOST:PORT [--room CODE] [--relay-secret S]] [--audio on|off] [--public-url URL --oidc-issuer URL --oidc-client-id ID [--oidc-client-secret-file F] [--oidc-scopes S] [--oidc-user-claim C] [--oidc-groups-claim C] | --saml-idp-metadata FILE|URL [--saml-entity-id ID] [--saml-user-attr A] [--saml-groups-attr A]] [--policy FILE] [--audit FILE] [--record DIR]\n  rein-remote relay [--listen ADDR] [--secret S]\n  rein-remote windows [--json]\n  rein-remote displays\n  rein-remote discover [SECONDS]\n  rein-remote paired | unpair ID\n  rein-remote connect URL|NAME [--seconds N] [--pair CODE] [--json] [--webtransport on|off] [--datagrams on|off] [--direct on|off]\n  rein-remote selftest [--window Q | --display :N | --kms [CONNECTOR] | --test-pattern [WxH]] [--type TEXT] [--encode OUT.h264 [--frames N]]\n  rein-remote --version",
+        "rein-remote {}\n\nusage:\n  rein-remote serve [--config FILE.toml] [--display :N | --window APP|TITLE|ID | --app NAME | --kms [CONNECTOR] | --vnc HOST:PORT [--vnc-password P] | --pipe WxH | --test-pattern [WxH] [--motion full]] [--listen ADDR] [--fps auto|N] [--codec h264|h265|auto] [--bitrate KBPS] [--token T] [--webtransport on|off] [--tls-cert PEM --tls-key PEM] [--tailscale-cert on|off] [--mdns on|off] [--pair on|off] [--relay ws(s)://HOST:PORT ... [--room CODE] [--relay-secret S]] [--audio on|off] [--public-url URL --oidc-issuer URL --oidc-client-id ID [--oidc-client-secret-file F] [--oidc-scopes S] [--oidc-user-claim C] [--oidc-groups-claim C] | --saml-idp-metadata FILE|URL [--saml-entity-id ID] [--saml-user-attr A] [--saml-groups-attr A]] [--policy FILE] [--audit FILE] [--record DIR]\n  rein-remote relay [--config FILE.toml] [--listen ADDR] [--secret S] [--metrics-listen ADDR|PORT|off]\n  rein-remote install-service [serve|relay] [--config FILE.toml] [--system] [--name NAME] [--print]\n  rein-remote uninstall-service [serve|relay] [--system] [--name NAME] [--print]\n  rein-remote windows [--json]\n  rein-remote displays\n  rein-remote discover [SECONDS]\n  rein-remote paired | unpair ID\n  rein-remote connect URL|NAME [--seconds N] [--pair CODE] [--json] [--webtransport on|off] [--datagrams on|off] [--direct on|off]\n  rein-remote selftest [--window Q | --display :N | --kms [CONNECTOR] | --test-pattern [WxH]] [--type TEXT] [--encode OUT.h264 [--frames N]]\n  rein-remote --version",
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(2);
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    std::process::exit(dispatch(std::env::args().skip(1).collect()));
+}
+
+/// A command and its arguments (also what a Windows service runs): the exit code.
+fn dispatch(mut args: Vec<String>) -> i32 {
+    // A service's flags from a file (`--config PATH`, TOML: each key a flag's name); the command line wins.
+    if matches!(args.first().map(String::as_str), Some("serve" | "relay")) {
+        match config::expand(&args[1..]) {
+            Ok(flags) => args.splice(1.., flags).for_each(drop),
+            Err(e) => {
+                eprintln!("rein-remote: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
     match args.first().map(String::as_str) {
         Some("--version") | Some("-V") => println!("rein-remote {}", env!("CARGO_PKG_VERSION")),
         Some("windows") => match list_windows(args.get(1).map(String::as_str) == Some("--json")) {
@@ -125,15 +145,20 @@ fn main() {
         }
         Some("relay") => {
             let (mut listen, mut secret) = ("0.0.0.0:7990".to_string(), std::env::var("REIN_REMOTE_RELAY_SECRET").ok());
+            // Metrics on this machine only, unless asked: a port number alone is 127.0.0.1's.
+            let mut metrics = Some("127.0.0.1:7991".to_string());
             let mut it = args[1..].iter();
             while let Some(a) = it.next() {
                 match (a.as_str(), it.next()) {
                     ("--listen", Some(v)) => listen = v.clone(),
                     ("--secret", Some(v)) => secret = Some(v.clone()),
+                    ("--metrics-listen", Some(v)) if v == "off" => metrics = None,
+                    ("--metrics-listen", Some(v)) if v.parse::<u16>().is_ok() => metrics = Some(format!("127.0.0.1:{v}")),
+                    ("--metrics-listen", Some(v)) => metrics = Some(v.clone()),
                     _ => usage(),
                 }
             }
-            if let Err(e) = relay::run(&listen, secret) {
+            if let Err(e) = relay::run(&listen, secret, metrics.as_deref()) {
                 eprintln!("rein-remote: {e}");
                 std::process::exit(1);
             }
@@ -154,11 +179,25 @@ fn main() {
         Some("serve") => {
             if let Err(e) = serve_cmd(&args[1..]) {
                 eprintln!("rein-remote: {e}");
-                std::process::exit(1);
+                return 1;
+            }
+        }
+        Some(c @ ("install-service" | "uninstall-service")) => {
+            if let Err(e) = service::run(&args[1..], c == "install-service") {
+                eprintln!("rein-remote: {e}");
+                return 1;
+            }
+        }
+        #[cfg(windows)]
+        Some("service-run") => {
+            if let Err(e) = service::windows::run(&args[1..]) {
+                eprintln!("rein-remote: {e}");
+                return 1;
             }
         }
         _ => usage(),
     }
+    0
 }
 
 fn serve_cmd(args: &[String]) -> Result<(), String> {
@@ -192,7 +231,7 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
     let (mut oidc_scopes, mut oidc_user_claim, mut oidc_groups_claim) = ("openid email profile".to_string(), "email".to_string(), "groups".to_string());
     let (mut saml_metadata, mut saml_entity, mut saml_user_attr, mut saml_groups_attr) = (None, None, None, "groups".to_string());
     let (mut policy, mut audit) = (None, None);
-    let (mut relay, mut room, mut relay_secret) = (None, None, std::env::var("REIN_REMOTE_RELAY_SECRET").ok());
+    let (mut relay, mut room, mut relay_secret) = (Vec::new(), None, std::env::var("REIN_REMOTE_RELAY_SECRET").ok());
     let (mut tls_cert, mut tls_key) = (None, None);
     let mut display: Option<String> = None;
     let mut window: Option<String> = None;
@@ -255,7 +294,8 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
             "--policy" => policy = Some(val()?),
             "--audit" => audit = Some(val()?),
             "--record" => opts.record = Some(std::path::PathBuf::from(val()?)),
-            "--relay" => relay = Some(val()?),
+            // Again (or A,B): a fleet.
+            "--relay" => relay.push(val()?),
             "--tls-cert" => tls_cert = Some(std::path::PathBuf::from(val()?)),
             "--tls-key" => tls_key = Some(std::path::PathBuf::from(val()?)),
             "--tailscale-cert" => opts.tailscale_cert = !matches!(val()?.as_str(), "off" | "false" | "no"),
@@ -264,8 +304,20 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
             "--room" => room = Some(val()?),
             "--relay-secret" => relay_secret = Some(val()?),
             "--webtransport" => opts.webtransport = !matches!(val()?.as_str(), "off" | "false" | "no"),
-            "--test-pattern" => pattern = Some(size_arg(&mut it)?.unwrap_or((1280, 720))),
-            "--kms" => kms = Some(optional_arg(&mut it)),
+            // `on`/`off` too (what `true`/`false` are in a config file).
+            "--test-pattern" => {
+                pattern = match on_off(&mut it) {
+                    Some(false) => None,
+                    _ => Some(size_arg(&mut it)?.unwrap_or((1280, 720))),
+                }
+            }
+            "--kms" => {
+                kms = match on_off(&mut it) {
+                    Some(false) => None,
+                    Some(true) => Some(None),
+                    None => Some(optional_arg(&mut it)),
+                }
+            }
             "--audio" => {
                 sound = Some(match val()?.as_str() {
                     "on" | "true" | "yes" => true,
@@ -310,7 +362,8 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
         const ALPHABET: &[u8] = b"abcdefghijkmnpqrstuvwxyz23456789";
         opts.token = Some(b.iter().map(|x| ALPHABET[*x as usize % 32] as char).collect());
     }
-    if let Some(r) = relay {
+    let relay = fleet::relays(&relay);
+    if !relay.is_empty() {
         // A room code nobody can guess: 24 characters from the system's randomness.
         let room = room.unwrap_or_else(|| {
             let mut b = [0u8; 24];
@@ -321,7 +374,7 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
         if room.len() < 16 {
             return Err("--room needs 16 characters or more (or leave it out for a random one)".into());
         }
-        opts.relay = Some((r, room, relay_secret));
+        opts.relay = Some((relay, room, relay_secret));
     }
     // What it shows, as a policy's `sources` names it.
     opts.source_label = match (&pattern, &window) {
@@ -439,6 +492,17 @@ fn size_arg(it: &mut std::slice::Iter<String>) -> Result<Option<(usize, usize)>,
     let size = (w.parse().map_err(|_| "WxH")?, h.parse().map_err(|_| "WxH")?);
     it.next();
     Ok(Some(size))
+}
+
+/// A flag that takes an optional value given `on` or `off`: which (and it's taken), or None.
+fn on_off(it: &mut std::slice::Iter<String>) -> Option<bool> {
+    let v = match it.clone().next().map(String::as_str) {
+        Some("on" | "true" | "yes") => true,
+        Some("off" | "false" | "no") => false,
+        _ => return None,
+    };
+    it.next();
+    Some(v)
 }
 
 /// A flag's optional value (the next argument, unless it's another flag).

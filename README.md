@@ -24,8 +24,9 @@ Early: the design is done and being built one verified piece at a time
 |---|---|
 | Protocol (`rr-proto`), versioned per message | done (phase 0: CI on Linux, macOS, Windows, WebAssembly) |
 | Server: Linux (X11, a real or virtual display, or one window) | working: the screen or any window (XComposite: shows as it is when covered; a press raises it), shared-memory capture, only what changed, the pointer apart, mouse, wheel and keyboard (phases 1, 3) |
-| Server: macOS (any app's window, ScreenCaptureKit) | working: capture only when it changes, mouse (raises the window, like Remote Desktop), keys and text even while it's behind others (phase 3) |
-| Server: Windows | todo (phase 3) |
+| Server: macOS (a window, an app or a display, ScreenCaptureKit) | working: capture only when it changes, VideoToolbox H.264/HEVC with no copy (a 3274×2048 display while it changes: 3.3% of one core), mouse (raises the window, like Remote Desktop), keys and text even while it's behind others; input on a whole display or app needs Accessibility, not yet tried ([manual test](docs/verification/macos-display-app-input.md)) (phase 3) |
+| Server: Windows (Graphics Capture, SendInput) | working on CI runners: a window or the whole display, typing into Notepad changes it, Media Foundation H.264 (Microsoft's encoder); GPU encoders (NVENC/AMF/QSV) with D3D11 zero copy written but need a GPU ([manual test](docs/verification/windows-hardware-encoders.md)) (phase 3) |
+| Hardware encoding, high refresh | working: hardware first with the software fallback (VideoToolbox on macOS; Media Foundation on Windows; VA-API on Linux with `serve --kms` DMA-BUF zero copy, [manual test](docs/verification/linux-vaapi-kms.md)); paced to the viewer's measured refresh (59.9 Hz → 60 fps), up to 240; a still screen sends nothing; 200 Hz on a real 200 Hz display: [manual test](docs/verification/high-refresh.md) (phase 3) |
 | Client: web (WebCodecs, embeddable `<rein-remote>`) | working: decode (hardware when there is), mouse, wheel, keyboard, touch gestures and the device's on-screen keyboard (phase 1) |
 | Packages (npm): `@rein-harness/remote`, `@rein-harness/remote-server` | working: the web client, and the server per platform (`npx rein-remote`), checked against Rein's contract in CI on all three (phase 2) |
 | Rein previews | working: a Rein web UI chat shows a native Linux app through Rein Remote, from a phone, through a reverse proxy (phase 2) |
@@ -93,6 +94,42 @@ The relay can't read what it passes: the machine makes a key and puts it in the 
 `#` (browsers never send that part of an address to a server), and every message is sealed end to
 end with AES-256-GCM (keys per session and direction, from HKDF). A wrong key or an altered message
 is refused. The viewer's page needs HTTPS (or localhost) for the browser's crypto.
+
+Several relays (a fleet): give `--relay` once per relay (or `--relay A,B`). The machine opens its room
+on every one and keeps it open; the link names the one that answered fastest, and the others after
+`#` (`&alt=`), where a native viewer tries them in turn. Or put them behind one name (a load balancer
+checking each relay's `/healthz`): any of them has the room. See
+[docs/verification/relay-fleet.md](docs/verification/relay-fleet.md).
+
+### Health and metrics
+
+- `GET /healthz`: alive, as JSON (`status`, `version`, `uptime_s`, `sessions`, …). On `serve` it needs
+  the token like `/stats`; on a relay it's on its port for anyone (no room or key in it).
+- `GET /metrics`: Prometheus's text format (viewers, sessions, frames and bytes sent, each relay's
+  health, round trip and registrations; on a relay: hosts waiting, sessions, bytes relayed,
+  rendezvous answered, requests refused). On `serve`, with the token, best as a bearer
+  (`Authorization: Bearer TOKEN`, Prometheus's `authorization: {credentials_file: …}`) so it's not in a
+  URL. On a relay, on its own address: `--metrics-listen` (default `127.0.0.1:7991`, this machine only;
+  a port alone is 127.0.0.1's; `off`).
+
+### Config by file, and running as a service
+
+```sh
+rein-remote serve --config serve.toml            # each key a flag: listen = "0.0.0.0:7979", fps = 60, relay = [...]
+rein-remote install-service --config serve.toml  # started with your session (systemd --user, a LaunchAgent, a task at logon)
+rein-remote install-service relay --config relay.toml --system   # a relay with the machine (systemd, a LaunchDaemon, a Windows service)
+rein-remote install-service … --print            # what it would install, nothing changed
+rein-remote uninstall-service [relay] [--system]
+```
+
+Secrets stay out of the service's command line: `token = { file = "/etc/rein-remote/token" }`. The
+command line wins over the file. See [docs/verification/service-install.md](docs/verification/service-install.md).
+
+### Signed binaries
+
+Releases are signed when the repository has the certificates (macOS: Developer ID and notarized;
+Windows: Authenticode, timestamped), and `SHA256SUMS` is signed with cosign (Sigstore,
+keyless). To check a download: [docs/verification/signing.md](docs/verification/signing.md).
 
 ### Optional: sign-in with your identity provider, policies, an audit log, recording
 

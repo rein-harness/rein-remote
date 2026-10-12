@@ -228,6 +228,11 @@ impl Gate {
         Some(code)
     }
 
+    /// Whether `given` (an `Authorization: Bearer` header's) is the token, compared in full.
+    pub fn token_is(&self, given: &str) -> bool {
+        self.token.as_deref().is_some_and(|t| same(t, given))
+    }
+
     /// Whether a request's query (`token=…` or `ticket=…`) lets it in.
     #[cfg(test)]
     pub fn allows(&self, query: &str) -> bool {

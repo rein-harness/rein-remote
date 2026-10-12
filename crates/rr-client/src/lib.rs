@@ -10,7 +10,8 @@
 //!   `/info` (a self-signed one), or against the system's roots (a real one).
 //! - **WebSocket** (TCP), when UDP doesn't get through.
 //! - **A relay** (`http(s)://relay/?room=…#k=…`, the link `serve --relay` prints), sealed end to end
-//!   with the key after `#` (the relay can't read or change what it passes). From there, a **direct
+//!   with the key after `#` (the relay can't read or change what it passes); a fleet's other relays
+//!   after it (`&alt=`), tried in turn when the first isn't there. From there, a **direct
 //!   path** through NAT when there is one ([`direct`]): the session moves to it, and stays on the relay
 //!   when there isn't.
 //!
@@ -28,8 +29,8 @@ pub mod pairing;
 pub use link::redact;
 use link::{Cert, Ev, In, Link};
 use rr_proto::{
-    Audio, CodecCap, Config, Cursor, DirectAnswer, DirectOffer, Feedback, Hello, Input, Message, FEATURE_DIRECT, FEATURE_VIDEO_DATAGRAMS, INPUT_KEYBOARD,
-    INPUT_POINTER, INPUT_TOUCH, VERSION_MAX, VERSION_MIN,
+    Audio, CodecCap, Config, Cursor, DirectAnswer, DirectOffer, Feedback, Hello, Input, Message, FEATURE_AUDIO_DATAGRAMS, FEATURE_DIRECT,
+    FEATURE_VIDEO_DATAGRAMS, INPUT_KEYBOARD, INPUT_POINTER, INPUT_TOUCH, VERSION_MAX, VERSION_MIN,
 };
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -83,6 +84,9 @@ pub struct Options {
     pub keyframe_on_loss: bool,
     /// The input kinds this client sends (`INPUT_*`): a client with gamepads adds `INPUT_GAMEPAD`.
     pub input: u8,
+    /// This client plays Opus (48 kHz, stereo): the server sends `Audio` (as datagrams of their own,
+    /// with `datagrams`, over WebTransport).
+    pub audio: bool,
 }
 
 impl Default for Options {
@@ -101,6 +105,7 @@ impl Default for Options {
             auto_feedback: true,
             keyframe_on_loss: true,
             input: INPUT_POINTER | INPUT_KEYBOARD | INPUT_TOUCH,
+            audio: false,
         }
     }
 }
@@ -287,12 +292,35 @@ pub fn connect(target: &str, opts: Options) -> Result<Session, String> {
         let key: [u8; 32] = e2e::b64url_decode(k)
             .and_then(|k| k.try_into().ok())
             .ok_or("the link's key (#k=…) isn't a key")?;
-        let ws = format!("{ws_scheme}://{}/stream?room={room}", url.origin.authority());
-        relayed = Some(Relayed {
-            reflector: direct::reflector(&target),
-            room: room.to_string(),
-        });
-        link::websocket(&ws, tx.clone(), Transport::Relay)?.sealed(key)
+        // The relay the link names, then the others of its fleet (after #, `alt=`), in order: the
+        // machine waits in its room on each.
+        let mut relays = vec![format!("{ws_scheme}://{}{}", url.origin.authority(), url.path.trim_end_matches('/'))];
+        relays.extend(
+            http::param(&url.fragment, "alt")
+                .into_iter()
+                .flat_map(|a| a.split(','))
+                .filter(|a| !a.is_empty())
+                .map(|a| a.trim_end_matches('/').to_string()),
+        );
+        let mut tried = Vec::new();
+        let mut link = None;
+        for relay in &relays {
+            match link::websocket(&format!("{relay}/stream?room={room}"), tx.clone(), Transport::Relay) {
+                Ok(l) => {
+                    relayed = Some(Relayed {
+                        reflector: direct::reflector(relay),
+                        room: room.to_string(),
+                    });
+                    if !tried.is_empty() {
+                        notes.push(format!("through {relay} ({})", tried.join("; ")));
+                    }
+                    link = Some(l);
+                    break;
+                }
+                Err(e) => tried.push(format!("{relay}: {e}")),
+            }
+        }
+        link.ok_or_else(|| tried.join("; "))?.sealed(key)
     } else if target.starts_with("ws") {
         link::websocket(&target, tx.clone(), Transport::WebSocket)?
     } else {
@@ -389,10 +417,12 @@ fn hello(opts: &Options, direct: bool) -> Vec<u8> {
         max_width: 3840,
         max_height: 2160,
         max_fps: 240,
-        audio: false,
+        audio: opts.audio,
         input: opts.input,
         refresh_mhz: opts.refresh_mhz,
-        features: if opts.datagrams { FEATURE_VIDEO_DATAGRAMS } else { 0 } | if direct { FEATURE_DIRECT } else { 0 },
+        features: if opts.datagrams { FEATURE_VIDEO_DATAGRAMS } else { 0 }
+            | if direct { FEATURE_DIRECT } else { 0 }
+            | if opts.datagrams && opts.audio { FEATURE_AUDIO_DATAGRAMS } else { 0 },
     })
     .encode()
 }
