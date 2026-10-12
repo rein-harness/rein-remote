@@ -1,0 +1,16 @@
+[package]
+name = "rr-jni"
+description = "Rein Remote's native client core (rr-ffi) for the JVM: the JNI functions the Android app (Kotlin) calls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+# librr_jni.so in the Android app (built with cargo-ndk), and a Rust library for tests.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rr-ffi = {path = "../rr-ffi"}
+jni = { version = "0.21.1", default-features = false }

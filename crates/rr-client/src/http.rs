@@ -100,13 +100,14 @@ trait Stream: Read + Write {}
 impl<T: Read + Write> Stream for T {}
 
 /// The roots a real certificate is checked against: the system's. On iOS, where an app can't read
-/// the system's (no file holds them), Mozilla's (webpki-roots), which the system's match.
+/// the system's (no file holds them), and on Android, where they aren't where rustls-native-certs
+/// looks, Mozilla's (webpki-roots), which the system's match.
 pub fn root_store() -> rustls::RootCertStore {
     let mut roots = rustls::RootCertStore::empty();
     for c in rustls_native_certs::load_native_certs().certs {
         let _ = roots.add(c);
     }
-    #[cfg(target_os = "ios")]
+    #[cfg(any(target_os = "ios", target_os = "android"))]
     if roots.is_empty() {
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     }
