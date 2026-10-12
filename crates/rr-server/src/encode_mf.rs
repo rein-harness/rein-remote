@@ -715,7 +715,9 @@ impl MediaFoundation {
                     self.mft.SetOutputType(self.output_id, &t, 0).map_err(e)?;
                 }
                 self.read_parameter_sets();
-                return Ok(true);
+                // The frame that was ready is still there, in the new format: an asynchronous encoder
+                // won't say so again, so it's taken now.
+                return self.output();
             }
             Err(err) => return Err(e(err)),
         }
