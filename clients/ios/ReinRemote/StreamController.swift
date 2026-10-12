@@ -79,6 +79,7 @@ final class StreamController: NSObject, ObservableObject {
     private var beeps: [UInt64] = []
     private var timer: Timer?
     private var serverInput: UInt8 = 0
+    private var lastPad: GamepadState?
     /// Read the test pattern's barcode from every frame.
     var measure = false
 
@@ -130,8 +131,10 @@ final class StreamController: NSObject, ObservableObject {
             if opts.gamepad {
                 gamepads = Gamepads()
                 gamepads?.onState = { [weak self] g in
-                    guard let self, self.serverInput & 8 != 0 else { return }
-                    self.session?.gamepad(g)
+                    guard let self else { return }
+                    self.lastPad = g
+                    // Only to a server that takes gamepads (it says so in its Hello).
+                    if self.serverInput & 8 != 0 { self.session?.gamepad(g) }
                 }
             }
             let t = Timer(timeInterval: 0.5, target: self, selector: #selector(tick), userInfo: nil, repeats: true)
@@ -283,6 +286,11 @@ final class StreamController: NSObject, ObservableObject {
             lines.append("glass to glass \(String(format: "%.0f", g)) ms (p95 \(String(format: "%.0f", g95)))")
         }
         if audio != nil { lines.append("sound: \(mm.audioPlayed) played, \(mm.audioDropped) dropped") }
+        if let n = gamepads?.connected, n > 0 {
+            let p = lastPad ?? GamepadState()
+            let sent = serverInput & 8 != 0 ? "sent" : "not sent: the server takes no gamepads"
+            lines.append("gamepads: \(n) · buttons 0x\(String(p.buttons, radix: 16)) · left \(p.lx),\(p.ly) · \(sent)")
+        }
         overlay = lines.joined(separator: "\n")
     }
 }

@@ -1,5 +1,5 @@
 # The iOS and iPadOS app. Generate the Xcode project with `xcodegen` (it isn't checked in), after
-# building the Rust core: ./build-core.sh (see README.md).
+# building the Rust core: ./build-core.sh (see docs/verification/ios-client.md).
 name: ReinRemote
 options:
   bundleIdPrefix: dev.reinharness
