@@ -34,9 +34,9 @@ has been verified.
   segment passed as a file descriptor; GetImage where there's none), and XDamage skips a still
   screen: at 1920×1080 scrolling full-screen, 1.7 ms to read the screen, 16 ms to encode,
   26 ms / 36 ms capture to decoded; a still terminal sent 8 frames in 8 seconds. A display with
-  only its abstract socket (the file missing) connects too. Still to do in this phase: multi-slice
-  threaded encoding (needs our own binding to openh264's C API; the crate's wrapper encodes one
-  slice).
+  only its abstract socket (the file missing) connects too. Multi-slice threaded encoding is in
+  (our own binding to openh264's C API): a frame in 4 slices on 4 cores, 8.6 ms at 1080p where one
+  slice took 12.9 ms (measured with phase 4's controller work, below).
 
 ## Phase 2 — Rein previews through Rein Remote
 
