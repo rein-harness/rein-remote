@@ -55,7 +55,7 @@ if [ -n "${MACOS_CERTIFICATE:-}" ] && [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_TE
   xcrun notarytool submit "$tmp/notarize.zip" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
     --password "$APPLE_APP_PASSWORD" --wait --timeout 30m --output-format json > "$tmp/notary.json"
   cat "$tmp/notary.json"; echo
-  id=$(plutil -extract id raw "$tmp/notary.json" 2>/dev/null || sed -n 's/.*"id":"\([^"]*\)".*/\1/p' "$tmp/notary.json")
+  id=$(plutil -extract id raw -o - "$tmp/notary.json" 2>/dev/null || sed -n 's/.*"id":"\([^"]*\)".*/\1/p' "$tmp/notary.json")
   if ! grep -q '"status":"Accepted"' "$tmp/notary.json"; then
     [ -n "$id" ] && xcrun notarytool log "$id" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" || true
     echo "notarization was not accepted" >&2

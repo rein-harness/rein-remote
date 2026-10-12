@@ -41,6 +41,10 @@ rein-remote uninstall-service [serve|relay] [--system] [--name NAME] [--print]
 | macOS | LaunchAgent, `~/Library/LaunchAgents/com.rein-harness.NAME.plist`, in the user's GUI session (`LimitLoadToSessionType Aqua`: where the screen can be captured), log in `~/Library/Logs/NAME.log` | LaunchDaemon, `/Library/LaunchDaemons/…`, log in `/Library/Logs/NAME.log` |
 | Windows | a scheduled task at logon (`schtasks /SC ONLOGON`): the user's desktop | a Windows service (`sc.exe create`, automatic start, restarted on failure), running `rein-remote service-run NAME …` (the service manager's protocol); log in `%ProgramData%\rein-remote\NAME.log` |
 
+Uninstalling stops the service, disables it, removes its file, then tells the service manager
+(systemd: `stop`, `disable`, the file, `daemon-reload`; launchd: `bootout`, the file; Windows:
+`sc.exe stop` and `delete`, or `schtasks /End` and `/Delete`).
+
 `NAME` is `rein-remote` for serve and `rein-remote-relay` for a relay unless `--name` says otherwise.
 The config file must read (it's checked first); the unit runs the binary where it is now (install it
 somewhere it stays, not in a build folder).

@@ -117,3 +117,9 @@ sha256sum -c SHA256SUMS
 
 Expect `Verified OK`, then `OK` for every archive. Changing a byte of SHA256SUMS must make the first
 command fail.
+
+The keyless branch of `tools/sign/cosign.sh` has not run yet: CI exercises the key branch only (an
+OIDC token on every pull request would put a CI signature in the public log each time), and the
+release step is `continue-on-error`, so a broken keyless step does **not** fail a release. On the first
+tag, check that the release has `SHA256SUMS.sigstore.json` among its assets and that the command above
+verifies it; if it's missing, the "Sign SHA256SUMS (cosign, keyless)" step's log says why.
