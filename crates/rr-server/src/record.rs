@@ -565,7 +565,7 @@ mod tests {
                     .arg(&path)
                     // Frames are timed by when they were captured (a still screen sends none): passed
                     // through as they are, not converted to a constant rate.
-                    .args(["-fps_mode", "passthrough", "-f", "null", "-"])
+                    .args(["-fps_mode", "passthrough", "-enc_time_base", "-1", "-f", "null", "-"])
                     .output()
                     .unwrap();
                 assert!(decode.status.success(), "{}", String::from_utf8_lossy(&decode.stderr));

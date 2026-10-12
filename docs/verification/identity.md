@@ -121,7 +121,7 @@ In a private window for each user (so their sign-ins don't mix):
    `ticket=`: none.
 6. The recording (`recordings/…-usera@…-….mp4`) plays in VLC or QuickTime (H.264), or
    `ffprobe -count_frames recordings/*.mp4` reads every frame and
-   `ffmpeg -v error -i FILE -fps_mode passthrough -f null -` says nothing (frames are timed by when
+   `ffmpeg -v error -i FILE -fps_mode passthrough -enc_time_base -1 -f null -` says nothing (frames are timed by when
    they were captured, and a still screen sends none: the frame rate varies).
 7. Sign out: `$PUBLIC/sso/logout`; opening `$PUBLIC/` goes back to the provider.
 

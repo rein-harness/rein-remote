@@ -66,9 +66,9 @@ done
 check "the WebSocket without sign-in is refused (audited)" "jq -e 'select(.event==\"session_refused\")' $OUT/audit-oidc.jsonl >/dev/null"
 
 echo "== recordings"
-docker exec rr-idp-host sh -c 'for f in /out/rec/*.mp4; do printf "%s " "$(basename "$f")"; ffprobe -v error -count_frames -show_entries stream=codec_name,width,height,nb_read_frames -show_entries format=duration -of compact=p=0:nk=1 "$f" | tr "\n" " "; ffmpeg -v error -xerror -i "$f" -f null - && echo decoded-ok || echo decode-FAILED; done' | tee "$OUT/recordings.txt"
+docker exec rr-idp-host sh -c 'for f in /out/rec/*.mp4; do printf "%s " "$(basename "$f")"; ffprobe -v error -count_frames -show_entries stream=codec_name,width,height,nb_read_frames -show_entries format=duration -of compact=p=0:nk=1 "$f" | tr "\n" " "; err=$(ffmpeg -v error -xerror -i "$f" -fps_mode passthrough -enc_time_base -1 -f null - 2>&1) && [ -z "$err" ] && echo decoded-ok || echo "decode-FAILED $err"; done' | tee "$OUT/recordings.txt"
 check "recordings: only alice's, one per protocol" "[ \$(grep -c . '$OUT/recordings.txt') = 2 ] && ! grep -q bob '$OUT/recordings.txt'"
-check "recordings decode with ffmpeg, every frame" "[ \$(grep -c decoded-ok '$OUT/recordings.txt') = 2 ]"
+check "recordings decode with ffmpeg, not a word from it" "[ \$(grep -c decoded-ok '$OUT/recordings.txt') = 2 ]"
 
 echo "== memory and CPU (peak per container)"
 sort -t= -k3 "$OUT/docker-stats.txt" | awk '{print $1}' | sort -u | while read n; do grep "^$n " "$OUT/docker-stats.txt" | tail -1; done
