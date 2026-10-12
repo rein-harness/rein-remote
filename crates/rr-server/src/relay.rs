@@ -8,7 +8,7 @@
 //! for a room it has open. That's how a host and a native viewer learn their addresses beyond their
 //! NATs and go straight to each other (rr-client's `direct`); the relay never sees what they say.
 
-use crate::serve::{CLIENT_JS, INDEX};
+use crate::serve::web_file;
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -140,8 +140,10 @@ fn handle(mut stream: TcpStream, rooms: Rooms, busy: Busy, secret: Option<String
     // The web client, as the machine itself serves it (it reads the room from the page's address).
     let _ = stream.read(&mut head);
     let (status, kind, body) = match path.as_str() {
-        "/" | "/index.html" => ("200 OK", "text/html; charset=utf-8", INDEX.to_string()),
-        "/rein-remote.js" => ("200 OK", "text/javascript; charset=utf-8", CLIENT_JS.to_string()),
+        p if web_file(p).is_some() => {
+            let (kind, body) = web_file(p).unwrap();
+            ("200 OK", kind, body.to_string())
+        }
         // No WebTransport through the relay (yet): the page uses its WebSocket.
         "/info" => ("200 OK", "application/json", r#"{"webtransport":null}"#.to_string()),
         _ => ("404 Not Found", "text/plain", "not found".to_string()),

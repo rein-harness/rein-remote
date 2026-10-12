@@ -369,3 +369,15 @@ fn an_older_peers_messages_get_defaults_for_fields_added_since() {
         assert_eq!(Header::read(&f).unwrap().version, version::of(f[0]));
     }
 }
+
+#[test]
+fn feature_bits_are_distinct() {
+    // Two features on the same bit would each be taken for the other.
+    let bits = [FEATURE_VIDEO_DATAGRAMS, FEATURE_DIRECT, FEATURE_AUDIO_DATAGRAMS];
+    for (i, a) in bits.iter().enumerate() {
+        assert_eq!(a.count_ones(), 1);
+        for b in &bits[i + 1..] {
+            assert_eq!(a & b, 0);
+        }
+    }
+}

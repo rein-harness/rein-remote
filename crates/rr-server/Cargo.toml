@@ -13,6 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 openh264-sys2 = "0.6.6"
+# libopus (BSD), built from its source by CMake and linked in statically.
+opusic-sys = "0.7.5"
 rr-proto = {path = "../rr-proto"}
 rr-client = {path = "../rr-client"}
 aes-gcm = "0.10.3"
@@ -25,7 +27,7 @@ hkdf = "0.12.4"
 sha2 = "0.10.9"
 socket2 = { version = "0.6.1", features = ["all"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
-wtransport = "0.7.2"
+wtransport = { version = "0.7.2", features = ["quinn"] }
 zune-jpeg = "0.4"
 tungstenite = { version = "0.29.0", features = ["rustls-tls-native-roots"] }
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
@@ -64,10 +66,13 @@ windows = { version = "0.62.2", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
     "Win32_System_LibraryLoader",
     "Win32_System_Ole",
+    "Win32_System_Performance",
     "Win32_System_Variant",
     "Win32_System_WinRT",
     "Win32_System_WinRT_Direct3D11",

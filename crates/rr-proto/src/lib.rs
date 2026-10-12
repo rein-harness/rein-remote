@@ -78,6 +78,8 @@ pub struct Hello {
     pub max_width: u16,
     pub max_height: u16,
     pub max_fps: u16,
+    /// A server: it can stream the sound the machine plays. A client: it plays Opus (48 kHz,
+    /// stereo); a server sends `Audio` only to a client that says so.
     pub audio: bool,
     /// Bit set of `INPUT_*`: the input kinds a server accepts, or a client can send.
     pub input: u8,
@@ -95,6 +97,10 @@ pub const FEATURE_VIDEO_DATAGRAMS: u32 = 1;
 /// open QUIC itself (native clients; a browser can't, it has no UDP of its own). The host may then
 /// send a [`DirectOffer`].
 pub const FEATURE_DIRECT: u32 = 2;
+/// A client that takes `Audio` as datagrams of their own (one whole frame each, told apart from
+/// video's by the first byte: the frame's kind), when the transport has datagrams: a lost packet is a
+/// gap, never a wait. Without it, audio goes in order with the control messages.
+pub const FEATURE_AUDIO_DATAGRAMS: u32 = 4;
 
 pub const INPUT_POINTER: u8 = 1;
 pub const INPUT_KEYBOARD: u8 = 2;
@@ -122,9 +128,11 @@ pub struct Video {
     pub data: Vec<u8>,
 }
 
-/// One Opus packet.
+/// One Opus packet (48 kHz, stereo; 10 or 20 ms).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Audio {
+    /// Capture time of its first sample, microseconds on the server's clock: the same clock as
+    /// `Video`'s, so a client plays sound and picture at the same delay.
     pub timestamp_us: u64,
     pub data: Vec<u8>,
 }
