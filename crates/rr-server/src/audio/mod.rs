@@ -52,12 +52,17 @@ pub enum Sound {
     /// one app's (`--window`, `--app`).
     #[cfg(target_os = "macos")]
     Mac(mac::Filter),
+    /// A capture that can't start (tests: no device, no permission).
+    #[cfg(test)]
+    Broken,
 }
 
 impl Sound {
     fn open(&self, sink: Sink) -> Result<Box<dyn Capture>, String> {
         match self {
             Sound::Off => Err("audio is off".into()),
+            #[cfg(test)]
+            Sound::Broken => Err("no audio output device (a test)".into()),
             Sound::Tone => Ok(Box::new(tone::Tone::start(sink))),
             #[cfg(target_os = "macos")]
             Sound::Mac(f) => Ok(Box::new(mac::MacAudio::start(f, sink)?)),
@@ -222,6 +227,8 @@ fn describe(s: &Sound) -> &'static str {
         Sound::Off => "off",
         Sound::System => "what this machine plays",
         Sound::Tone => "a test tone, a beep when the pattern flashes",
+        #[cfg(test)]
+        Sound::Broken => "broken",
         #[cfg(target_os = "macos")]
         Sound::Mac(f) if f.app => "what the app shown plays",
         #[cfg(target_os = "macos")]
@@ -274,6 +281,8 @@ impl Packetizer {
 /// Any rate and channel count into 48 kHz stereo (linear interpolation: the mix formats it meets
 /// are 44.1 or 48 kHz, where that's inaudible next to Opus). Mono is copied to both sides; more than
 /// two channels keep the front left and right.
+// (PulseAudio converts to 48 kHz stereo itself: on Linux only the tests use it.)
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub struct Resampler {
     from: u32,
     /// Where the next output sample falls, in input samples from the start of the next block (it can
@@ -282,6 +291,7 @@ pub struct Resampler {
     last: [f32; 2],
 }
 
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 impl Resampler {
     pub fn new(from: u32) -> Self {
         Self {

@@ -98,7 +98,8 @@ unsafe fn run(sink: Sink, stop: &AtomicBool, ok: &mpsc::Sender<Result<(), String
     CoTaskMemFree(Some(fmt as *const _));
     init.map_err(e("loopback on the output"))?;
     let Some(kind) = kind else {
-        return Err(format!("a mix format it doesn't read ({} bits, tag {:#x})", wf.wBitsPerSample, wf.wFormatTag));
+        let (bits, tag) = (wf.wBitsPerSample, wf.wFormatTag);
+        return Err(format!("a mix format it doesn't read ({bits} bits, tag {tag:#x})"));
     };
     let capture: IAudioCaptureClient = client.GetService().map_err(e("the loopback"))?;
     client.Start().map_err(e("starting the loopback"))?;

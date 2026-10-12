@@ -86,7 +86,11 @@
       const t = s.stats;
       const g = [...t.glassMs].sort((a, b) => a - b);
       const glass = g.length ? ` · glass to glass ${g[g.length >> 1]} ms (p95 ${g[Math.floor(g.length * 0.95)]})` : '';
-      document.getElementById('stats').textContent = `${t.state} · ${t.transport || '…'} · ${t.decoder || '…'} · ${t.frames} frames (${t.fps} fps${t.refreshHz ? `, display ${Math.round(t.refreshHz)} Hz` : ""}) · ${(t.bytes / 1e6).toFixed(1)} MB · rtt ${t.rttMs.toFixed(0)} ms${glass}${t.error ? ' · ' + t.error : ''}`;
+      // Sound: whether it plays (a browser waits for a tap first), and how far behind capture.
+      const a = t.audio;
+      const av = [...(t.avSyncMs ?? [])].sort((x, y) => x - y);
+      const sound = !a || !a.packets ? '' : a.state !== 'running' ? ' · sound: tap to hear it' : ` · sound ${a.offsetMs ?? '…'} ms${a.holdMs ? ` (picture waits ${Math.round(a.holdMs)} ms for it)` : ''}${av.length ? ` · sound after picture ${av[av.length >> 1]} ms` : ''}`;
+      document.getElementById('stats').textContent = `${t.state} · ${t.transport || '…'} · ${t.decoder || '…'} · ${t.frames} frames (${t.fps} fps${t.refreshHz ? `, display ${Math.round(t.refreshHz)} Hz` : ""}) · ${(t.bytes / 1e6).toFixed(1)} MB · rtt ${t.rttMs.toFixed(0)} ms${glass}${sound}${t.error ? ' · ' + t.error : ''}`;
     }, 500);
   </script>
 </body>

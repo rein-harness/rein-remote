@@ -778,6 +778,124 @@ fn session(mut link: Box<dyn Link + Send>, source: Arc<Mutex<Box<dyn Source>>>, 
 mod tests {
     use super::*;
 
+    /// A connection in memory: what the session sends is kept, what the client says is queued.
+    struct MemLink {
+        sent: Arc<Mutex<Vec<Vec<u8>>>>,
+        inbox: std::sync::mpsc::Receiver<Vec<u8>>,
+    }
+
+    impl Link for MemLink {
+        fn send_bytes(&mut self, bytes: Vec<u8>, _video: bool) -> Result<(), String> {
+            self.sent.lock().unwrap().push(bytes);
+            Ok(())
+        }
+        fn flushed(&mut self) -> Result<bool, String> {
+            Ok(true)
+        }
+        fn recv(&mut self) -> Result<Recv, String> {
+            match self.inbox.try_recv() {
+                Ok(b) => Ok(Recv::Data(b)),
+                Err(std::sync::mpsc::TryRecvError::Empty) => Ok(Recv::Nothing),
+                Err(_) => Ok(Recv::Closed),
+            }
+        }
+        fn wait(&mut self, d: Duration) {
+            std::thread::sleep(d.min(Duration::from_millis(1)));
+        }
+    }
+
+    /// A session with the test pattern for `secs` from its first video frame (opening an encoder can
+    /// take a second or two), a client whose Hello is `hello`: the kinds of the frames it got, and the
+    /// server's Hello.
+    fn session_with(hello: Vec<u8>, sound: crate::audio::Sound, secs: f32) -> (Vec<u8>, Hello) {
+        let (tx, inbox) = std::sync::mpsc::channel();
+        let sent = Arc::new(Mutex::new(vec![]));
+        let link = MemLink { sent: sent.clone(), inbox };
+        let opts = Options {
+            listen: String::new(),
+            fps: 30,
+            codec: Some(Codec::H264),
+            bitrate_kbps: 2000,
+            token: None,
+            webtransport: false,
+            relay: None,
+            e2e_key: [0; 32],
+            tls: None,
+            tailscale_cert: false,
+            mdns: false,
+            pair: None,
+            audio: crate::audio::Audio::new(sound),
+        };
+        tx.send(hello).unwrap();
+        let source: Arc<Mutex<Box<dyn Source>>> = Arc::new(Mutex::new(Box::new(crate::capture::TestPattern::new(320, 240))));
+        let run = std::thread::spawn(move || session(Box::new(link), source, Arc::new(Mutex::new(Stats::default())), &opts));
+        let start = Instant::now();
+        while !sent.lock().unwrap().iter().any(|f| f[0] == rr_proto::kind::VIDEO) && start.elapsed() < Duration::from_secs(30) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_secs_f32(secs));
+        drop(tx);
+        run.join().unwrap().unwrap();
+        let frames = sent.lock().unwrap().clone();
+        let Ok((Some(Message::Hello(server)), _)) = Message::decode(&frames[0]) else {
+            panic!("no hello first")
+        };
+        (frames.iter().map(|f| f[0]).collect(), server)
+    }
+
+    fn client_hello(audio: bool) -> Hello {
+        Hello {
+            version_min: 0,
+            version_max: 0,
+            name: "test".into(),
+            codecs: vec![rr_proto::CodecCap {
+                codec: Codec::H264,
+                hardware: false,
+            }],
+            max_width: 1920,
+            max_height: 1080,
+            max_fps: 60,
+            audio,
+            input: INPUT_POINTER,
+            refresh_mhz: 60_000,
+            features: 0,
+        }
+    }
+
+    #[test]
+    fn sound_goes_only_to_clients_that_play_it_and_its_absence_stops_nothing() {
+        use crate::audio::Sound;
+        use rr_proto::kind;
+        let count = |kinds: &[u8], k: u8| kinds.iter().filter(|&&x| x == k).count();
+        // A client that plays sound: Opus packets, 100 a second, next to the video.
+        let (kinds, server) = session_with(Message::Hello(client_hello(true)).encode(), Sound::Tone, 1.5);
+        assert!(server.audio);
+        assert!(count(&kinds, kind::AUDIO) > 50, "{} audio packets: {kinds:?}", count(&kinds, kind::AUDIO));
+        assert!(count(&kinds, kind::VIDEO) > 10);
+        // One that says it doesn't: none.
+        let (kinds, _) = session_with(Message::Hello(client_hello(false)).encode(), Sound::Tone, 1.0);
+        assert_eq!(count(&kinds, kind::AUDIO), 0);
+        assert!(count(&kinds, kind::VIDEO) > 10);
+        // An older client (Hello version 1: no features, and audio: 0, as every web client before sound
+        // said): none either.
+        let mut old = Message::Hello(client_hello(false)).encode();
+        old.truncate(old.len() - 4);
+        old[1] = 1;
+        let len = (old.len() - rr_proto::HEADER_LEN) as u32;
+        old[3..7].copy_from_slice(&len.to_le_bytes());
+        let (kinds, _) = session_with(old, Sound::Tone, 1.0);
+        assert_eq!(count(&kinds, kind::AUDIO), 0);
+        assert!(count(&kinds, kind::VIDEO) > 10);
+        // No sound to be had (no device, no permission): the video streams on its own.
+        let (kinds, _) = session_with(Message::Hello(client_hello(true)).encode(), Sound::Broken, 1.0);
+        assert_eq!(count(&kinds, kind::AUDIO), 0);
+        assert!(count(&kinds, kind::VIDEO) > 10);
+        // And --audio off: the server says it has none.
+        let (kinds, server) = session_with(Message::Hello(client_hello(true)).encode(), Sound::Off, 0.5);
+        assert!(!server.audio);
+        assert_eq!(count(&kinds, kind::AUDIO), 0);
+    }
+
     #[test]
     fn scaled_pictures_map_input_back_to_the_source() {
         assert_eq!(scaled_size((1920, 1080), 0.5), (960, 540));

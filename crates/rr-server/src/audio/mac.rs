@@ -148,13 +148,25 @@ unsafe fn take(sb: *mut c_void, out: &mut Out) -> Result<(), String> {
     if asbd.flags & FLAG_FLOAT == 0 || asbd.bits != 32 {
         return Err(format!("a format it doesn't read ({} bits, flags {:#x})", asbd.bits, asbd.flags));
     }
-    let mut list: AudioBufferList = std::mem::zeroed();
+    // How big its buffer list is, then the list (in memory aligned for it, as big as it says).
+    let mut size = 0usize;
     let mut block: *const c_void = std::ptr::null();
+    CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+        sb,
+        &mut size,
+        std::ptr::null_mut(),
+        0,
+        std::ptr::null(),
+        std::ptr::null(),
+        0,
+        std::ptr::null_mut(),
+    );
+    let mut mem = vec![0u64; size.max(std::mem::size_of::<AudioBufferList>()).div_ceil(8)];
     let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
         sb,
         std::ptr::null_mut(),
-        &mut list,
-        std::mem::size_of::<AudioBufferList>(),
+        mem.as_mut_ptr().cast(),
+        size,
         std::ptr::null(),
         std::ptr::null(),
         0,
@@ -163,12 +175,16 @@ unsafe fn take(sb: *mut c_void, out: &mut Out) -> Result<(), String> {
     if status != 0 {
         return Err(format!("its buffers ({status})"));
     }
+    let list = &*(mem.as_ptr() as *const AudioBufferList);
+    let count = (list.count as usize).min(list.buffers.len());
     let channels = asbd.channels.max(1) as usize;
     let floats = |b: &AudioBuffer| std::slice::from_raw_parts(b.data as *const f32, b.size as usize / 4);
     // Interleaved, whichever way it came: planar (one buffer a channel, ScreenCaptureKit's way) or not.
-    let (pcm, n) = if asbd.flags & FLAG_NON_INTERLEAVED != 0 && list.count >= 1 {
+    let (pcm, n) = if count == 0 {
+        (vec![], 2)
+    } else if asbd.flags & FLAG_NON_INTERLEAVED != 0 {
         let left = floats(&list.buffers[0]);
-        let right = if list.count >= 2 { floats(&list.buffers[1]) } else { left };
+        let right = if count >= 2 { floats(&list.buffers[1]) } else { left };
         let n = left.len().min(right.len());
         ((0..n).flat_map(|i| [left[i], right[i]]).collect::<Vec<f32>>(), 2)
     } else {
@@ -182,6 +198,15 @@ unsafe fn take(sb: *mut c_void, out: &mut Out) -> Result<(), String> {
     let now = CMClockGetTime(CMClockGetHostTimeClock());
     let age_us = ((now.secs() - pts.secs()) * 1e6).max(0.0) as u64;
     let at_us = super::now_us().saturating_sub(age_us);
+    if std::env::var_os("RR_DEBUG_AUDIO").is_some() {
+        eprintln!(
+            "sck audio: {} frames at {} Hz, {} ch, age {} us",
+            pcm.len() / n,
+            asbd.rate,
+            asbd.channels,
+            age_us
+        );
+    }
     let rate = asbd.rate.round() as u32;
     let samples = if rate == RATE && n == 2 {
         pcm
