@@ -153,12 +153,15 @@ final class GamepadTests: XCTestCase {
         g.dpad.setValueForXAxis(1, yAxis: 0)
         g.leftThumbstick.setValueForXAxis(0, yAxis: 1)
         g.rightTrigger.setValue(1)
+        g.leftTrigger.setValue(0.3)
         let s = GamepadState(pad: 2, g)
         XCTAssertEqual(s.pad, 2)
         XCTAssertEqual(s.buttons, 1 << 0 | 1 << 7 | 1 << 15)
         // Up on the stick is negative, as on the web.
         XCTAssertEqual(s.ly, -32767)
         XCTAssertEqual(s.rt, 255)
+        // A trigger's bit only past half way (its value goes as well).
+        XCTAssertEqual(s.lt, 77)
     }
 }
 

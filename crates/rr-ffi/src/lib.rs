@@ -2,15 +2,15 @@
 //! languages: the iOS and iPadOS app (Swift) links it as a static library in an XCFramework. The
 //! header is `include/rr_ffi.h`; it says what each function does and which thread may call it.
 //!
-//! A session's handle holds the session (whose events one thread waits for), a [`rr_client::Sender`]
-//! (input from any thread) and its stats. Events are copied into a C struct that owns its bytes and
+//! A session's handle holds the session (whose events one thread waits for) and a
+//! [`rr_client::Control`] (input and stats from any thread). Events are copied into a C struct that owns its bytes and
 //! text until `rr_event_free`. Nothing here parses the wire: the protocol and the pairing stay in the
 //! core, shared with every other client.
 
-use rr_client::{Event, Options, Sender, Stats};
-use rr_proto::{Button, Codec, CodecCap, Input, Message};
+use rr_client::{Control, Event, Options};
+use rr_proto::{Button, Codec, CodecCap, Input, Message, INPUT_GAMEPAD, INPUT_KEYBOARD, INPUT_POINTER, INPUT_TOUCH};
 use std::ffi::{c_char, CStr, CString};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
 /// What the app wants (`RrOptions`).
@@ -118,8 +118,7 @@ pub struct RrStats {
 /// A session (`RrSession`).
 pub struct RrSession {
     events: Mutex<rr_client::Session>,
-    sender: Sender,
-    stats: Arc<Mutex<Stats>>,
+    sender: Control,
 }
 
 fn cstring(s: &str) -> CString {
@@ -175,8 +174,8 @@ pub fn options(o: &RrOptions, name: &str, pair: Option<&str>) -> Options {
         refresh_mhz: o.refresh_mhz,
         auto_feedback: false,
         keyframe_on_loss: true,
+        input: INPUT_POINTER | INPUT_KEYBOARD | INPUT_TOUCH | if o.gamepad { INPUT_GAMEPAD } else { 0 },
         audio: o.audio,
-        gamepad: o.gamepad,
     }
 }
 
@@ -329,8 +328,7 @@ pub unsafe extern "C" fn rr_connect(
     let o = if opts.is_null() { RrOptions::default() } else { *opts };
     match rr_client::connect(target, options(&o, string(name).unwrap_or(""), string(pair_code))) {
         Ok(s) => Box::into_raw(Box::new(RrSession {
-            sender: s.sender(),
-            stats: s.stats_handle(),
+            sender: s.control(),
             events: Mutex::new(s),
         })),
         Err(e) => {
@@ -488,7 +486,7 @@ pub unsafe extern "C" fn rr_keyframe(s: *const RrSession) {
 #[no_mangle]
 pub unsafe extern "C" fn rr_feedback(s: *const RrSession, frame: u32, received_us: u64, decoded_us: u64, lost: u16) {
     if let Some(s) = s.as_ref() {
-        let loss_permille = s.stats.lock().unwrap().loss_permille;
+        let loss_permille = s.sender.stats().loss_permille;
         s.sender.feedback(rr_proto::Feedback {
             frame,
             received_us,
@@ -515,7 +513,7 @@ fn transport_name(t: &str) -> &'static CStr {
 #[no_mangle]
 pub unsafe extern "C" fn rr_stats(s: *const RrSession, out: *mut RrStats) {
     let (Some(s), false) = (s.as_ref(), out.is_null()) else { return };
-    let st = s.stats.lock().unwrap().clone();
+    let st = s.sender.stats();
     *out = RrStats {
         frames: st.frames,
         keyframes: st.keyframes,

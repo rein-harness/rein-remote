@@ -149,11 +149,15 @@ item what happened.
    without clicking moves the remote pointer (drawn by the app, in the server's shape: the arrow,
    the I-beam over text); a click clicks; a two-finger click (or a mouse's right button) right-clicks;
    two fingers on the trackpad (or the wheel) scroll; click and drag selects.
-10. **A gamepad** (an Xbox, PlayStation or MFi controller, paired in Settings > Bluetooth): with the
-    speedometer on, a line `gamepads: 1 · buttons 0x… · left x,y` changes as buttons and sticks
-    move (A is 0x1, the d-pad right 0x8000; up on the left stick is negative). No server injects
-    gamepads yet, so it says `not sent: the server takes no gamepads`; a server that does takes them
-    in the W3C standard layout (rr-proto's `Input::Gamepad`).
+10. **A gamepad** (an Xbox, PlayStation or MFi controller, paired in Settings > Bluetooth), against a
+    Windows or Linux server set up to play gamepads (ViGEmBus, or write access to `/dev/uinput`: see
+    [desktop-client.md](desktop-client.md), section 5; a Mac server can't, and says so in its Hello).
+    With the speedometer on, a line `gamepads: 1 · buttons 0x… · left x,y · sent` changes as buttons
+    and sticks move (A is 0x1, the d-pad right 0x8000; up on the left stick is negative). The server
+    prints `gamepad 0: a virtual Xbox 360 controller (…)` on the first press; `joy.cpl` (Windows) or
+    `evtest` (Linux) shows every button, both sticks (up is up), the triggers and the d-pad following
+    the pad. Switch the pad off mid-press: nothing stays pressed. Against a Mac server the line says
+    `not sent: the server takes no gamepads`.
 11. **Sound**: with the test pattern, a beep each second with the white flash in the top left, heard
     from the speaker together with the flash (the overlay counts packets played and dropped; the
     self-test's `av_sync_ms_p50`, on a device whose clock agrees, says how far apart). With a real

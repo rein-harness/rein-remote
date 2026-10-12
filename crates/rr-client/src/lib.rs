@@ -29,7 +29,7 @@ pub use link::redact;
 use link::{Cert, Ev, In, Link};
 use rr_proto::{
     Audio, CodecCap, Config, Cursor, DirectAnswer, DirectOffer, Feedback, Hello, Input, Message, FEATURE_AUDIO_DATAGRAMS, FEATURE_DIRECT,
-    FEATURE_VIDEO_DATAGRAMS, INPUT_GAMEPAD, INPUT_KEYBOARD, INPUT_POINTER, INPUT_TOUCH, VERSION_MAX, VERSION_MIN,
+    FEATURE_VIDEO_DATAGRAMS, INPUT_KEYBOARD, INPUT_POINTER, INPUT_TOUCH, VERSION_MAX, VERSION_MIN,
 };
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -81,11 +81,11 @@ pub struct Options {
     pub auto_feedback: bool,
     /// Ask for a keyframe when a frame is lost (what a decoder needs to go on).
     pub keyframe_on_loss: bool,
+    /// The input kinds this client sends (`INPUT_*`): a client with gamepads adds `INPUT_GAMEPAD`.
+    pub input: u8,
     /// This client plays Opus (48 kHz, stereo): the server sends `Audio` (as datagrams of their own,
     /// with `datagrams`, over WebTransport).
     pub audio: bool,
-    /// This client sends gamepads' state (`Input::Gamepad`).
-    pub gamepad: bool,
 }
 
 impl Default for Options {
@@ -103,8 +103,8 @@ impl Default for Options {
             refresh_mhz: 60_000,
             auto_feedback: true,
             keyframe_on_loss: true,
+            input: INPUT_POINTER | INPUT_KEYBOARD | INPUT_TOUCH,
             audio: false,
-            gamepad: false,
         }
     }
 }
@@ -176,14 +176,21 @@ pub struct Session {
     stats: Arc<Mutex<Stats>>,
 }
 
-/// Sends to a session from any thread (input from a UI thread while another waits for events):
-/// cloned from [`Session::sender`]. Once the session has ended, what's sent goes nowhere.
-#[derive(Clone)]
-pub struct Sender {
-    inbox: mpsc::Sender<Ev>,
-}
+impl Session {
+    /// The next event, waiting up to `wait`.
+    pub fn next_event(&self, wait: Duration) -> Option<Event> {
+        self.events.recv_timeout(wait).ok()
+    }
 
-impl Sender {
+    /// A handle that sends to the server from any thread (a window's input, while another thread
+    /// takes the events and decodes).
+    pub fn control(&self) -> Control {
+        Control {
+            inbox: self.inbox.clone(),
+            stats: self.stats.clone(),
+        }
+    }
+
     pub fn input(&self, i: Input) {
         self.send(Message::Input(i));
     }
@@ -202,37 +209,32 @@ impl Sender {
         let _ = self.inbox.send(Ev::Cmd(Cmd::Send(m)));
     }
 
+    pub fn stats(&self) -> Stats {
+        self.stats.lock().unwrap().clone()
+    }
+
     pub fn close(&self) {
         let _ = self.inbox.send(Ev::Cmd(Cmd::Close));
     }
 }
 
-impl Session {
-    /// The next event, waiting up to `wait`.
-    pub fn next_event(&self, wait: Duration) -> Option<Event> {
-        self.events.recv_timeout(wait).ok()
-    }
+/// Sends to the server from any thread: [`Session::control`]. The session ends when the `Session`
+/// is dropped (or [`Control::close`]), not when these are.
+#[derive(Clone)]
+pub struct Control {
+    inbox: mpsc::Sender<Ev>,
+    stats: Arc<Mutex<Stats>>,
+}
 
-    /// What sends to this session, for other threads (a `Session` waits for events on one).
-    pub fn sender(&self) -> Sender {
-        Sender { inbox: self.inbox.clone() }
-    }
-
-    /// Its numbers so far, for other threads.
-    pub fn stats_handle(&self) -> Arc<Mutex<Stats>> {
-        self.stats.clone()
-    }
-
+impl Control {
     pub fn input(&self, i: Input) {
         self.send(Message::Input(i));
     }
 
-    /// Asks for a keyframe (the decoder lost its place, or just started).
     pub fn keyframe(&self) {
         self.send(Message::KeyframeRequest);
     }
 
-    /// Tells the server a frame was shown (with `auto_feedback` off: after decoding it).
     pub fn feedback(&self, f: Feedback) {
         self.send(Message::Feedback(f));
     }
@@ -379,12 +381,7 @@ fn find(name: &str) -> Result<String, String> {
                 if names.is_empty() { "none".into() } else { names.join(", ") }
             )
         })?;
-    let addr = f.addrs.first().ok_or("it gave no address")?;
-    let host = if addr.is_ipv6() { format!("[{addr}]") } else { addr.to_string() };
-    // Plain HTTP: the same port serves it next to HTTPS, and a real certificate is for the machine's
-    // name, not the address found here. (A self-signed WebTransport certificate is checked by its
-    // hash, so that works by address; with a real one, the WebSocket is used.)
-    Ok(format!("http://{host}:{}/", f.port))
+    f.link()
 }
 
 fn hello(opts: &Options, direct: bool) -> Vec<u8> {
@@ -397,7 +394,7 @@ fn hello(opts: &Options, direct: bool) -> Vec<u8> {
         max_height: 2160,
         max_fps: 240,
         audio: opts.audio,
-        input: INPUT_POINTER | INPUT_KEYBOARD | INPUT_TOUCH | if opts.gamepad { INPUT_GAMEPAD } else { 0 },
+        input: opts.input,
         refresh_mhz: opts.refresh_mhz,
         features: if opts.datagrams { FEATURE_VIDEO_DATAGRAMS } else { 0 }
             | if direct { FEATURE_DIRECT } else { 0 }
@@ -568,9 +565,11 @@ impl Run {
             }
             s.clock_offset_us.map(|o| received_us as i64 - (v.timestamp_us as i64 + o))
         };
+        // The share of datagrams lost lately: in the stats either way (a client that sends its own
+        // feedback reports it from there).
+        let loss_permille = self.link.loss_permille();
+        self.stats.lock().unwrap().loss_permille = loss_permille;
         if self.opts.auto_feedback {
-            let loss_permille = self.link.loss_permille();
-            self.stats.lock().unwrap().loss_permille = loss_permille;
             self.link.send(
                 Message::Feedback(Feedback {
                     frame: v.frame,

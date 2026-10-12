@@ -150,6 +150,10 @@ struct GamepadState: Equatable {
             g.dpad.up, g.dpad.down, g.dpad.left, g.dpad.right, g.buttonHome,
         ]
         for (i, b) in order.enumerated() where b?.isPressed == true { buttons |= 1 << UInt32(i) }
+        // The triggers' bits: pressed past half way (their values go as well).
+        buttons &= ~(1 << 6 | 1 << 7)
+        if g.leftTrigger.value > 0.5 { buttons |= 1 << 6 }
+        if g.rightTrigger.value > 0.5 { buttons |= 1 << 7 }
         // Up is positive in GameController, negative in the protocol (as on the web).
         lx = Self.axis(g.leftThumbstick.xAxis.value)
         ly = Self.axis(-g.leftThumbstick.yAxis.value)
@@ -183,6 +187,14 @@ final class Gamepads {
 
     private func refresh() {
         let pads = GCController.controllers().filter { $0.extendedGamepad != nil }
+        // A pad that went: once more at rest, so nothing stays held on the server.
+        let here = Set(pads.map(ObjectIdentifier.init))
+        for (id, s) in last where !here.contains(id) {
+            var rest = GamepadState()
+            rest.pad = s.pad
+            onState?(rest)
+            last[id] = nil
+        }
         connected = pads.count
         for (i, c) in pads.enumerated() {
             let pad = UInt8(min(i, 255))
