@@ -221,7 +221,16 @@ mod tests {
         for reference in &mut r.signature.as_mut().unwrap().signed_info.reference {
             reference.digest_method.algorithm = samael::signature::DigestAlgorithm::Sha256;
         }
-        let signed = Crypto::sign_xml(r.to_string().unwrap(), &idp.export_private_key_der().unwrap()).unwrap();
+        // And it leaves out the bearer confirmation's NotOnOrAfter, which the Web SSO profile (and samael)
+        // require: five minutes, as IdPs give.
+        let until = crate::audit::rfc3339(std::time::SystemTime::now() + Duration::from_secs(300));
+        let xml = r.to_string().unwrap().replacen(
+            "<saml2:SubjectConfirmationData ",
+            &format!("<saml2:SubjectConfirmationData NotOnOrAfter=\"{until}\" "),
+            1,
+        );
+        assert!(xml.contains("NotOnOrAfter=\""), "{xml}");
+        let signed = Crypto::sign_xml(xml, &idp.export_private_key_der().unwrap()).unwrap();
         base64::engine::general_purpose::STANDARD.encode(signed)
     }
 
