@@ -171,6 +171,30 @@ has been verified.
 - Desktop: Windows, macOS, Linux (Rust core, platform hardware decode, gamepads).
 - Mobile: iOS and iPadOS (Swift, VideoToolbox), Android (Kotlin, MediaCodec); touch, keyboard,
   gamepads, pointer on iPad.
+- **Status:** all three are in, on one Rust core (`crates/rr-client`: WebTransport with datagrams
+  and FEC, the WebSocket, the relay with hole punching, pairing, mDNS), exposed to Swift as a C ABI
+  (`crates/rr-ffi`, an XCFramework) and to Kotlin through JNI (`crates/rr-jni`).
+  Desktop (`rein-remote-viewer`, winit): VideoToolbox's pictures go straight to the window's layer,
+  so the CPU never copies them; on this Mac (A18 Pro, server on the same machine, 1280×720 test
+  pattern, 902 of 902 barcodes read) 9 / 12 ms glass to glass p50 / p95 at 60 fps and ~10% of one
+  core (HEVC 9 / 18 ms; openh264 13 / 15 ms at 44%; relay then punched direct 13 / 15 ms); keys
+  typed into the window reached TextEdit behind other windows, the pointer arrived where sent.
+  Media Foundation and VA-API decoders (software fallback after three failures), gamepads through
+  gilrs, and on the server a virtual Xbox pad (uinput on Linux, read back in CI; ViGEmBus on
+  Windows). CI runs the viewer on all three in software: Windows 11 / 16 ms, Linux under Xvfb 34 /
+  36 ms. iOS and iPadOS (SwiftUI): VideoToolbox into `AVSampleBufferDisplayLayer`, Opus through
+  Apple's decoder in sync, touch gestures like the web client's, both keyboards, the iPad pointer,
+  gamepads, Bonjour, pairing by code or QR. In the iOS 26.5 simulator (iPhone 17): 60 fps, 9 / 15 ms
+  glass to glass (HEVC 9 / 17; WebSocket 17 / 22–40; relay then direct 12 / 28), a pointer move
+  seen in the picture 51–54 ms later, sound 15–22 ms from its picture, a UIKit tap landing as a
+  click; CI runs it in the simulator too. Android (Kotlin, MediaCodec onto a Surface, Opus into a
+  low-latency AudioTrack, NsdManager, the same gestures and gamepad bits): in the emulator at 720p,
+  59.6 fps, 13 / 29 ms glass to glass (the emulator's codec, which decodes on the host; Android's
+  software HEVC 12 / 57 ms), a tap through the touch system seen as a click in 103–136 ms, pairing
+  then a stored key; CI builds it and runs it in an emulator (38.5 fps, 36 / 40 ms). Real devices
+  still to verify, step by step: [desktop GPUs and gamepads](docs/verification/desktop-client.md),
+  [iPhone and iPad](docs/verification/ios-client.md),
+  [an Android phone](docs/verification/android-client.md).
 - **Verified:** each connects, streams and controls on real devices.
 
 ## Phase 6 — larger deployments
