@@ -17,6 +17,10 @@ export interface Stats {
   error: string;
   /** Glass-to-glass samples in ms (only with `measure`, against `serve --test-pattern`). */
   glassMs: number[];
+  /** This display's refresh rate as measured (the server paces to it), 0 if unknown. */
+  refreshHz: number;
+  /** Frames shown in the last second. */
+  fps: number;
 }
 
 export interface ConnectOptions {
@@ -28,7 +32,12 @@ export interface ConnectOptions {
   webtransport?: {url: string; hash?: string | null};
   /** This client's name, as the server logs it. */
   name?: string;
+  /** The display's refresh rate in millihertz, instead of measuring it (0: unknown). */
+  refreshMhz?: number;
 }
+
+/** This display's refresh rate, measured from animation frames, in millihertz (0 when it can't tell). */
+export function measureRefresh(frames?: number, timeoutMs?: number): Promise<number>;
 
 export interface Session {
   stats: Stats;
