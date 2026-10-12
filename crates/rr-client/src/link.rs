@@ -3,7 +3,8 @@
 //!
 //! - **WebTransport** (QUIC over UDP, HTTP/3, the same endpoint browsers use): control and input on one
 //!   stream the client opens, each video frame on a stream of its own or, when the server sends them so,
-//!   as datagrams with forward error correction (put back together here with rr-proto's `fec`).
+//!   as datagrams with forward error correction (put back together here with rr-proto's `fec`), and
+//!   sound, when asked for, a whole frame a datagram.
 //! - **WebSocket** (TCP, ws:// or wss://): through anything that passes web traffic.
 //!
 //! A relay's link is a WebSocket whose messages are sealed end to end (the session seals and opens
@@ -341,6 +342,13 @@ pub(crate) fn webtransport(
     let (c, tx, f, d) = (conn.clone(), inbox.clone(), fec.clone(), datagrams.clone());
     rt.spawn(async move {
         while let Ok(dg) = c.receive_datagram().await {
+            // Sound comes whole, a protocol frame a datagram (its first byte its kind); video in shards.
+            if dg.payload().first() == Some(&rr_proto::kind::AUDIO) {
+                if tx.send(Ev::Net(id, In::Data(dg.payload().to_vec()))).is_err() {
+                    return;
+                }
+                continue;
+            }
             d.store(true, Ordering::Relaxed);
             let frame = f.lock().unwrap().push(&dg.payload());
             if let Some((_, frame)) = frame {

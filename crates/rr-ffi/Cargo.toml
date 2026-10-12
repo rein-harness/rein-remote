@@ -1,0 +1,16 @@
+[package]
+name = "rr-ffi"
+description = "Rein Remote's native client core (rr-client) behind a small C ABI, for apps in other languages (the iOS and iPadOS app, in Swift)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+# A static library for the app (an XCFramework on Apple platforms), and a Rust library for tests.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rr-client = {path = "../rr-client"}
+rr-proto = {path = "../rr-proto"}

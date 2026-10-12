@@ -201,6 +201,12 @@ pub enum Input {
         points: Vec<(u8, u16, u16)>,
     },
     /// A gamepad's state: buttons as a bit set, then sticks and triggers.
+    ///
+    /// Bit `i` of `buttons` is button `i` of the W3C "standard gamepad" layout: 0 A (bottom face), 1 B
+    /// (right), 2 X (left), 3 Y (top), 4 left shoulder, 5 right shoulder, 6 left trigger, 7 right
+    /// trigger, 8 back/select/view, 9 start/menu, 10 left stick press, 11 right stick press, 12 up,
+    /// 13 down, 14 left, 15 right (the d-pad), 16 home/guide. Sticks from -32767 to 32767, positive
+    /// right and down; triggers 0 (released) to 255 (fully pressed). `pad` tells gamepads apart.
     Gamepad {
         pad: u8,
         buttons: u32,

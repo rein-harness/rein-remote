@@ -1609,6 +1609,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rr-ffi"
+version = "0.1.1"
+dependencies = [
+ "rr-client",
+ "rr-proto",
+]
+
+[[package]]
 name = "rr-proto"
 version = "0.1.1"
 dependencies = [

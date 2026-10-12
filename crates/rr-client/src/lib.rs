@@ -28,8 +28,8 @@ pub mod pairing;
 pub use link::redact;
 use link::{Cert, Ev, In, Link};
 use rr_proto::{
-    Audio, CodecCap, Config, Cursor, DirectAnswer, DirectOffer, Feedback, Hello, Input, Message, FEATURE_DIRECT, FEATURE_VIDEO_DATAGRAMS, INPUT_KEYBOARD,
-    INPUT_POINTER, INPUT_TOUCH, VERSION_MAX, VERSION_MIN,
+    Audio, CodecCap, Config, Cursor, DirectAnswer, DirectOffer, Feedback, Hello, Input, Message, FEATURE_AUDIO_DATAGRAMS, FEATURE_DIRECT,
+    FEATURE_VIDEO_DATAGRAMS, INPUT_GAMEPAD, INPUT_KEYBOARD, INPUT_POINTER, INPUT_TOUCH, VERSION_MAX, VERSION_MIN,
 };
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -81,6 +81,11 @@ pub struct Options {
     pub auto_feedback: bool,
     /// Ask for a keyframe when a frame is lost (what a decoder needs to go on).
     pub keyframe_on_loss: bool,
+    /// This client plays Opus (48 kHz, stereo): the server sends `Audio` (as datagrams of their own,
+    /// with `datagrams`, over WebTransport).
+    pub audio: bool,
+    /// This client sends gamepads' state (`Input::Gamepad`).
+    pub gamepad: bool,
 }
 
 impl Default for Options {
@@ -98,6 +103,8 @@ impl Default for Options {
             refresh_mhz: 60_000,
             auto_feedback: true,
             keyframe_on_loss: true,
+            audio: false,
+            gamepad: false,
         }
     }
 }
@@ -169,10 +176,51 @@ pub struct Session {
     stats: Arc<Mutex<Stats>>,
 }
 
+/// Sends to a session from any thread (input from a UI thread while another waits for events):
+/// cloned from [`Session::sender`]. Once the session has ended, what's sent goes nowhere.
+#[derive(Clone)]
+pub struct Sender {
+    inbox: mpsc::Sender<Ev>,
+}
+
+impl Sender {
+    pub fn input(&self, i: Input) {
+        self.send(Message::Input(i));
+    }
+
+    /// Asks for a keyframe (the decoder lost its place, or just started).
+    pub fn keyframe(&self) {
+        self.send(Message::KeyframeRequest);
+    }
+
+    /// Tells the server a frame was shown (with `auto_feedback` off: after decoding it).
+    pub fn feedback(&self, f: Feedback) {
+        self.send(Message::Feedback(f));
+    }
+
+    pub fn send(&self, m: Message) {
+        let _ = self.inbox.send(Ev::Cmd(Cmd::Send(m)));
+    }
+
+    pub fn close(&self) {
+        let _ = self.inbox.send(Ev::Cmd(Cmd::Close));
+    }
+}
+
 impl Session {
     /// The next event, waiting up to `wait`.
     pub fn next_event(&self, wait: Duration) -> Option<Event> {
         self.events.recv_timeout(wait).ok()
+    }
+
+    /// What sends to this session, for other threads (a `Session` waits for events on one).
+    pub fn sender(&self) -> Sender {
+        Sender { inbox: self.inbox.clone() }
+    }
+
+    /// Its numbers so far, for other threads.
+    pub fn stats_handle(&self) -> Arc<Mutex<Stats>> {
+        self.stats.clone()
     }
 
     pub fn input(&self, i: Input) {
@@ -348,10 +396,12 @@ fn hello(opts: &Options, direct: bool) -> Vec<u8> {
         max_width: 3840,
         max_height: 2160,
         max_fps: 240,
-        audio: false,
-        input: INPUT_POINTER | INPUT_KEYBOARD | INPUT_TOUCH,
+        audio: opts.audio,
+        input: INPUT_POINTER | INPUT_KEYBOARD | INPUT_TOUCH | if opts.gamepad { INPUT_GAMEPAD } else { 0 },
         refresh_mhz: opts.refresh_mhz,
-        features: if opts.datagrams { FEATURE_VIDEO_DATAGRAMS } else { 0 } | if direct { FEATURE_DIRECT } else { 0 },
+        features: if opts.datagrams { FEATURE_VIDEO_DATAGRAMS } else { 0 }
+            | if direct { FEATURE_DIRECT } else { 0 }
+            | if opts.datagrams && opts.audio { FEATURE_AUDIO_DATAGRAMS } else { 0 },
     })
     .encode()
 }
