@@ -245,6 +245,7 @@ fn choice() -> String {
 }
 
 /// The machine's hardware encoders for `codec`, best first: each is tried in turn when a stream starts.
+/// (On Windows, Media Foundation's software encoder comes last among them: `hardware()` tells.)
 #[allow(unused_variables, unused_mut)]
 fn hardware(codec: Codec, width: usize, height: usize, fps: f32, kbps: u32) -> Vec<Result<Box<dyn VideoEncoder>, String>> {
     let want = choice();
@@ -253,6 +254,13 @@ fn hardware(codec: Codec, width: usize, height: usize, fps: f32, kbps: u32) -> V
     #[cfg(target_os = "macos")]
     if named("videotoolbox") {
         out.push(crate::encode_vt::VideoToolbox::new(codec, width, height, fps, kbps).map(|e| Box::new(e) as Box<dyn VideoEncoder>));
+    }
+    // The vendors' encoders (NVENC, AMF, Quick Sync) through Media Foundation, then Microsoft's
+    // software one (before openh264) unless only hardware will do.
+    #[cfg(windows)]
+    if named("mediafoundation") {
+        let hardware_only = want == "hardware";
+        out.push(crate::encode_mf::MediaFoundation::new(codec, width, height, fps, kbps, hardware_only).map(|e| Box::new(e) as Box<dyn VideoEncoder>));
     }
     out
 }
@@ -290,7 +298,7 @@ fn has_hardware(codec: Codec) -> bool {
     if matches!(choice().as_str(), "" | "auto" | "hardware" | "videotoolbox") {
         return crate::encode_vt::listed(codec);
     }
-    hardware(codec, 256, 144, 30.0, 500).into_iter().any(|e| e.is_ok())
+    hardware(codec, 256, 144, 30.0, 500).into_iter().any(|e| e.is_ok_and(|e| e.hardware()))
 }
 
 /// What this machine encodes, each codec once, hardware first (for the server's Hello): found the
@@ -302,7 +310,9 @@ pub fn capabilities() -> &'static [CodecCap] {
         for codec in [Codec::H264, Codec::H265] {
             if choice() != "software" && has_hardware(codec) {
                 caps.push(CodecCap { codec, hardware: true });
-            } else if codec == Codec::H264 && !matches!(choice().as_str(), "hardware" | "videotoolbox" | "mediafoundation" | "vaapi") {
+            } else if codec == Codec::H264 && !matches!(choice().as_str(), "hardware" | "videotoolbox" | "vaapi") {
+                // Software: openh264, or Media Foundation's own encoder (RR_ENCODER=mediafoundation
+                // on a machine without a hardware one).
                 caps.push(CodecCap { codec, hardware: false });
             }
         }

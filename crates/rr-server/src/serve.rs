@@ -431,6 +431,8 @@ fn session(mut link: Box<dyn Link + Send>, source: Arc<Mutex<Box<dyn Source>>>, 
     // The pointer as last sent: its place, and its image's serial (the image goes only when it changes).
     let mut cursor_sent: Option<(u16, u16, u32, bool)> = None;
     let mut seen_generation: Option<u64> = None;
+    // Whether a frame has gone in where it was (said once in the log).
+    let mut zero_copy = false;
     // Frames in the encoder: their capture time (the tag), when they were read, and how long reading took.
     let mut encoding: std::collections::VecDeque<(u64, Instant, f64)> = Default::default();
     loop {
@@ -523,6 +525,10 @@ fn session(mut link: Box<dyn Link + Send>, source: Arc<Mutex<Box<dyn Source>>>, 
                         // Zero copy where both ends can: the system's own frame straight into the hardware encoder.
                         let surface = if enc.takes_surfaces() { src.surface() } else { None };
                         if let Some(surface) = surface {
+                            if !zero_copy {
+                                zero_copy = true;
+                                eprintln!("rein-remote: zero copy: frames go from the capture into the encoder on the GPU");
+                            }
                             let grab_ms = t0.elapsed().as_secs_f64() * 1000.0;
                             encoding.push_back((captured_at, t0, grab_ms));
                             enc.encode_surface(&surface, captured_at)?

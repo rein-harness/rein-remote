@@ -1,6 +1,6 @@
 //! `rein-remote`: the Rein Remote server.
 //!
-//!   rein-remote serve                      # this display ($DISPLAY on Linux), on 127.0.0.1:7979
+//!   rein-remote serve                      # this display ($DISPLAY on Linux, the primary one on Windows), on 127.0.0.1:7979
 //!   rein-remote serve --display :20        # a virtual display (Xvfb, Xvnc)
 //!   rein-remote serve --test-pattern       # a moving pattern, no display needed
 //!   rein-remote serve --window Simulator   # one app's window (macOS), by app name, title or id
@@ -18,6 +18,8 @@ mod capture;
 mod conn;
 mod e2e;
 mod encode;
+#[cfg(windows)]
+mod encode_mf;
 #[cfg(target_os = "macos")]
 mod encode_vt;
 mod link;
@@ -213,7 +215,7 @@ fn open_window(query: &str) -> Result<Box<dyn Source>, String> {
 
 #[cfg(windows)]
 fn open_window(query: &str) -> Result<Box<dyn Source>, String> {
-    Ok(Box::new(capture::win::WinWindow::open(query)?))
+    Ok(Box::new(capture::win::WinSource::open_window(query)?))
 }
 
 #[cfg(target_os = "macos")]
@@ -321,8 +323,11 @@ fn open_app(_query: &str) -> Result<Box<dyn Source>, String> {
 }
 
 #[cfg(windows)]
-fn open_display(_display: Option<&str>) -> Result<Box<dyn Source>, String> {
-    Err("the whole screen on Windows isn't in yet: --window shows any app's window".into())
+fn open_display(display: Option<&str>) -> Result<Box<dyn Source>, String> {
+    if display.is_some() {
+        return Err("--display is for Linux and macOS; on Windows, no source streams the primary display".into());
+    }
+    Ok(Box::new(capture::win::WinSource::open_display()?))
 }
 
 #[cfg(target_os = "macos")]
@@ -338,8 +343,9 @@ fn list_displays() -> Result<(), String> {
     Err("`displays` is for macOS (on Linux, --display :N picks an X display)".into())
 }
 
-/// Capture without a client (for CI and for checking a machine): the source gives a frame, and with
-/// `--type`, typing into it (then Enter) changes what it shows.
+/// Capture without a client (for CI and for checking a machine): the source gives a frame, the
+/// encoder a stream would use (`RR_ENCODER` picks it) makes a keyframe of it, and with `--type`,
+/// typing into it changes what it shows.
 fn selftest(args: &[String]) -> Result<String, String> {
     use std::time::{Duration, Instant};
     let mut it = args.iter();
@@ -383,8 +389,11 @@ fn selftest(args: &[String]) -> Result<String, String> {
     if src.generation() == Some(0) {
         return Err("no frame came in 5 seconds".into());
     }
+    let encoded = encode_check(&mut src)?;
     let before = digest(&mut src)?;
-    let Some(text) = text else { return Ok(format!("{w}×{h}, frames come")) };
+    let Some(text) = text else {
+        return Ok(format!("{w}×{h}, frames come, {encoded}"));
+    };
     // Clicking first gives the window the keyboard (as a person would).
     src.input(&rr_proto::Input::PointerMove {
         x: (w / 2) as u16,
@@ -405,8 +414,41 @@ fn selftest(args: &[String]) -> Result<String, String> {
         std::thread::sleep(Duration::from_millis(100));
         src.generation();
         if digest(&mut src)? != before {
-            return Ok(format!("{w}×{h}, frames come, and typing changed the window"));
+            return Ok(format!("{w}×{h}, frames come, {encoded}, and typing changed what's seen"));
         }
     }
     Err("typing didn't change what the window shows".into())
+}
+
+/// A few frames from the source through the encoder a stream would get, as a stream would give them
+/// (on the GPU where both can): which encoder it was, and that the first frame out is a keyframe.
+fn encode_check(src: &mut Box<dyn Source>) -> Result<String, String> {
+    use std::time::{Duration, Instant};
+    let (w, h) = src.size();
+    let mut enc = encode::open(rr_proto::Codec::H264, w, h, 30.0, 4000)?;
+    let (mut out, mut zero_copy) = (Vec::new(), false);
+    for tag in 1..=3u64 {
+        let surface = if enc.takes_surfaces() { src.surface() } else { None };
+        out.extend(match surface {
+            Some(s) => {
+                zero_copy = true;
+                enc.encode_surface(&s, tag)?
+            }
+            None => {
+                let f = src.grab()?;
+                enc.encode(f.bgra, f.stride, tag)?
+            }
+        });
+    }
+    let start = Instant::now();
+    while enc.in_flight() > 0 && start.elapsed() < Duration::from_secs(2) {
+        std::thread::sleep(Duration::from_millis(1));
+        out.extend(enc.poll()?);
+    }
+    let first = out.first().ok_or_else(|| format!("{} gave no frame back", enc.name()))?;
+    if !first.keyframe {
+        return Err(format!("{}: the first frame out isn't a keyframe", enc.name()));
+    }
+    let gpu = if zero_copy { ", zero copy" } else { "" };
+    Ok(format!("encoded with {}{gpu} (a {}-byte keyframe)", enc.name(), first.data.len()))
 }

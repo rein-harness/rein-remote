@@ -1,6 +1,7 @@
-//! BGRA → I420 (YUV 4:2:0), the encoder's input, fast: integer BT.601 (limited range), 2×2 blocks
-//! for the chroma, rows split across the CPU's cores. The generic per-pixel conversion took most of
-//! a frame's time; this is several times faster.
+//! BGRA → YUV 4:2:0, the encoders' input, fast: integer BT.601 (limited range), 2×2 blocks for the
+//! chroma, rows split across the CPU's cores. The generic per-pixel conversion took most of a
+//! frame's time; this is several times faster. I420 (three planes) for openh264, NV12 (Y, then U and
+//! V interleaved) for Media Foundation's encoders.
 
 pub struct I420 {
     pub w: usize,
@@ -41,11 +42,34 @@ impl I420 {
                 let (vb, vr) = v_rest.split_at_mut(rows / 2 * cw);
                 (y_rest, u_rest, v_rest) = (yr, ur, vr);
                 let src = &bgra[row0 * stride..];
-                s.spawn(move || band_convert(src, stride, w, rows, yb, ub, vb));
+                s.spawn(move || band_convert::<false>(src, stride, w, rows, yb, ub, vb));
                 row0 += rows;
             }
         });
     }
+}
+
+/// Convert `bgra` (`stride` bytes a row, `w`×`h`, both even) into NV12 in `out` (`w * h * 3 / 2`
+/// bytes: the Y plane, then the U and V samples interleaved), written straight into the encoder's
+/// own buffer.
+#[cfg_attr(not(windows), allow(dead_code))] // Media Foundation's input
+pub fn nv12(bgra: &[u8], stride: usize, w: usize, h: usize, out: &mut [u8]) {
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, 8);
+    let band = ((h / 2).div_ceil(threads)) * 2;
+    let (y_all, uv_all) = out[..w * h * 3 / 2].split_at_mut(w * h);
+    std::thread::scope(|s| {
+        let (mut y_rest, mut uv_rest) = (y_all, uv_all);
+        let mut row0 = 0;
+        while row0 < h {
+            let rows = band.min(h - row0);
+            let (yb, yr) = y_rest.split_at_mut(rows * w);
+            let (uvb, uvr) = uv_rest.split_at_mut(rows / 2 * w);
+            (y_rest, uv_rest) = (yr, uvr);
+            let src = &bgra[row0 * stride..];
+            s.spawn(move || band_convert::<true>(src, stride, w, rows, yb, uvb, &mut []));
+            row0 += rows;
+        }
+    });
 }
 
 #[inline(always)]
@@ -53,13 +77,19 @@ fn luma(b: i32, g: i32, r: i32) -> u8 {
     (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16) as u8
 }
 
-fn band_convert(src: &[u8], stride: usize, w: usize, rows: usize, y: &mut [u8], u: &mut [u8], v: &mut [u8]) {
+/// A band of rows. `NV12`: `u` holds the U and V samples interleaved (and `v` is unused); else
+/// they're two planes.
+fn band_convert<const NV12: bool>(src: &[u8], stride: usize, w: usize, rows: usize, y: &mut [u8], u: &mut [u8], v: &mut [u8]) {
     let cw = w / 2;
     for pair in 0..rows / 2 {
         let r0 = &src[(pair * 2) * stride..(pair * 2) * stride + w * 4];
         let r1 = &src[(pair * 2 + 1) * stride..(pair * 2 + 1) * stride + w * 4];
         let (y0, y1) = y[pair * 2 * w..(pair * 2 + 2) * w].split_at_mut(w);
-        let (uo, vo) = (&mut u[pair * cw..(pair + 1) * cw], &mut v[pair * cw..(pair + 1) * cw]);
+        let (uo, vo) = if NV12 {
+            (&mut u[pair * w..(pair + 1) * w], &mut [][..])
+        } else {
+            (&mut u[pair * cw..(pair + 1) * cw], &mut v[pair * cw..(pair + 1) * cw])
+        };
         for x in 0..cw {
             let i = x * 8;
             let (b00, g00, r00) = (r0[i] as i32, r0[i + 1] as i32, r0[i + 2] as i32);
@@ -75,8 +105,15 @@ fn band_convert(src: &[u8], stride: usize, w: usize, rows: usize, y: &mut [u8], 
                 (g00 + g01 + g10 + g11 + 2) >> 2,
                 (r00 + r01 + r10 + r11 + 2) >> 2,
             );
-            uo[x] = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128) as u8;
-            vo[x] = (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128) as u8;
+            let cb = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128) as u8;
+            let cr = (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128) as u8;
+            if NV12 {
+                uo[x * 2] = cb;
+                uo[x * 2 + 1] = cr;
+            } else {
+                uo[x] = cb;
+                vo[x] = cr;
+            }
         }
     }
 }
@@ -98,6 +135,19 @@ mod tests {
         assert_eq!((f.u[0], f.v[0]), (128, 128));
         assert_eq!(&f.y[2..4], &[82, 82]);
         assert!((f.u[1] as i32 - 90).abs() <= 1 && (f.v[1] as i32 - 240).abs() <= 1);
+    }
+
+    #[test]
+    fn nv12_is_i420_with_the_chroma_interleaved() {
+        let (w, h) = (10, 6);
+        let bgra: Vec<u8> = (0..w * h * 4).map(|i| (i * 37 % 251) as u8).collect();
+        let mut i420 = I420::new(w, h);
+        i420.convert(&bgra, w * 4);
+        let mut nv12 = vec![0u8; w * h * 3 / 2];
+        super::nv12(&bgra, w * 4, w, h, &mut nv12);
+        assert_eq!(&nv12[..w * h], &i420.y[..]);
+        let uv: Vec<u8> = i420.u.iter().zip(&i420.v).flat_map(|(u, v)| [*u, *v]).collect();
+        assert_eq!(&nv12[w * h..], &uv[..]);
     }
 
     #[test]
