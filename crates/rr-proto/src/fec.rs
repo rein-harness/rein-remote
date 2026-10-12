@@ -253,8 +253,15 @@ pub fn split(frame_seq: u32, frame: &[u8], max_datagram: usize, parity: f32, nex
 
 struct Partial {
     blocks: u8,
-    /// Per block: its shards as they came, and the block once rebuilt.
-    shards: BTreeMap<u8, (Vec<Option<Vec<u8>>>, u8, u32, Option<Vec<u8>>)>,
+    shards: BTreeMap<u8, Block>,
+}
+
+/// One block of a frame on its way: its shards as they came, `k`, its length, and the block once rebuilt.
+struct Block {
+    shards: Vec<Option<Vec<u8>>>,
+    k: u8,
+    len: u32,
+    data: Option<Vec<u8>>,
 }
 
 /// Frames put back together from datagrams in any order, lost ones rebuilt from parity. A frame
@@ -313,28 +320,30 @@ impl Reassembler {
             blocks: h.blocks,
             shards: BTreeMap::new(),
         });
-        let entry = p
-            .shards
-            .entry(h.block)
-            .or_insert_with(|| (vec![None; h.k as usize + h.m as usize], h.k, h.len, None));
-        if entry.3.is_none() && (h.index as usize) < entry.0.len() {
-            entry.0[h.index as usize] = Some(body.to_vec());
-            let k = entry.1 as usize;
-            if entry.0.iter().filter(|s| s.is_some()).count() >= k {
-                let missing_data = entry.0.iter().take(k).any(Option::is_none);
-                if let Some(data) = reconstruct(&entry.0, k) {
+        let entry = p.shards.entry(h.block).or_insert_with(|| Block {
+            shards: vec![None; h.k as usize + h.m as usize],
+            k: h.k,
+            len: h.len,
+            data: None,
+        });
+        if entry.data.is_none() && (h.index as usize) < entry.shards.len() {
+            entry.shards[h.index as usize] = Some(body.to_vec());
+            let k = entry.k as usize;
+            if entry.shards.iter().filter(|s| s.is_some()).count() >= k {
+                let missing_data = entry.shards.iter().take(k).any(Option::is_none);
+                if let Some(data) = reconstruct(&entry.shards, k) {
                     if missing_data {
                         self.recovered += 1;
                     }
                     let mut block: Vec<u8> = data.concat();
-                    block.truncate(entry.2 as usize);
-                    entry.3 = Some(block);
-                    entry.0.clear();
+                    block.truncate(entry.len as usize);
+                    entry.data = Some(block);
+                    entry.shards.clear();
                 }
             }
         }
         let p = &self.partial[&h.frame];
-        let whole = p.shards.len() == p.blocks as usize && p.shards.values().all(|b| b.3.is_some());
+        let whole = p.shards.len() == p.blocks as usize && p.shards.values().all(|b| b.data.is_some());
         // Give up on frames too far behind the newest seen.
         let newest = *self.partial.keys().next_back().unwrap();
         let stale: Vec<u32> = self.partial.keys().copied().filter(|&f| newest.wrapping_sub(f) > self.window).collect();
@@ -355,7 +364,7 @@ impl Reassembler {
             self.lost += 1;
         }
         self.done_up_to = Some(h.frame);
-        Some((h.frame, p.shards.into_values().flat_map(|b| b.3.unwrap()).collect()))
+        Some((h.frame, p.shards.into_values().flat_map(|b| b.data.unwrap()).collect()))
     }
 }
 
