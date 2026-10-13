@@ -1,0 +1,23 @@
+{
+  "settings": {
+    "prefer": "framerate",
+    "fps": "auto",
+    "bitrate": "auto",
+    "codec": "h264",
+    "audio": true,
+    "listen": "auto",
+    "mdns": true,
+    "pair": true,
+    "relay": ["wss://relay.example"],
+    "relay-secret-set": true,
+    "webtransport": true,
+    "tailscale-cert": true,
+    "record": null,
+    "audit": "/Users/me/.rein-remote/audit.jsonl"
+  },
+  "sharing": true,
+  "source": "display:1",
+  "path": "/Users/me/.rein-remote/host.toml",
+  "overridden": ["test-pattern"],
+  "restart_needed": false
+}

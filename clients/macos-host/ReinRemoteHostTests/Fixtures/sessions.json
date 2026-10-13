@@ -1,0 +1,7 @@
+{"sessions": [
+  {"id": "5f1c2a9b0e7d4c31", "device": "Gary's iPhone", "user": "alice@corp.example",
+   "via": "oidc", "transport": "webtransport", "addr": "192.168.1.30:51234",
+   "fps": 60, "rtt_ms": 4.2, "kbps": 8000, "width": 1280, "height": 720,
+   "since": "2026-10-13T09:31:02.481Z", "view_only": true,
+   "groups": ["rr-admins"], "rule": "admins", "clipboard": false, "audio": true, "recorded": false, "ends_at": null}
+]}

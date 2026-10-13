@@ -1,0 +1,2 @@
+{"enabled": true, "path": "/Users/me/.rein-remote/policy.toml", "format": "toml", "rules": 2,
+ "text": "[[rule]]\nname = \"admins\"\ngroups = [\"rr-admins\"]\n\n[[rule]]\nname = \"the link\"\nvia = [\"token\", \"paired\"]\n"}

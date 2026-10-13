@@ -1,0 +1,15 @@
+{
+  "kind": "oidc",
+  "public-url": "https://remote.example.com",
+  "oidc-issuer": "https://example.okta.com",
+  "oidc-client-id": "0oa1b2c3",
+  "oidc-client-secret-set": true,
+  "oidc-scopes": "openid email profile",
+  "oidc-user-claim": "email",
+  "oidc-groups-claim": "groups",
+  "saml-idp-metadata": null,
+  "saml-entity-id": null,
+  "saml-user-attr": null,
+  "saml-groups-attr": "groups",
+  "saml_available": false
+}

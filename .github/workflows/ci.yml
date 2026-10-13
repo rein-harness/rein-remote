@@ -512,6 +512,36 @@ jobs:
           grep -v '^rein-remote: {' serve.log || true
           # What it sent (frames, bytes, encode times): the last few of its 5-second reports.
           grep '^rein-remote: {' serve.log | tail -4 || true
+  # The macOS host app (clients/macos-host): built with rein-remote inside it, its unit tests (the API
+  # client against the doc's examples), then its UI tests against a real `rein-remote host
+  # --test-pattern` on a home folder of its own: sharing on and off, the source, a viewer kicked, the
+  # audit log, pairing, settings in host.toml, a policy's error, the menu bar, the host restarted.
+  macos-host:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: The server (bundled into the app, and the host the UI tests drive)
+        run: cargo build --release -p rr-server
+      - name: The Xcode project
+        run: brew install xcodegen && cd clients/macos-host && xcodegen
+      - name: Build and test (units, then the UI against a real host)
+        run: |
+          cd clients/macos-host
+          TEST_RUNNER_RR_BIN="$GITHUB_WORKSPACE/target/release/rein-remote" TEST_RUNNER_RR_SHOTS="$RUNNER_TEMP/shots" \
+            xcodebuild test -project ReinRemoteHost.xcodeproj -scheme ReinRemoteHost -destination 'platform=macOS' \
+            -derivedDataPath DerivedData | tee xcodebuild.log | grep -E "Test Case|error:|\*\* "
+          test "${PIPESTATUS[0]}" -eq 0
+      - name: Screenshots
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-host-screenshots
+          path: ${{ runner.temp }}/shots
+          if-no-files-found: ignore
+          retention-days: 7
   # The Android app: the Rust core (crates/rr-jni) built with cargo-ndk for a phone and the emulator,
   # the APK, and the unit tests (gestures, keys, gamepads, the barcode reader, links).
   android:
