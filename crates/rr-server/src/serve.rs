@@ -1284,6 +1284,9 @@ fn stream(
                     };
                     enc_in += 1;
                     enc_out += done.len() as u64;
+                    if !done.is_empty() {
+                        adapt.sent(Instant::now());
+                    }
                     for e in done {
                         record(&recorder, &e, out);
                         send_frame(e, &mut *link, &mut encoding, &mut captured, &mut frame_no, &stats)?;
@@ -1295,6 +1298,7 @@ fn stream(
         if enc.in_flight() > 0 || !encoding.is_empty() {
             for e in enc.poll()? {
                 enc_out += 1;
+                adapt.sent(Instant::now());
                 record(&recorder, &e, out);
                 send_frame(e, &mut *link, &mut encoding, &mut captured, &mut frame_no, &stats)?;
             }
@@ -1310,7 +1314,7 @@ fn stream(
             let (fed, got) = (enc_in - enc_seen.0, enc_out - enc_seen.1);
             enc_seen = (enc_in, enc_out);
             if fed >= 8 && got * 10 < fed * 9 {
-                adapt.encoder_short(last_adapt);
+                adapt.encoder_short(last_adapt, got == 0);
             }
             if let Some(t) = adapt.tick(last_adapt).filter(|_| !off) {
                 enc.set_bitrate(t.kbps)?;

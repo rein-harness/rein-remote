@@ -51,6 +51,8 @@ pub struct Adapt {
     /// The encoder skipped frames since the last tick: too few bits for the picture's size.
     encoder_short: bool,
     short_until: Option<Instant>,
+    first_sent: Option<Instant>,
+    last_sent: Option<Instant>,
     /// The target when it last congested: climbing back slows down below it.
     ceiling: Option<u32>,
     /// Since when the bitrate has been enough for a bigger picture (scaling back up waits a while).
@@ -105,6 +107,8 @@ impl Adapt {
             starved: false,
             encoder_short: false,
             short_until: None,
+            first_sent: None,
+            last_sent: None,
             last_cut: long_ago,
             last_step: long_ago,
             starting: true,
@@ -155,15 +159,28 @@ impl Adapt {
     /// The encoder skipped more than a tenth of the frames given it since the last tick (a hardware
     /// encoder's rate control does, when a frame can't fit its share of the bitrate): the frame rate
     /// is kept by making the picture smaller.
-    /// Starting, it's the modest first bitrate that's short (a big fast picture at 800 kbit/s gets
-    /// every frame skipped, and with nothing sent no feedback comes to climb on): up it goes, as
-    /// fast as starting climbs.
-    pub fn encoder_short(&mut self, _at: Instant) {
-        if self.starting {
-            self.now.kbps = ((self.now.kbps as f64 * 1.5) as u32).min(self.max.kbps);
+    /// Starting, when it gave out nothing at all (`none_out`), it's the modest first bitrate that's
+    /// short (a big fast picture at 800 kbit/s had every frame skipped, and with nothing sent no
+    /// feedback comes to climb on): up it goes, as fast as starting climbs. Starting with some out,
+    /// the feedback decides (on a slow link the bitrate must not climb blind).
+    pub fn encoder_short(&mut self, _at: Instant, none_out: bool) {
+        if self.starting && !(none_out && self.now.kbps >= self.max.kbps) {
+            if none_out {
+                self.now.kbps = ((self.now.kbps as f64 * 1.5) as u32).min(self.max.kbps);
+            }
         } else {
+            // Nothing out even at the top bitrate (an encoder that can't do this size at this rate:
+            // H.264 at 4K and 240 fps): smaller.
+            self.starting = false;
             self.encoder_short = true;
         }
+    }
+
+    /// A frame went out. Frames going out for a second with no feedback for a while: nothing gets
+    /// through (or nothing the client can use: no feedback comes until a frame decodes).
+    pub fn sent(&mut self, at: Instant) {
+        self.first_sent.get_or_insert(at);
+        self.last_sent = Some(at);
     }
 
     fn feedback_lately(&self, at: Instant) -> bool {
@@ -191,6 +208,11 @@ impl Adapt {
     /// Called a few times a second: a new target when it should change.
     pub fn tick(&mut self, at: Instant) -> Option<Target> {
         let q = self.queuing_ms();
+        let sending = self.last_sent.is_some_and(|l| at.duration_since(l) < Duration::from_millis(250))
+            && self.first_sent.is_some_and(|f| at.duration_since(f) > Duration::from_secs(1));
+        if sending && !self.feedback_lately(at) {
+            self.starved = true;
+        }
         if (self.backed_up || self.starved || q > CONGESTED_MS) && at.duration_since(self.last_cut) > Duration::from_millis(300) {
             // Congested: to a little under what got through (or by 30% when that's not known yet).
             let got = self.delivered_kbps(at);
@@ -243,7 +265,9 @@ impl Adapt {
         if !self.starting {
             self.now.scale = self.scale_for(at);
         }
-        if std::mem::take(&mut self.encoder_short) {
+        // (A second between: each new size is a new encoder, which takes a moment to give out frames.)
+        let shrunk_lately = self.short_until.is_some_and(|u| u > at + Duration::from_secs(4));
+        if std::mem::take(&mut self.encoder_short) && !shrunk_lately {
             // A size smaller than both what the bitrate picks and what it is now.
             let smaller = SCALES.iter().map(|(s, _)| *s).filter(|s| *s < self.now.scale).fold(0.0f32, f32::max);
             if smaller > 0.0 {
@@ -415,17 +439,33 @@ mod tests {
         // Starting, the bitrate climbs instead, feedback or none (with every frame skipped, none comes).
         let mut a = Adapt::new(8000, 240);
         let mut t = Instant::now();
-        a.encoder_short(t);
+        a.encoder_short(t, true);
         a.tick(t);
         assert_eq!((a.target().scale, a.target().kbps), (1.0, START_KBPS * 3 / 2));
+        // Some frames out: the feedback decides, not the encoder.
+        a.encoder_short(t, false);
+        assert_eq!(a.target().kbps, START_KBPS * 3 / 2);
+        // Nothing out even at the top: smaller.
+        let mut b = Adapt::new(8000, 240);
+        for _ in 0..10 {
+            b.encoder_short(t, true);
+            b.tick(t);
+        }
+        // (Held a second before it shrinks again.)
+        assert_eq!((b.target().kbps, b.target().scale, b.target().fps), (8000, 0.75, 240));
         a.feedback(1_000_020.0, 1000, t);
         // At the top, the picture gives way.
         run(&mut a, &mut t, 5.0, |_| 20.0);
         assert_eq!(a.target().scale, 1.0);
-        a.encoder_short(t);
+        a.encoder_short(t, false);
         a.tick(t);
         assert_eq!((a.target().scale, a.target().fps), (0.75, 240));
-        a.encoder_short(t);
+        // Not again at once (the new encoder needs a moment); a second later, yes.
+        a.encoder_short(t, false);
+        a.tick(t);
+        assert_eq!(a.target().scale, 0.75);
+        run(&mut a, &mut t, 1.1, |_| 20.0);
+        a.encoder_short(t, false);
         a.tick(t);
         assert_eq!(a.target().scale, 0.5);
         // Held there a while, then back up with room.
@@ -433,6 +473,22 @@ mod tests {
         assert_eq!(a.target().scale, 0.5);
         run(&mut a, &mut t, 20.0, |_| 20.0);
         assert_eq!(a.target().scale, 1.0);
+    }
+
+    #[test]
+    fn frames_going_out_with_no_feedback_is_starved() {
+        // A link too slow for even the first keyframe: frames go, nothing decodes, nothing comes back.
+        let mut a = Adapt::new(8000, 60);
+        let t0 = Instant::now();
+        let mut t = t0;
+        for _ in 0..120 {
+            t += Duration::from_millis(16);
+            a.sent(t);
+            if (t - t0).as_millis() % 250 < 16 {
+                a.tick(t);
+            }
+        }
+        assert!(a.target().kbps < START_KBPS, "{:?}", a.target());
     }
 
     #[test]

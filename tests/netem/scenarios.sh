@@ -6,6 +6,7 @@ set -u
 SECS=${SECS:-15}
 MOTION=${MOTION:-full}
 RES=${RES:-1280x720}
+CLIENTS=${CLIENTS:-native web}
 # name|netem (delay, loss, jitter)|rate (a token bucket under it, with 100 ms of buffer, like a router's)
 links=(
   "lan||"
@@ -36,6 +37,18 @@ run() { # name transport url-extra
   kill $sp; wait $sp 2>/dev/null
   echo "$out" | jq -c --arg link "$name" --arg t "$transport" '{link:$link, transport:$t, got:.transport, fps, mbit, glass:.glassMs, fec, decoder, server_kbps:.server.kbps, server_fps:.server.fps, latency:.server.latency_ms, keyframes:.server.keyframes}'
 }
+native() { # name transport: the native viewer (rr-client, openh264), headless, reading the barcode
+  local name=$1 transport=$2
+  local wt=on; [ "$transport" = websocket ] && wt=off
+  rein-remote serve --test-pattern "$RES" --motion "$MOTION" --listen 127.0.0.1:7979 --webtransport $wt --mdns off > "$LOGS/$name-native-$transport.serve.log" 2>&1 &
+  local sp=$!
+  sleep 1
+  local out
+  out=$(timeout $((SECS + 20)) rein-remote-viewer http://127.0.0.1:7979 --headless --measure --frames 1000000 --seconds "$SECS" --webtransport $wt --json 2>"$LOGS/$name-native-$transport.viewer.log")
+  local stats; stats=$(curl -s http://127.0.0.1:7979/stats)
+  kill $sp; wait $sp 2>/dev/null
+  echo "$out" | jq -c --arg link "$name" --arg t "$transport" --argjson s "${stats:-null}" '{link:$link, client:"native", transport:$t, got:.transport, fps, glass:.glass_ms, size, decoder, keyframe_requests, server_kbps:$s.kbps, server_fps:$s.fps, latency:$s.latency_ms}'
+}
 relay() { # through the relay, sealed end to end (localhost is a secure page: the browser's crypto works)
   local name=$1
   rein-remote relay --listen 127.0.0.1:7990 > "$LOGS/$name-relay.relay.log" 2>&1 &
@@ -53,8 +66,14 @@ relay() { # through the relay, sealed end to end (localhost is a secure page: th
 for l in "${links[@]}"; do
   IFS='|' read -r name spec rate <<< "$l"
   link "$spec" "$rate"
-  run "$name" websocket
-  run "$name" webtransport
-  [ "$name" = lan ] || [ "$name" = rtt40_loss2 ] && relay "$name"
+  if [[ " $CLIENTS " == *" native "* ]]; then
+    native "$name" websocket
+    native "$name" webtransport
+  fi
+  if [[ " $CLIENTS " == *" web "* ]]; then
+    run "$name" websocket
+    run "$name" webtransport
+    [ "$name" = lan ] || [ "$name" = rtt40_loss2 ] && relay "$name"
+  fi
 done
 link ""
