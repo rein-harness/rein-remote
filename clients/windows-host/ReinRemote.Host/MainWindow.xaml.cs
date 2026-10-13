@@ -17,7 +17,11 @@ public sealed partial class MainWindow : Window
         ["Viewers"] = typeof(ViewersPage),
         ["Devices"] = typeof(DevicesPage),
         ["Settings"] = typeof(SettingsPage),
-        ["Admin"] = typeof(AdminPage),
+        ["SignIn"] = typeof(SignInPage),
+        ["Policy"] = typeof(PolicyPage),
+        ["Sessions"] = typeof(SessionsPage),
+        ["Audit"] = typeof(AuditLogPage),
+        ["Metrics"] = typeof(MetricsPage),
     };
 
     public MainWindow()
@@ -95,7 +99,7 @@ public sealed partial class MainWindow : Window
     public void Navigate(string tag)
     {
         foreach (var item in Nav.MenuItems.OfType<NavigationViewItem>())
-            if ((string)item.Tag == tag)
+            if (item.Tag as string == tag)
                 Nav.SelectedItem = item;
     }
 

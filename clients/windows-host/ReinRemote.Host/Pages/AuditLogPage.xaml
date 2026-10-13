@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Page
+    x:Class="ReinRemote.Host.Pages.AuditLogPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:core="using:ReinRemote.Host.Core"
+    NavigationCacheMode="Required">
+    <Grid Padding="24,8,24,24" RowSpacing="10">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+        <TextBlock Text="Audit log" Style="{StaticResource PageTitle}" AutomationProperties.HeadingLevel="Level1" AutomationProperties.AutomationId="PageTitle" />
+        <Grid Grid.Row="1" ColumnSpacing="12">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="2*" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <TextBox x:Name="EventFilter" Header="Events" PlaceholderText="all (or session_start, session_end, …)"
+                     AutomationProperties.AutomationId="EventFilter" AutomationProperties.Name="Event types, comma-separated" />
+            <DropDownButton Grid.Column="1" VerticalAlignment="Bottom" Content="Add"
+                            AutomationProperties.AutomationId="AddEvent" AutomationProperties.Name="Add an event type to the filter">
+                <DropDownButton.Flyout>
+                    <MenuFlyout x:Name="EventMenu" Placement="Bottom" />
+                </DropDownButton.Flyout>
+            </DropDownButton>
+            <TextBox x:Name="UserFilter" Grid.Column="2" Header="User has" PlaceholderText="anyone"
+                     AutomationProperties.AutomationId="UserFilter" AutomationProperties.Name="User contains" />
+            <TextBox x:Name="SinceFilter" Grid.Column="3" Header="Since" PlaceholderText="2026-10-12 or a time"
+                     AutomationProperties.AutomationId="SinceFilter" AutomationProperties.Name="Since (a date or an RFC 3339 time)" />
+            <ComboBox x:Name="LimitBox" Grid.Column="4" Header="Per page" SelectedIndex="1" Width="96"
+                      AutomationProperties.AutomationId="LimitBox" AutomationProperties.Name="Entries per page">
+                <ComboBoxItem Content="25" />
+                <ComboBoxItem Content="50" />
+                <ComboBoxItem Content="100" />
+                <ComboBoxItem Content="500" />
+            </ComboBox>
+            <Button x:Name="SearchAudit" Grid.Column="5" VerticalAlignment="Bottom" Content="Search" Style="{StaticResource AccentButtonStyle}" Click="Search_Click"
+                    AutomationProperties.AutomationId="SearchAudit" AutomationProperties.Name="Search the audit log" />
+        </Grid>
+        <InfoBar x:Name="AuditResult" Grid.Row="2" IsClosable="True" AutomationProperties.AutomationId="AuditResult" AutomationProperties.Name="Audit log result" />
+        <ListView x:Name="AuditList" Grid.Row="3" SelectionMode="Single" BorderThickness="1" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" CornerRadius="6"
+                  AutomationProperties.AutomationId="AuditList" AutomationProperties.Name="Audit log entries, newest first">
+            <ListView.Header>
+                <Grid Padding="12,8" ColumnSpacing="12" Background="{ThemeResource CardBackgroundFillColorSecondaryBrush}">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="150" />
+                        <ColumnDefinition Width="150" />
+                        <ColumnDefinition Width="200" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Text="Time" Style="{StaticResource CaptionTextBlockStyle}" FontWeight="SemiBold" />
+                    <TextBlock Grid.Column="1" Text="Event" Style="{StaticResource CaptionTextBlockStyle}" FontWeight="SemiBold" />
+                    <TextBlock Grid.Column="2" Text="User" Style="{StaticResource CaptionTextBlockStyle}" FontWeight="SemiBold" />
+                    <TextBlock Grid.Column="3" Text="Details" Style="{StaticResource CaptionTextBlockStyle}" FontWeight="SemiBold" />
+                </Grid>
+            </ListView.Header>
+            <ListView.ItemTemplate>
+                <DataTemplate x:DataType="core:AuditRow">
+                    <Grid ColumnSpacing="12" Padding="0,4">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="150" />
+                            <ColumnDefinition Width="150" />
+                            <ColumnDefinition Width="200" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="{x:Bind Time}" Style="{StaticResource CaptionTextBlockStyle}" />
+                        <TextBlock Grid.Column="1" Text="{x:Bind Event}" Style="{StaticResource CaptionTextBlockStyle}" FontWeight="SemiBold" />
+                        <TextBlock Grid.Column="2" Text="{x:Bind User}" Style="{StaticResource CaptionTextBlockStyle}" TextTrimming="CharacterEllipsis" />
+                        <TextBlock Grid.Column="3" Text="{x:Bind Details}" Style="{StaticResource CaptionTextBlockStyle}" TextWrapping="Wrap" IsTextSelectionEnabled="True"
+                                   FontFamily="Cascadia Mono, Consolas" />
+                    </Grid>
+                </DataTemplate>
+            </ListView.ItemTemplate>
+        </ListView>
+        <Grid Grid.Row="4" ColumnSpacing="8">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <TextBlock x:Name="AuditPageInfo" VerticalAlignment="Center" Style="{StaticResource Hint}" AutomationProperties.AutomationId="AuditPageInfo" />
+            <Button x:Name="NewerAudit" Grid.Column="1" Content="Newer" Click="Newer_Click" IsEnabled="False"
+                    AutomationProperties.AutomationId="NewerAudit" AutomationProperties.Name="Newer entries" />
+            <Button x:Name="OlderAudit" Grid.Column="2" Content="Older" Click="Older_Click" IsEnabled="False"
+                    AutomationProperties.AutomationId="OlderAudit" AutomationProperties.Name="Older entries" />
+        </Grid>
+    </Grid>
+</Page>

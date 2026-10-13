@@ -45,8 +45,21 @@
                 <NavigationViewItem Content="Settings" Tag="Settings" AutomationProperties.AutomationId="NavSettings" AutomationProperties.Name="Settings">
                     <NavigationViewItem.Icon><FontIcon Glyph="&#xE713;" /></NavigationViewItem.Icon>
                 </NavigationViewItem>
-                <NavigationViewItem Content="Admin" Tag="Admin" AutomationProperties.AutomationId="NavAdmin" AutomationProperties.Name="Admin">
-                    <NavigationViewItem.Icon><FontIcon Glyph="&#xE7EF;" /></NavigationViewItem.Icon>
+                <NavigationViewItemHeader Content="Admin" AutomationProperties.Name="Admin" />
+                <NavigationViewItem Content="Sign-in" Tag="SignIn" AutomationProperties.AutomationId="NavSignIn" AutomationProperties.Name="Sign-in">
+                    <NavigationViewItem.Icon><FontIcon Glyph="&#xE77B;" /></NavigationViewItem.Icon>
+                </NavigationViewItem>
+                <NavigationViewItem Content="Policy" Tag="Policy" AutomationProperties.AutomationId="NavPolicy" AutomationProperties.Name="Policy">
+                    <NavigationViewItem.Icon><FontIcon Glyph="&#xE72E;" /></NavigationViewItem.Icon>
+                </NavigationViewItem>
+                <NavigationViewItem Content="Live sessions" Tag="Sessions" AutomationProperties.AutomationId="NavSessions" AutomationProperties.Name="Live sessions">
+                    <NavigationViewItem.Icon><FontIcon Glyph="&#xE7F4;" /></NavigationViewItem.Icon>
+                </NavigationViewItem>
+                <NavigationViewItem Content="Audit log" Tag="Audit" AutomationProperties.AutomationId="NavAudit" AutomationProperties.Name="Audit log">
+                    <NavigationViewItem.Icon><FontIcon Glyph="&#xE9D9;" /></NavigationViewItem.Icon>
+                </NavigationViewItem>
+                <NavigationViewItem Content="Metrics" Tag="Metrics" AutomationProperties.AutomationId="NavMetrics" AutomationProperties.Name="Metrics">
+                    <NavigationViewItem.Icon><FontIcon Glyph="&#xE9D2;" /></NavigationViewItem.Icon>
                 </NavigationViewItem>
             </NavigationView.MenuItems>
             <Frame x:Name="ContentFrame" AutomationProperties.AutomationId="ContentFrame" />

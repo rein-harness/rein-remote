@@ -18,7 +18,7 @@ public class AppTests
         try
         {
             Env.Until(() => app.Window.Title.Contains("Not sharing"), "the app connected (its title says Not sharing)", 60);
-            foreach (var (nav, title) in new[] { ("NavSharing", "Sharing"), ("NavViewers", "Viewers"), ("NavDevices", "Paired devices"), ("NavSettings", "Settings"), ("NavAdmin", "Admin") })
+            foreach (var (nav, title) in new[] { ("NavSharing", "Sharing"), ("NavViewers", "Viewers"), ("NavDevices", "Paired devices"), ("NavSettings", "Settings"), ("NavSignIn", "Sign-in"), ("NavPolicy", "Policy"), ("NavSessions", "Live sessions"), ("NavAudit", "Audit log"), ("NavMetrics", "Metrics") })
             {
                 app.Page(nav, title);
                 app.Shot(title.ToLowerInvariant().Replace(' ', '-'));

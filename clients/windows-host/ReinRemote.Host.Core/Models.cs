@@ -45,6 +45,7 @@ public sealed class Link
     [JsonPropertyName("url")] public string Url { get; set; } = "";
     [JsonPropertyName("qr")] public string? Qr { get; set; }
 
+    [JsonIgnore] public string CopyName => $"Copy the link for {Label}";
     public override string ToString() => $"{Label}: {Url}";
 }
 
@@ -151,6 +152,7 @@ public sealed class Viewer
     [JsonPropertyName("ends_at")] public DateTimeOffset? EndsAt { get; set; }
 
     [JsonIgnore] public string Name => string.IsNullOrEmpty(Device) ? User ?? Id : Device!;
+    [JsonIgnore] public string KickName => $"Kick {Name}";
     [JsonIgnore] public string Who => $"{User} · via {Via} · {Transport} · {Addr}";
     [JsonIgnore] public string Stats => Format.ViewerStats(this);
     [JsonIgnore] public string Policy =>
@@ -178,6 +180,7 @@ public sealed class Device
     [JsonPropertyName("since")] public DateTimeOffset? Since { get; set; }
 
     [JsonIgnore] public string SinceText => Since is DateTimeOffset s ? $"paired {s.ToLocalTime():g}" : "";
+    [JsonIgnore] public string UnpairName => $"Unpair {Name}";
     public override string ToString() => $"{Name} ({Id})";
 }
 

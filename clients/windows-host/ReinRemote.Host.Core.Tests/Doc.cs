@@ -10,7 +10,8 @@ static class Doc
 {
     static readonly Lazy<List<string>> blocks = new(() =>
     {
-        var text = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "control-api.md"));
+        // (A Windows checkout may have CRLF line ends.)
+        var text = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "control-api.md")).Replace("\r\n", "\n");
         return Regex.Matches(text, "```json\n(.*?)```", RegexOptions.Singleline)
             // The audit page's example elides an entry's other keys with "…".
             .Select(m => m.Groups[1].Value.Replace(", …}", "}"))
