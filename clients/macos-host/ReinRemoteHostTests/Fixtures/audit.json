@@ -1,0 +1,8 @@
+{
+  "path": "/Users/me/.rein-remote/audit.jsonl",
+  "entries": [
+    {"ts": "2026-10-13T09:35:12.004Z", "event": "session_end", "session": "5f1c2a9b0e7d4c31", "user": "alice@corp.example", "via": "oidc", "reason": "kicked", "seconds": 250.1},
+    {"ts": "2026-10-13T09:31:02.481Z", "event": "session_start", "session": "5f1c2a9b0e7d4c31", "user": "alice@corp.example"}
+  ],
+  "next": "1841"
+}

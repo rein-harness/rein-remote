@@ -1,0 +1,9 @@
+{
+  "settings": {
+    "prefer": "quality", "fps": 60, "bitrate": 20000, "codec": "auto", "audio": false, "listen": "127.0.0.1:0",
+    "mdns": false, "pair": true, "relay": [], "relay-secret-set": false, "webtransport": true, "tailscale-cert": true,
+    "record": "/Users/me/recordings", "audit": "off"
+  },
+  "sharing": true, "source": "display:1", "path": "/Users/me/.rein-remote/host.toml", "overridden": [],
+  "restart_needed": true, "applied": "on_restart"
+}

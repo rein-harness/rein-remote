@@ -1,0 +1,99 @@
+# Rein Remote for macOS: the menu-bar app on `rein-remote host` (docs/control-api.md). Generate the
+# Xcode project with `xcodegen` (it isn't checked in), after building the server:
+#   cargo build --release -p rr-server && cd clients/macos-host && xcodegen
+# See docs/verification/macos-host-app.md.
+name: ReinRemoteHost
+options:
+  bundleIdPrefix: dev.reinharness
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    # Signed to run on this Mac (ad hoc). For a release, pass CODE_SIGN_IDENTITY="Developer ID
+    # Application: …" DEVELOPMENT_TEAM=… ENABLE_HARDENED_RUNTIME=YES to xcodebuild.
+    CODE_SIGN_IDENTITY: "-"
+    CODE_SIGN_STYLE: Manual
+    DEVELOPMENT_TEAM: ""
+    ENABLE_HARDENED_RUNTIME: NO
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+targets:
+  ReinRemoteHost:
+    type: application
+    platform: macOS
+    sources: [ReinRemoteHost]
+    dependencies:
+      - sdk: ServiceManagement.framework
+      - sdk: CoreImage.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.reinharness.remote.host
+        PRODUCT_NAME: Rein Remote
+        PRODUCT_MODULE_NAME: ReinRemoteHost
+        INFOPLIST_FILE: ReinRemoteHost/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        MARKETING_VERSION: "0.1.1"
+        CURRENT_PROJECT_VERSION: "1"
+        # Not sandboxed: it starts rein-remote and reads its home folder (~/.rein-remote).
+        ENABLE_APP_SANDBOX: NO
+        COMBINE_HIDPI_IMAGES: YES
+    info:
+      path: ReinRemoteHost/Info.plist
+      properties:
+        CFBundleDisplayName: Rein Remote
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSApplicationCategoryType: public.app-category.utilities
+        LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
+        # In the menu bar, no Dock icon; the window opens on demand.
+        LSUIElement: true
+        NSHumanReadableCopyright: MIT
+        # The control API is on 127.0.0.1.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+    postBuildScripts:
+      # The server in the app: Contents/MacOS/rein-remote, which the app starts as `rein-remote host`.
+      - name: Bundle rein-remote
+        script: sh "$SRCROOT/bundle-server.sh"
+        basedOnDependencyAnalysis: false
+  ReinRemoteHostTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: ReinRemoteHostTests
+        excludes: [Fixtures]
+      - path: ReinRemoteHostTests/Fixtures
+        type: folder
+        buildPhase: resources
+    dependencies:
+      - target: ReinRemoteHost
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.reinharness.remote.host.tests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/Rein Remote.app/Contents/MacOS/Rein Remote
+        BUNDLE_LOADER: $(TEST_HOST)
+  ReinRemoteHostUITests:
+    type: bundle.ui-testing
+    platform: macOS
+    sources: [ReinRemoteHostUITests]
+    dependencies:
+      - target: ReinRemoteHost
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.reinharness.remote.host.uitests
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_ENTITLEMENTS: ReinRemoteHostUITests/UITests.entitlements
+        TEST_TARGET_NAME: ReinRemoteHost
+schemes:
+  ReinRemoteHost:
+    build:
+      targets:
+        ReinRemoteHost: all
+        ReinRemoteHostTests: [test]
+        ReinRemoteHostUITests: [test]
+    test:
+      targets: [ReinRemoteHostTests, ReinRemoteHostUITests]
+      gatherCoverageData: false

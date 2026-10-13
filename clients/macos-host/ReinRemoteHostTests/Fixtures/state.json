@@ -1,0 +1,24 @@
+{
+  "api": 1,
+  "version": "0.1.1",
+  "pid": 41237,
+  "sharing": true,
+  "error": null,
+  "source": "display:1",
+  "listen": "0.0.0.0:7979",
+  "links": [
+    {"kind": "tailnet", "label": "your tailnet", "url": "https://box.tail1234.ts.net:7979/?token=k3…", "qr": "https://box.tail1234.ts.net:7979/?token=k3…"},
+    {"kind": "lan", "label": "this network", "url": "http://192.168.1.20:7979/?token=k3…", "qr": "http://192.168.1.20:7979/?token=k3…"},
+    {"kind": "local", "label": "this computer", "url": "http://localhost:7979/?token=k3…", "qr": "http://localhost:7979/?token=k3…"},
+    {"kind": "relay", "label": "through relay.example", "url": "https://relay.example/?room=…#k=…", "qr": "https://relay.example/?room=…#k=…"}
+  ],
+  "pairing": {
+    "enabled": true,
+    "code": "123-456",
+    "expires_at": "2026-10-13T09:40:00.000Z",
+    "url": "http://192.168.1.20:7979/#pair=123456&id=abcd-efgh-ijkl-mnop",
+    "qr": "http://192.168.1.20:7979/#pair=123456&id=abcd-efgh-ijkl-mnop"
+  },
+  "viewers": 1,
+  "restart_needed": false
+}

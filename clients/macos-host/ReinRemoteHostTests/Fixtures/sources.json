@@ -1,0 +1,16 @@
+{
+  "displays": [
+    {"id": "display:1", "name": "Display 1 (main)", "width": 3024, "height": 1964},
+    {"id": "display:2", "name": "Display 2", "width": 2560, "height": 1440}
+  ],
+  "windows": [
+    {"id": "window:4242", "app": "Safari", "title": "Apple", "width": 1440, "height": 900}
+  ],
+  "apps": [
+    {"id": "app:Safari", "name": "Safari", "windows": 2}
+  ],
+  "other": [
+    {"id": "test-pattern", "name": "Test pattern"}
+  ],
+  "error": null
+}

@@ -33,6 +33,7 @@ Early: the design is done and being built one verified piece at a time
 | Client: Windows / macOS / Linux (`rein-remote-viewer`, Rust) | working on this Mac: VideoToolbox decoded straight into the window (no copy), 9 / 12 ms glass to glass p50 / p95 at 60 fps, ~10% of one core; mouse, keys and text, the remote pointer, a picker of machines on the network, pairing; Windows and Linux on CI runners in software (11 / 16 ms Windows); GPU decoders (Media Foundation, VA-API) and real gamepads still to verify ([manual test](docs/verification/desktop-client.md)) (phase 5) |
 | Client: iOS / iPadOS (`clients/ios`, Swift on the Rust core) | in the simulator: VideoToolbox H.264 and HEVC, 60 fps, 9 / 15 ms glass to glass over WebTransport datagrams, Opus in sync (15–22 ms), a UIKit tap as a click, pairing, Bonjour, real certificates; a real iPhone and iPad still to verify ([manual test](docs/verification/ios-client.md)) (phase 5) |
 | Client: Android (`clients/android`, Kotlin on the Rust core) | in the emulator: 59.6 fps, 13 / 29 ms glass to glass at 720p (the emulator's codec, decoding on the host), MediaCodec decode (H.264, HEVC), a tap seen as a click, pairing, WebTransport and the WebSocket, Opus decoded; keyboards, gamepads and the other gestures unit-tested; a real phone still to verify ([docs/verification/android-client.md](docs/verification/android-client.md)) (phase 5) |
+| Host app: macOS (`clients/macos-host`, SwiftUI) | working on a Mac and on CI: a menu-bar app on `rein-remote host` (the server inside it): sharing on and off, the source, links and QR codes, pairing, viewers and kicking, paired devices, settings, permissions, sign-in, policy, sessions, the audit log, metrics; UI tests against a real host; a real phone and the permission panes still to verify ([manual test](docs/verification/macos-host-app.md)) (phase 7) |
 | Transport: WebSocket | working, with keyframe-and-skip when the link backs up (phase 1) |
 | Transport: WebTransport (QUIC) | working: a stream per frame, self-signed certificate by hash, falls back to the WebSocket by itself (phase 4) |
 | Transport: relay (behind NAT, no open ports) | working: `rein-remote relay` (self-hosted), `serve --relay`, end-to-end sealed; NAT hole punching moves the session onto a direct QUIC path (behind two NATs in Docker: 0.5–1.2 s, round trip 97 → 45 ms; [real NATs](docs/verification/nat-hole-punching.md)) (phase 4) |
@@ -134,7 +135,8 @@ command line wins over the file. See [docs/verification/service-install.md](docs
 `rein-remote host` is the long-running process the platform apps drive: sharing on and off, the
 source switched live, viewers listed and ended, pairing, settings (`~/.rein-remote/host.toml`) and
 the admin pages, through a local HTTP + JSON control API with live events. The contract:
-[docs/control-api.md](docs/control-api.md).
+[docs/control-api.md](docs/control-api.md). On macOS, the menu-bar app on it is `clients/macos-host`
+([docs/verification/macos-host-app.md](docs/verification/macos-host-app.md)).
 
 ### Signed binaries
 

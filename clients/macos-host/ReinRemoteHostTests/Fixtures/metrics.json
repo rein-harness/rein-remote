@@ -1,0 +1,13 @@
+{
+  "version": "0.1.1",
+  "uptime_s": 3600,
+  "viewers": {"direct": 1, "relayed": 0},
+  "sessions_total": 12,
+  "frames_sent_total": 182344,
+  "keyframes_sent_total": 31,
+  "video_bytes_sent_total": 911203344,
+  "frames_skipped_total": 12,
+  "direct_offers_total": 2,
+  "direct_answers_total": 2,
+  "relays": [{"relay": "relay.example:443", "up": true, "rtt_ms": 12.5, "registered": true, "registrations": 3}]
+}

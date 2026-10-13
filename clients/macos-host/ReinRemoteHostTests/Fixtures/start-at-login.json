@@ -1,0 +1,2 @@
+{"enabled": true, "kind": "launchd", "name": "rein-remote-host",
+ "path": "/Users/me/Library/LaunchAgents/com.rein-harness.rein-remote-host.plist"}
