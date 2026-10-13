@@ -218,7 +218,10 @@ has been verified.
   the machine at load average 17–21, 720p at 240 still 170 fps at 13 ms. The top bitrate follows the
   picture (0.12 bits a pixel a frame: 8 Mbit/s at 720p60, ~240 at 4K240, up to 1 Gbit/s); an
   encoder that can't keep up gets a smaller picture, not fewer frames (a 4K source at 240 streams
-  at 1280×720, 60 fps, on this Mac). A GPU machine at 120–240 fps:
+  at 1280×720, 60 fps, on this Mac). Intra refresh: rolling rows on VA-API and
+  gradual intra refresh on Media Foundation where the hardware offers it (a band of the picture
+  intra each frame, all of it every half second); VideoToolbox and openh264 offer none and keep the
+  keyframe on a loss: [manual test](docs/verification/intra-refresh.md). A GPU machine at 120–240 fps:
   [manual test](docs/verification/high-refresh.md).
 
 ## Phase 5 — native clients

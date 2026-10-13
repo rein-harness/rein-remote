@@ -459,6 +459,7 @@ impl MediaFoundation {
                 }
             }
             let codec_api = mft.cast::<ICodecAPI>().ok();
+            let mut intra_refresh = false;
             let bps = kbps.saturating_mul(1000);
             // Real time, before the media types (some encoders read them only then).
             if let Some(api) = &codec_api {
@@ -473,6 +474,12 @@ impl MediaFoundation {
                         break;
                     }
                 }
+                // Gradual intra refresh where the encoder does it (some hardware ones): a band of the
+                // picture coded intra each frame, the whole of it every half second, so a frame
+                // lost on the way heals without waiting for a keyframe.
+                let wave = (fps_n / 2).max(1);
+                intra_refresh = api.IsSupported(&CODECAPI_AVEncVideoGradualIntraRefresh).is_ok()
+                    && set(&CODECAPI_AVEncVideoGradualIntraRefresh, VARIANT::from(wave)).is_ok();
             }
             let size = ((width as u64) << 32) | height as u64;
             let rate = ((fps_n as u64) << 32) | 1;
@@ -524,7 +531,7 @@ impl MediaFoundation {
                 activate: c.activate.clone(),
                 events,
                 codec_api,
-                name: describe(&c.name, &c.vendor, c.hardware),
+                name: describe(&c.name, &c.vendor, c.hardware) + if intra_refresh { ", intra refresh" } else { "" },
                 hardware: c.hardware,
                 width,
                 height,

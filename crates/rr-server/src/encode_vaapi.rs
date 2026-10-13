@@ -43,6 +43,8 @@ mod ffi {
     pub const VA_CONFIG_ATTRIB_RATE_CONTROL: i32 = 5;
     pub const VA_CONFIG_ATTRIB_ENC_PACKED_HEADERS: i32 = 10;
     pub const VA_CONFIG_ATTRIB_ENC_MAX_REF_FRAMES: i32 = 13;
+    pub const VA_CONFIG_ATTRIB_ENC_INTRA_REFRESH: i32 = 23;
+    pub const VA_ENC_INTRA_REFRESH_ROLLING_ROW: u32 = 0x2;
     pub const VA_ATTRIB_NOT_SUPPORTED: u32 = 0x8000_0000;
 
     pub const VA_RT_FORMAT_YUV420: u32 = 0x1;
@@ -68,6 +70,7 @@ mod ffi {
     pub const VA_ENC_MISC_FRAME_RATE: u32 = 0;
     pub const VA_ENC_MISC_RATE_CONTROL: u32 = 1;
     pub const VA_ENC_MISC_HRD: u32 = 5;
+    pub const VA_ENC_MISC_RIR: u32 = 7;
     pub const VA_ENC_PACKED_HEADER_TYPE_SEQUENCE: u32 = 1;
     pub const VA_ENC_PACKED_HEADER_TYPE_SLICE: u32 = 3;
 
@@ -320,6 +323,19 @@ mod ffi {
     pub struct VAEncMiscParameterFrameRate {
         pub framerate: u32,
         pub framerate_flags: u32,
+        pub va_reserved: [u32; 4],
+    }
+
+    /// Rolling intra refresh: `intra_insert_size` rows (or columns) of macroblocks from
+    /// `intra_insertion_location` are coded intra in this frame.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct VAEncMiscParameterRIR {
+        /// Bit 0: columns, bit 1: rows.
+        pub rir_flags: u32,
+        pub intra_insertion_location: u16,
+        pub intra_insert_size: u16,
+        pub qp_delta_for_inserted_intra: u8,
         pub va_reserved: [u32; 4],
     }
 
@@ -750,6 +766,10 @@ pub struct Vaapi {
     keyframe_next: bool,
     /// Frames since the IDR (frame_num, and the picture order count, count from it).
     since_idr: u32,
+    /// Rolling intra refresh, when the driver does it: rows of macroblocks coded intra each P-frame,
+    /// a band moving down the picture, so a frame lost on the way is healed within half a second
+    /// whether or not a keyframe comes.
+    intra_refresh: bool,
     idr_pic_id: u16,
     /// Which recon surface this frame writes (the other holds the frame it refers to).
     cur: usize,
@@ -823,6 +843,7 @@ impl Vaapi {
             // Our SPS and PPS where it takes them (so the stream says what we mean), and our slice headers
             // where it takes those (ffmpeg does the same; drivers that want them get them).
             let packed = attr(VA_CONFIG_ATTRIB_ENC_PACKED_HEADERS).unwrap_or(0) & (VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_SLICE);
+            let rir = attr(VA_CONFIG_ATTRIB_ENC_INTRA_REFRESH).is_some_and(|v| v & VA_ENC_INTRA_REFRESH_ROLLING_ROW != 0);
             let params = Params {
                 profile,
                 level_idc: h264::level(width, height, fps, kbps),
@@ -845,13 +866,22 @@ impl Vaapi {
                     value: packed,
                 });
             }
+            if rir {
+                attribs.push(VAConfigAttrib {
+                    type_: VA_CONFIG_ATTRIB_ENC_INTRA_REFRESH,
+                    value: VA_ENC_INTRA_REFRESH_ROLLING_ROW,
+                });
+            }
             let mut config = VA_INVALID_ID;
             let s = unsafe { (d.va.vaCreateConfig)(d.dpy, va_profile, entrypoint, attribs.as_mut_ptr(), attribs.len() as i32, &mut config) };
             if s != VA_STATUS_SUCCESS {
                 tried.push(format!("{}: {}", what(entrypoint, profile), err_str(d.va, s)));
                 continue;
             }
-            return Self::with_config(d, config, entrypoint, params, packed, rate_control, fps, kbps);
+            return Self::with_config(d, config, entrypoint, params, packed, rate_control, fps, kbps).map(|mut e| {
+                e.intra_refresh = rir;
+                e
+            });
         }
         Err(format!(
             "{} has no H.264 encoder{}",
@@ -893,6 +923,7 @@ impl Vaapi {
             kbps_changed: false,
             keyframe_next: true,
             since_idr: 0,
+            intra_refresh: false,
             idr_pic_id: 0,
             cur: 0,
             zero_copy_seen: false,
@@ -1270,6 +1301,22 @@ impl Vaapi {
                 let headers = [p.sps(), p.pps()].concat();
                 self.packed_header(&mut bufs, VA_ENC_PACKED_HEADER_TYPE_SEQUENCE, &headers, headers.len() * 8)?;
             }
+            if self.intra_refresh && !idr {
+                let (location, size) = rir_band(p.height_mbs() as u32, self.fps, self.since_idr);
+                bufs.push(d.buffer(
+                    ctx,
+                    VA_ENC_MISC_PARAMETER_BUFFER,
+                    &VAEncMiscParameter {
+                        type_: VA_ENC_MISC_RIR,
+                        data: VAEncMiscParameterRIR {
+                            rir_flags: VA_ENC_INTRA_REFRESH_ROLLING_ROW,
+                            intra_insertion_location: location,
+                            intra_insert_size: size,
+                            ..Default::default()
+                        },
+                    },
+                )?);
+            }
             bufs.push(d.buffer(ctx, VA_ENC_PICTURE_PARAMETER_BUFFER, &self.picture_params(idr))?);
             if self.packed & VA_ENC_PACKED_HEADER_SLICE != 0 {
                 let (header, bits) = p.slice_header(idr, self.since_idr, self.idr_pic_id as u32);
@@ -1461,11 +1508,12 @@ pub fn fourcc_str(f: u32) -> String {
 impl VideoEncoder for Vaapi {
     fn name(&self) -> String {
         format!(
-            "H.264 in hardware (VA-API: {}, {:?}{}, {})",
+            "H.264 in hardware (VA-API: {}, {:?}{}, {}{})",
             self.d.vendor,
             self.params.profile,
             if self.entrypoint == VA_ENTRYPOINT_ENC_SLICE_LP { ", low power" } else { "" },
-            if self.rate_control == VA_RC_CBR { "CBR" } else { "VBR" }
+            if self.rate_control == VA_RC_CBR { "CBR" } else { "VBR" },
+            if self.intra_refresh { ", intra refresh" } else { "" }
         )
     }
     fn hardware(&self) -> bool {
@@ -1523,10 +1571,38 @@ impl Drop for Vaapi {
     }
 }
 
+/// Rolling intra refresh's band for the P-frame `since_idr` frames after the IDR: where it starts
+/// and how many macroblock rows, so the whole picture (`rows` high) is refreshed every half second.
+fn rir_band(rows: u32, fps: u32, since_idr: u32) -> (u16, u16) {
+    let period = (fps / 2).clamp(1, rows.max(1));
+    let size = rows.div_ceil(period).max(1);
+    let location = (since_idr.saturating_sub(1) % period) * size;
+    (location.min(rows.saturating_sub(1)) as u16, size as u16)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::mem::{offset_of, size_of};
+
+    #[test]
+    fn the_intra_refresh_band_covers_the_picture_every_half_second() {
+        // 720p: 45 rows of macroblocks; at 60 fps, a wave of 30 frames, 2 rows a frame.
+        let rows = 45;
+        let mut covered = vec![false; rows as usize];
+        for f in 1..=30 {
+            let (at, size) = rir_band(rows, 60, f);
+            assert_eq!(size, 2);
+            for r in at..(at + size).min(rows as u16) {
+                covered[r as usize] = true;
+            }
+        }
+        assert!(covered.iter().all(|c| *c), "{covered:?}");
+        // And again from the top.
+        assert_eq!(rir_band(rows, 60, 31).0, 0);
+        // A short picture at a high rate: a row a frame, never past the bottom.
+        assert_eq!(rir_band(9, 240, 50), (((50 - 1) % 9) as u16, 1));
+    }
 
     /// Sizes and offsets from libva 2.20's headers (gcc, LP64: the same on x86-64 and arm64), so a
     /// field out of place fails here, not in a driver.
@@ -1540,6 +1616,12 @@ mod tests {
         assert_eq!(size_of::<VAEncMiscParameterRateControl>(), 60);
         assert_eq!(size_of::<VAEncMiscParameterFrameRate>(), 24);
         assert_eq!(size_of::<VAEncMiscParameterHRD>(), 24);
+        // libva 2.17's va.h (VA_VERSION 1.17): sizeof 28; location at 4, size at 6, qp delta at 8.
+        assert_eq!(size_of::<VAEncMiscParameterRIR>(), 28);
+        assert_eq!(offset_of!(VAEncMiscParameterRIR, intra_insertion_location), 4);
+        assert_eq!(offset_of!(VAEncMiscParameterRIR, intra_insert_size), 6);
+        assert_eq!(offset_of!(VAEncMiscParameterRIR, qp_delta_for_inserted_intra), 8);
+        assert_eq!(offset_of!(VAEncMiscParameterRIR, va_reserved), 12);
         assert_eq!(size_of::<VAEncMiscParameter<VAEncMiscParameterRateControl>>(), 4 + 60);
         assert_eq!(offset_of!(VAEncMiscParameter<VAEncMiscParameterHRD>, data), 4);
         assert_eq!(size_of::<VAEncPackedHeaderParameterBuffer>(), 28);
