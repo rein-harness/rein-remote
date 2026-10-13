@@ -101,4 +101,4 @@ Check (@(Arp).Count -eq 0) 'no Add/Remove Programs entry'
 Check (-not (Test-Path "$hive\Software\Rein Harness\Rein Remote")) 'no registry left'
 Check (-not (Select-String -Path "$logs\uninstall.log" -Pattern 'REBOOTREQUIRED|ScheduleReboot|files in use' -Quiet)) 'no reboot needed'
 Remove-Item Env:\REIN_REMOTE_HOME
-Write-Host "== $Scope: passed"
+Write-Host "== ${Scope}: passed"

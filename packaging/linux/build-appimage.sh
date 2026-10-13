@@ -13,6 +13,7 @@
 set -eu
 root=$(cd "$(dirname "$0")/../.." && pwd)
 out=${1:-$root/target/appimage}
+mkdir -p "$out" && out=$(cd "$out" && pwd)
 target=${TARGET_DIR:-$root/target/release}
 GTK_PREFIX=${GTK_PREFIX:-/opt/rr-gtk}
 version=${VERSION:-$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml" | head -1)}
@@ -85,6 +86,9 @@ rm -f "$output"
 # The loaders' cache, written now that they're deployed, with bare names.
 GDK_PIXBUF_MODULEDIR="$app/usr/lib" gdk-pixbuf-query-loaders $(ls "$app"/usr/lib/libpixbufloader*.so 2>/dev/null) |
   sed "s|$app/usr/lib/||g" > "$app/usr/lib/gdk-pixbuf-loaders.cache"
+# libwayland-client and -cursor are on the exclude list (the system's is expected), but this GTK was
+# built against wayland 1.23 and 22.04 has 1.20: ours, beside the rest (RUNPATH $ORIGIN finds them).
+for l in libwayland-client.so.0 libwayland-cursor.so.0; do cp -L "$GTK_PREFIX/lib/$l" "$app/usr/lib/$l"; done
 echo "== bundled libraries"; ls "$app/usr/lib"
 (cd "$work" && OUTPUT=$output LINUXDEPLOY_OUTPUT_VERSION=$version NO_STRIP=1 \
   "$linuxdeploy" --appimage-extract-and-run --appdir "$app" --output appimage)
