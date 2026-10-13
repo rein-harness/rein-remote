@@ -43,6 +43,28 @@ Early: the design is done and being built one verified piece at a time
 | Host app: Windows (`clients/windows-host`, WinUI 3) | on CI runners: a tray icon and a window on `rein-remote host`'s control API (sharing, the source, links with QR codes, pairing, viewers and kicks, paired devices, settings, sign-in, policy, sessions, the audit log, metrics), driven through UI Automation against a real host, light and dark ([screenshots](docs/verification/windows-host-app/)); a real PC with a phone still to verify ([manual test](docs/verification/windows-host-app.md)) (phase 7) |
 | Host app: Linux (`crates/rr-host-gtk`, GTK4 and libadwaita, a tray icon) | on a CI runner: the app driven through AT-SPI on Xvfb against the real `rein-remote host` it starts: sharing on and off, the source switched, a new pairing code, a viewer kicked (asked first) and the kick in the audit log, a setting saved to `host.toml`, a bad policy refused with the parser's message, the tray's D-Bus menu, the host killed and found again; a real GNOME and KDE desktop and a phone still to verify ([manual test](docs/verification/linux-host-app.md)) (phase 7) |
 
+## Install
+
+The host app (a tray or menu-bar icon and a window to share this screen, pair devices and see who's
+watching) and `rein-remote` itself, from a [release](https://github.com/rein-harness/rein-remote/releases):
+
+| | File | |
+|---|---|---|
+| Windows 10 1809+ / 11 | `rein-remote-VERSION-x64.msi` | Installs for you alone, no administrator needed (`%LOCALAPPDATA%\Programs\Rein Remote`), and starts in the tray when you sign in. For every user: `msiexec /i rein-remote-VERSION-x64.msi ALLUSERS=1` (Program Files). Without the sign-in item: `STARTATLOGIN=0`. |
+| Ubuntu 24.04+, Debian 13 | `rein-remote_VERSION_amd64.deb` | `sudo apt install ./rein-remote_VERSION_amd64.deb`, then *Rein Remote* in the menu. |
+| Ubuntu 22.04+, other Linux | `rein-remote-VERSION-x86_64.AppImage` | `chmod +x` it and run it (FUSE 2: `libfuse2`). |
+| macOS 14+ | `rein-remote-VERSION-macos-universal.dmg` | Drag *Rein Remote* to Applications. `rein-remote` is in the app (`Contents/MacOS/rein-remote`). |
+
+On Linux and macOS, starting at login is a switch in the app's Settings. Uninstalling: Settings →
+Apps (Windows), `sudo apt remove rein-remote`, or delete the AppImage or the app; your settings and
+pairings (`~/.rein-remote`, `%APPDATA%\rein-remote`) are kept. Builds from a release are signed
+when the project has the certificates ([signing.md](docs/verification/signing.md)); what Windows
+SmartScreen and macOS Gatekeeper say otherwise, and how each installer was tested:
+[docs/verification/installers.md](docs/verification/installers.md).
+
+Just the command-line binary: the `.tar.gz` / `.zip` archives in the same release, or
+`npx rein-remote` (npm).
+
 ## Try it
 
 ```sh

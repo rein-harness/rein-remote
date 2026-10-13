@@ -1,0 +1,85 @@
+<!--
+  Rein Remote for Windows: the host app (clients/windows-host, WinUI 3, self-contained) and
+  rein-remote.exe beside it, as one .msi (WiX v5). Built by packaging/windows/build.ps1:
+
+    wix build -arch x64 -ext WixToolset.Util.wixext -d AppDir=<published app> -d Version=0.1.1 rein-remote.wxs
+
+  - Per user by default, no administrator needed: %LOCALAPPDATA%\Programs\Rein Remote (a
+    dual-purpose package: ProgramFiles64Folder is redirected there). For every user of the PC,
+    elevated: msiexec /i rein-remote.msi ALLUSERS=1, into C:\Program Files\Rein Remote.
+  - A Start menu shortcut.
+  - The app at sign-in, in the tray without its window (ReinRemoteHost.exe background): a Run key
+    (HKCU per user, HKLM for ALLUSERS=1). STARTATLOGIN=0 leaves it out. This is the app; the
+    app's own Settings → "Start at login" is the host's scheduled task (rein-remote host,
+    docs/control-api.md), which the uninstaller removes too.
+  - Uninstall: the running app and its host (from this folder only) are stopped first, so nothing is
+    left for a reboot; the host's scheduled task is removed. Settings and pairings in
+    %APPDATA%\rein-remote are the user's and stay.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package Name="Rein Remote" Manufacturer="Rein Harness" Version="$(Version)"
+           UpgradeCode="718FA69D-07ED-42B6-99FF-5B5BB9CA9AB1" Scope="perUserOrMachine" Language="1033">
+    <SummaryInformation Description="Rein Remote: share this PC's screen" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Rein Remote is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Icon Id="ReinRemote.ico" SourceFile="$(AppDir)\Assets\rein-remote.ico" />
+    <Property Id="ARPPRODUCTICON" Value="ReinRemote.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/rein-harness/rein-remote" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/rein-harness/rein-remote/blob/main/docs/verification/installers.md" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+    <!-- 1: the app starts in the tray at sign-in (the default); 0: it doesn't. -->
+    <Property Id="STARTATLOGIN" Value="1" Secure="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Rein Remote" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="App" Directory="INSTALLFOLDER">
+      <!-- Everything `dotnet publish -\-self-contained` made, rein-remote.exe among it. -->
+      <Files Include="$(AppDir)\**" />
+    </ComponentGroup>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="StartMenuShortcut">
+        <Shortcut Id="AppShortcut" Name="Rein Remote" Description="Share this PC's screen"
+                  Target="[INSTALLFOLDER]ReinRemoteHost.exe" WorkingDirectory="INSTALLFOLDER" Icon="ReinRemote.ico" />
+        <RegistryValue Root="HKMU" Key="Software\Rein Harness\Rein Remote" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <!-- HKMU: HKCU for a per-user install, HKLM for ALLUSERS=1. -->
+    <Component Id="RunAtLogin" Directory="INSTALLFOLDER" Condition="STARTATLOGIN = &quot;1&quot;">
+      <RegistryValue Root="HKMU" Key="Software\Microsoft\Windows\CurrentVersion\Run" Name="Rein Remote"
+                     Type="string" Value="&quot;[INSTALLFOLDER]ReinRemoteHost.exe&quot; --background" KeyPath="yes" />
+    </Component>
+
+    <Component Id="InstallFolderRecord" Directory="INSTALLFOLDER">
+      <RegistryValue Root="HKMU" Key="Software\Rein Harness\Rein Remote" Name="InstallFolder" Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
+    </Component>
+
+    <Feature Id="Main" Title="Rein Remote" Level="1">
+      <ComponentGroupRef Id="App" />
+      <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="RunAtLogin" />
+      <ComponentRef Id="InstallFolderRecord" />
+    </Feature>
+
+    <!-- Before files are removed (uninstall, and the old version's removal in an upgrade): the app and
+         a host running from this folder are stopped, so no file is in use. (No braces in it: MSI's
+         formatting would take a {...} with a [property] inside as a conditional group.) -->
+    <SetProperty Id="StopApp" Sequence="execute" Before="StopApp"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command &quot;Get-Process ReinRemoteHost,rein-remote -ErrorAction SilentlyContinue | Where-Object Path -like '[INSTALLFOLDER]*' | Stop-Process -Force -ErrorAction SilentlyContinue&quot;" />
+    <CustomAction Id="StopApp" BinaryRef="Wix4UtilCA_X64" DllEntry="WixQuietExec" Execute="deferred" Return="ignore" Impersonate="yes" />
+    <!-- Uninstall only: the host's scheduled task (Settings → Start at login), which runs this folder's
+         rein-remote.exe. Nothing to do when it isn't there. -->
+    <SetProperty Id="RemoveHostTask" Sequence="execute" Before="RemoveHostTask"
+                 Value="&quot;[INSTALLFOLDER]rein-remote.exe&quot; uninstall-service host" />
+    <CustomAction Id="RemoveHostTask" BinaryRef="Wix4UtilCA_X64" DllEntry="WixQuietExec" Execute="deferred" Return="ignore" Impersonate="yes" />
+    <InstallExecuteSequence>
+      <Custom Action="StopApp" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="RemoveHostTask" After="StopApp" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

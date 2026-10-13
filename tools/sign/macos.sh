@@ -3,6 +3,10 @@
 #
 #   tools/sign/macos.sh FILE...
 #
+# A FILE may also be an .app (the executables in Contents/MacOS and Contents/Helpers signed first, as
+# com.rein-harness.NAME, then the bundle, with its own identifier) or a .dmg; these are notarized
+# each on its own and the ticket stapled to them (packaging/macos/build-dmg.sh: the app, then the dmg).
+#
 # With a Developer ID (release.yml, from the repository's secrets):
 #   MACOS_CERTIFICATE           base64 of a .p12: the "Developer ID Application" certificate and its key
 #   MACOS_CERTIFICATE_PASSWORD  the .p12's password
@@ -37,22 +41,36 @@ if [ -n "${MACOS_CERTIFICATE:-}" ]; then
   identity=${MACOS_SIGN_IDENTITY:-$(security find-identity -v -p codesigning "$kc" | awk -F'"' '/Developer ID Application/ {print $2; exit}')}
   [ -n "$identity" ] || { echo "no Developer ID Application identity in MACOS_CERTIFICATE" >&2; exit 1; }
   echo "signing with: $identity"
-  for f in "$@"; do codesign --force --options runtime --timestamp --identifier "com.rein-harness.$(basename "$f" .exe)" --sign "$identity" "$f"; done
+  ts=--timestamp
 else
   echo "no MACOS_CERTIFICATE: ad-hoc signature (runs here; Gatekeeper still treats it as unsigned elsewhere)"
-  for f in "$@"; do codesign --force --options runtime --timestamp=none --identifier "com.rein-harness.$(basename "$f")" --sign - "$f"; done
+  identity=-
+  ts=--timestamp=none
 fi
 
 for f in "$@"; do
-  codesign --verify --strict --verbose=2 "$f"
+  case "$f" in
+    *.app|*.app/)
+      main=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$f/Contents/Info.plist")
+      for inner in "$f"/Contents/MacOS/* "$f"/Contents/Helpers/*; do
+        [ -f "$inner" ] && [ "$(basename "$inner")" != "$main" ] || continue
+        codesign --force --options runtime $ts --identifier "com.rein-harness.$(basename "$inner")" --sign "$identity" "$inner"
+      done
+      codesign --force --options runtime $ts --sign "$identity" "$f"
+      codesign --verify --strict --deep --verbose=2 "$f" ;;
+    *.dmg)
+      codesign --force $ts --identifier "com.rein-harness.$(basename "$f" .dmg)" --sign "$identity" "$f"
+      codesign --verify --strict --verbose=2 "$f" ;;
+    *)
+      codesign --force --options runtime $ts --identifier "com.rein-harness.$(basename "$f" .exe)" --sign "$identity" "$f"
+      codesign --verify --strict --verbose=2 "$f" ;;
+  esac
   codesign --display --verbose=2 "$f" 2>&1 | grep -E '^(Identifier|Format|CodeDirectory|Signature|Authority|TeamIdentifier|Timestamp|Runtime)' || true
 done
 
-if [ -n "${MACOS_CERTIFICATE:-}" ] && [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ] && [ -n "${APPLE_APP_PASSWORD:-}" ]; then
-  mkdir "$tmp/notarize"
-  cp "$@" "$tmp/notarize/"
-  ditto -c -k --keepParent "$tmp/notarize" "$tmp/notarize.zip"
-  xcrun notarytool submit "$tmp/notarize.zip" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+# notarize FILE: submits it (a .zip or .dmg), waits, fails unless Accepted.
+notarize() {
+  xcrun notarytool submit "$1" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
     --password "$APPLE_APP_PASSWORD" --wait --timeout 30m --output-format json > "$tmp/notary.json"
   cat "$tmp/notary.json"; echo
   id=$(plutil -extract id raw -o - "$tmp/notary.json" 2>/dev/null || sed -n 's/.*"id":"\([^"]*\)".*/\1/p' "$tmp/notary.json")
@@ -61,7 +79,30 @@ if [ -n "${MACOS_CERTIFICATE:-}" ] && [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_TE
     echo "notarization was not accepted" >&2
     exit 1
   fi
-  echo "notarized ($id); bare executables aren't stapled (Gatekeeper checks the ticket online)"
+  echo "notarized: $1 ($id)"
+}
+
+if [ -n "${MACOS_CERTIFICATE:-}" ] && [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ] && [ -n "${APPLE_APP_PASSWORD:-}" ]; then
+  mkdir "$tmp/notarize"
+  bare=0
+  for f in "$@"; do
+    case "$f" in
+      *.app|*.app/)
+        rm -f "$tmp/app.zip"
+        ditto -c -k --keepParent "$f" "$tmp/app.zip"
+        notarize "$tmp/app.zip"
+        xcrun stapler staple "$f" ;;
+      *.dmg)
+        notarize "$f"
+        xcrun stapler staple "$f" ;;
+      *) cp "$f" "$tmp/notarize/"; bare=1 ;;
+    esac
+  done
+  if [ "$bare" = 1 ]; then
+    ditto -c -k --keepParent "$tmp/notarize" "$tmp/notarize.zip"
+    notarize "$tmp/notarize.zip"
+    echo "bare executables aren't stapled (Gatekeeper checks the ticket online)"
+  fi
 elif [ -n "${MACOS_CERTIFICATE:-}" ]; then
   echo "no APPLE_ID / APPLE_TEAM_ID / APPLE_APP_PASSWORD: signed, not notarized"
 fi
