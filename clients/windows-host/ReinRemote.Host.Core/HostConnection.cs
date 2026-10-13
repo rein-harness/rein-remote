@@ -103,13 +103,17 @@ public sealed class HostConnection : IAsyncDisposable
                 if (!wasConnected)
                     SetStatus(Status == LinkStatus.Disconnected ? LinkStatus.Disconnected : LinkStatus.Connecting, StatusMessage);
                 var (client, state, why) = await Find(ct).ConfigureAwait(false);
+                var launched = false;
                 if (client is null && Launcher is not null && Launcher.Child is null && DateTimeOffset.UtcNow - lastLaunch > TimeSpan.FromSeconds(10))
                 {
                     (client, state, why) = await LaunchAndFind(ct).ConfigureAwait(false);
+                    launched = true;
                 }
                 if (client is null)
                 {
-                    SetStatus(LinkStatus.Disconnected, wasConnected ? "Lost the connection to rein-remote host. Reconnecting…" : why);
+                    // Why a start failed says more than "reconnecting"; it stays until the next attempt says otherwise.
+                    if (launched || !wasConnected || Status != LinkStatus.Disconnected || StatusMessage is null)
+                        SetStatus(LinkStatus.Disconnected, wasConnected && !launched ? "Lost the connection to rein-remote host. Reconnecting…" : why);
                     await Task.Delay(retry, ct).ConfigureAwait(false);
                     continue;
                 }
