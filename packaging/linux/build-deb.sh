@@ -43,7 +43,7 @@ install -d "$pkg/usr/share/doc/rein-remote"
 mkdir -p "$work/debian"
 echo "Source: rein-remote" > "$work/debian/control"
 shlibs=$(cd "$work" && dpkg-shlibdeps -O "$pkg/usr/bin/rein-remote" "$pkg/usr/bin/rein-remote-host-gtk" 2>/dev/null |
-  sed -n 's/^shlibs:Depends=//p')
+  sed -n 's/^shlibs:Depends=//p' | tr ',' '\n' | sed 's/^ *//' | grep -Ev '^(libgtk-4-1|libadwaita-1-0) ' | paste -sd, - | sed 's/,/, /g')
 depends="$shlibs, libgtk-4-1 (>= 4.14), libadwaita-1-0 (>= 1.5)"
 
 mkdir -p "$pkg/DEBIAN"
