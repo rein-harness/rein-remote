@@ -73,8 +73,7 @@ pub struct Ctx {
 }
 
 impl Ctx {
-    /// Calls the host off the main thread; `done` gets the answer on it. Errors are shown as a
-    /// toast too, unless `done` says it showed them (returns true).
+    /// Calls the host off the main thread; `done` gets the answer (or the error, to show) on it.
     pub fn call<T: Send + 'static>(
         self: &Rc<Self>,
         f: impl FnOnce(&Client) -> ApiResult<T> + Send + 'static,

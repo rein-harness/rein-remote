@@ -268,8 +268,7 @@ impl Client {
     }
 }
 
-/// The changes between two sets of values, as a PUT body: a key whose value differs, `null` for one
-/// cleared ("" where the setting was something).
+/// The keys of `after` whose values differ from `before`'s: a PUT's body.
 pub fn changes(before: &Map<String, Value>, after: &Map<String, Value>) -> Map<String, Value> {
     after
         .iter()

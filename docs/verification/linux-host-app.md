@@ -24,7 +24,10 @@ frame rate's message; sees a bad policy refused with the parser's message (nothi
 a good one; checks the tray's D-Bus item (`org.kde.StatusNotifierItem`) and its menu
 (`com.canonical.dbusmenu.GetLayout`: the status, Stop sharing, the pairing code, the viewers, Open,
 Quit); kills the host and sees the app say so, start a new one and reconnect. Screenshots of each page
-are the job's `linux-host-app` artifact; a few are in [linux-host-app/](linux-host-app/).
+are the job's `linux-host-app` artifact; a few are in [linux-host-app/](linux-host-app/):
+[Sharing](linux-host-app/sharing.png), [kicking a viewer](linux-host-app/viewers-kick-confirm.png),
+[Settings](linux-host-app/settings.png), [a refused policy](linux-host-app/policy-error.png),
+[the audit log with the kick](linux-host-app/audit.png).
 
 **What it can't check**, and this test is for: a real panel showing the tray icon (GNOME needs the
 AppIndicator extension; KDE has it), a phone on the network pairing and watching, a real X11 or
