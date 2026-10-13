@@ -664,6 +664,36 @@ fn record(r: &Option<RecordOnDrop>, e: &crate::encode::Encoded, out: &mut Outcom
 }
 
 /// The picture's size at `scale` of `full` (even, at least 160×90).
+/// An encoder that failed mid-session (a hardware one can stop answering: seen on CI's virtual
+/// Macs) is replaced, so the session goes on (its first frame a keyframe) rather than showing
+/// nothing until the viewer reconnects: by the software encoder when the failed one was hardware
+/// and the codec is H.264, else by a new one. A few times at most; then the session ends.
+fn replace_encoder(
+    old: &dyn crate::encode::VideoEncoder,
+    why: String,
+    failures: &mut u32,
+    codec: rr_proto::Codec,
+    (w, h): (usize, usize),
+    fps: u32,
+    kbps: u32,
+) -> Result<Box<dyn crate::encode::VideoEncoder>, String> {
+    *failures += 1;
+    if *failures > 3 {
+        return Err(why);
+    }
+    eprintln!("rein-remote: {why}: a new encoder for this session");
+    if old.hardware() && codec == rr_proto::Codec::H264 {
+        match crate::encode::open_software(codec, w, h, fps as f32, kbps) {
+            Ok(e) => {
+                eprintln!("rein-remote: encoding {} from here", e.name());
+                return Ok(e);
+            }
+            Err(e) => eprintln!("rein-remote: no software encoder ({e})"),
+        }
+    }
+    crate::encode::open(codec, w, h, fps as f32, kbps)
+}
+
 /// The most the stream may take, kbit/s: `--bitrate`, or when it's not given, from the picture's
 /// pixels a second: 0.12 bits a pixel a frame (8 Mbit/s at 1280×720 and 60 fps, ~30 at 1080p and
 /// 120, ~240 at 4K and 240), at least 8 Mbit/s and at most 1 Gbit/s. A frame's share stays the same
@@ -1047,6 +1077,8 @@ fn stream(
     // Frames into the encoder and out of it: an encoder that skips frames (its rate control, when a
     // frame can't fit its share of the bitrate) is short of bits for the picture's size.
     let (mut enc_in, mut enc_out, mut enc_seen) = (0u64, 0u64, (0u64, 0u64));
+    // Encoders that failed in this session (each replaced, a few times at most).
+    let mut enc_failures = 0u32;
     let mut last_adapt = Instant::now();
     let mut frame_no: u32 = 0;
     // Frames sent: number, capture time (µs, for latency) and when they went out (for the round trip).
@@ -1253,7 +1285,7 @@ fn stream(
                     seen_generation = generation;
                     let t0 = Instant::now();
                     let captured_at = now_us();
-                    let done = {
+                    let done: Result<Vec<crate::encode::Encoded>, String> = {
                         let mut src = source.lock().unwrap();
                         // Zero copy where both ends can: the system's own frame straight into the hardware encoder.
                         let scaled = (ew, eh) != enc_full;
@@ -1269,17 +1301,25 @@ fn stream(
                             }
                             let grab_ms = t0.elapsed().as_secs_f64() * 1000.0;
                             encoding.push_back((captured_at, t0, grab_ms));
-                            enc.encode_surface(&surface, captured_at)?
+                            enc.encode_surface(&surface, captured_at)
                         } else {
                             let frame = src.grab()?;
                             let grab_ms = t0.elapsed().as_secs_f64() * 1000.0;
                             encoding.push_back((captured_at, t0, grab_ms));
                             if scaled {
                                 crate::yuv::scale_down(frame.bgra, frame.stride, w, h, &mut small, ew, eh);
-                                enc.encode(&small, ew * 4, captured_at)?
+                                enc.encode(&small, ew * 4, captured_at)
                             } else {
-                                enc.encode(frame.bgra, frame.stride, captured_at)?
+                                enc.encode(frame.bgra, frame.stride, captured_at)
                             }
+                        }
+                    };
+                    let done = match done {
+                        Ok(done) => done,
+                        Err(why) => {
+                            enc = replace_encoder(&*enc, why, &mut enc_failures, codec, (ew, eh), fps, adapt.target().kbps)?;
+                            encoding.clear();
+                            Vec::new()
                         }
                     };
                     enc_in += 1;
@@ -1296,7 +1336,15 @@ fn stream(
         }
         // Frames a pipelined encoder finished since: out at once.
         if enc.in_flight() > 0 || !encoding.is_empty() {
-            for e in enc.poll()? {
+            let polled = match enc.poll() {
+                Ok(v) => v,
+                Err(why) => {
+                    enc = replace_encoder(&*enc, why, &mut enc_failures, codec, (ew, eh), fps, adapt.target().kbps)?;
+                    encoding.clear();
+                    Vec::new()
+                }
+            };
+            for e in polled {
                 enc_out += 1;
                 adapt.sent(Instant::now());
                 record(&recorder, &e, out);
@@ -1360,6 +1408,18 @@ fn stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_encoder_is_replaced_a_few_times_then_the_session_ends() {
+        let old = crate::encode::open_software(rr_proto::Codec::H264, 320, 240, 30.0, 500).unwrap();
+        let mut failures = 0;
+        for _ in 0..3 {
+            let new = replace_encoder(&*old, "stopped answering".into(), &mut failures, rr_proto::Codec::H264, (320, 240), 30, 500);
+            assert_eq!(new.unwrap().size(), (320, 240));
+        }
+        let r = replace_encoder(&*old, "stopped answering".into(), &mut failures, rr_proto::Codec::H264, (320, 240), 30, 500);
+        assert_eq!(r.err().as_deref(), Some("stopped answering"));
+    }
 
     #[test]
     fn the_top_bitrate_follows_pixels_a_second() {

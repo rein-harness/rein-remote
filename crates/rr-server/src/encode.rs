@@ -285,6 +285,12 @@ pub fn open(codec: Codec, width: usize, height: usize, fps: f32, kbps: u32) -> R
     open_as(&choice(), codec, width, height, fps, kbps)
 }
 
+/// The software encoder (openh264; H.264 only): what a session falls back to when its hardware
+/// encoder fails.
+pub fn open_software(codec: Codec, width: usize, height: usize, fps: f32, kbps: u32) -> Result<Box<dyn VideoEncoder>, String> {
+    open_as("software", codec, width, height, fps, kbps)
+}
+
 /// `open` with RR_ENCODER's value given (the tests try each without changing the environment).
 fn open_as(want: &str, codec: Codec, width: usize, height: usize, fps: f32, kbps: u32) -> Result<Box<dyn VideoEncoder>, String> {
     let mut why = Vec::new();
