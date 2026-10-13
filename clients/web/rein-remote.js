@@ -195,7 +195,9 @@ export class FecReassembler {
       b.shards[index] = d.subarray(FEC_HEADER);
       b.count++;
       if (b.count >= k) {
-        const missing = b.shards.slice(0, k).some((x) => !x);
+        // (A loop: `some` skips an array's holes, which are just the shards that never came.)
+        let missing = false;
+        for (let i = 0; i < k; i++) missing ||= !b.shards[i];
         const data = fecReconstruct(b.shards, k);
         if (data) {
           if (missing) this.recovered++;

@@ -357,7 +357,8 @@ fn through_relay(
                     lost = false;
                 }
                 let _ = ws.get_ref().tcp().set_nodelay(true);
-                let _ = socket2::SockRef::from(ws.get_ref().tcp()).set_send_buffer_size((opts.bitrate_kbps as usize * 1000 / 8 / 20).max(64 * 1024));
+                let _ = socket2::SockRef::from(ws.get_ref().tcp())
+                    .set_send_buffer_size((top_kbps(opts.bitrate_kbps, 1280, 720, 60) as usize * 1000 / 8 / 20).max(64 * 1024));
                 // It may wait a long time for a viewer: TCP keepalive finds a relay that went quietly
                 // (a reboot, a network gone) within a minute, and this machine connects again.
                 let keepalive = socket2::TcpKeepalive::new()
@@ -517,7 +518,7 @@ fn handle(
         // controller backs off), instead of a second of video queued where neither can see it.
         use crate::link::Sock;
         let _ = conn.tcp().set_nodelay(true);
-        let _ = socket2::SockRef::from(conn.tcp()).set_send_buffer_size((opts.bitrate_kbps as usize * 1000 / 8 / 20).max(64 * 1024));
+        let _ = socket2::SockRef::from(conn.tcp()).set_send_buffer_size((top_kbps(opts.bitrate_kbps, 1280, 720, 60) as usize * 1000 / 8 / 20).max(64 * 1024));
         let ws = tungstenite::accept(crate::conn::Replay::new(head, conn)).map_err(|e| format!("websocket: {e}"))?;
         return session(Box::new(WsLink::new(ws)), source, stats, opts, None, adm);
     }
@@ -663,6 +664,19 @@ fn record(r: &Option<RecordOnDrop>, e: &crate::encode::Encoded, out: &mut Outcom
 }
 
 /// The picture's size at `scale` of `full` (even, at least 160×90).
+/// The most the stream may take, kbit/s: `--bitrate`, or when it's not given, from the picture's
+/// pixels a second: 0.12 bits a pixel a frame (8 Mbit/s at 1280×720 and 60 fps, ~30 at 1080p and
+/// 120, ~240 at 4K and 240), at least 8 Mbit/s and at most 1 Gbit/s. A frame's share stays the same
+/// at any rate (on a fixed 8 Mbit/s a hardware encoder skipped every other frame of a fast scene at
+/// 240 fps). The controller still sends only what the link carries.
+pub fn top_kbps(given: u32, w: usize, h: usize, fps: u32) -> u32 {
+    if given > 0 {
+        return given;
+    }
+    let kbps = (w * h) as f64 * fps.max(60) as f64 * 0.12 / 1000.0;
+    (kbps as u32).clamp(8000, 1_000_000)
+}
+
 fn scaled_size(full: (usize, usize), scale: f32) -> (usize, usize) {
     if scale >= 1.0 {
         return full;
@@ -774,6 +788,7 @@ fn session(
     adm: crate::auth::Admission,
 ) -> Result<(), String> {
     let started = Instant::now();
+    let _timing = FrameTiming::begin();
     let mut start = adm.audit_fields();
     start["source"] = opts.source_label.clone().into();
     opts.audit.log("session_start", start);
@@ -794,6 +809,43 @@ fn session(
         }),
     );
     r
+}
+
+/// Waits as short as a frame at 240 Hz (4 ms) need the system's timers to keep to them: on macOS an
+/// ordinary thread's timers are coalesced (a 4 ms wait took about 8, which held 240 fps to ~110),
+/// so the session's thread is marked user-interactive, as apps mark their frame-paced work; on
+/// Windows the timer ticks every 15.6 ms unless asked for 1 ms (a 60 fps ceiling), asked here for as
+/// long as the session runs.
+struct FrameTiming;
+
+impl FrameTiming {
+    fn begin() -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            extern "C" {
+                fn pthread_set_qos_class_self_np(qos: u32, relative_priority: i32) -> i32;
+            }
+            const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+            // SAFETY: sets this thread's own QoS class; no pointers.
+            unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
+        }
+        #[cfg(windows)]
+        // SAFETY: plain call; undone in Drop.
+        unsafe {
+            windows::Win32::Media::timeBeginPeriod(1);
+        }
+        FrameTiming
+    }
+}
+
+impl Drop for FrameTiming {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        // SAFETY: pairs the timeBeginPeriod in begin.
+        unsafe {
+            windows::Win32::Media::timeEndPeriod(1);
+        }
+    }
 }
 
 fn stream(
@@ -871,11 +923,12 @@ fn stream(
     // encoding stays at 60 (what a CPU core holds).
     let auto = opts.fps == 0;
     let mut fps = pace(opts.fps, client.refresh_mhz, true);
-    let mut enc = crate::encode::open(codec, w, h, fps as f32, opts.bitrate_kbps)?;
+    let mut enc = crate::encode::open(codec, w, h, fps as f32, top_kbps(opts.bitrate_kbps, w, h, fps))?;
     if auto && !enc.hardware() && fps > SOFTWARE_FPS {
         fps = pace(opts.fps, client.refresh_mhz, false);
-        enc = crate::encode::open(codec, w, h, fps as f32, opts.bitrate_kbps)?;
+        enc = crate::encode::open(codec, w, h, fps as f32, top_kbps(opts.bitrate_kbps, w, h, fps))?;
     }
+    let top = top_kbps(opts.bitrate_kbps, w, h, fps);
     eprintln!("rein-remote: encoding {}", enc.name());
     let (mut ew, mut eh) = enc.size();
     // The picture at full size, and a buffer for it scaled down (when the link asks for that).
@@ -886,7 +939,7 @@ fn stream(
         width: ew as u16,
         height: eh as u16,
         fps: fps as u16,
-        bitrate_kbps: opts.bitrate_kbps,
+        bitrate_kbps: top,
     }))?;
     let refresh = match client.refresh_mhz {
         0 => String::new(),
@@ -990,7 +1043,10 @@ fn stream(
     }
 
     let mut frame_time = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
-    let mut adapt = crate::adapt::Adapt::new(opts.bitrate_kbps, fps);
+    let mut adapt = crate::adapt::Adapt::new(top, fps);
+    // Frames into the encoder and out of it: an encoder that skips frames (its rate control, when a
+    // frame can't fit its share of the bitrate) is short of bits for the picture's size.
+    let (mut enc_in, mut enc_out, mut enc_seen) = (0u64, 0u64, (0u64, 0u64));
     let mut last_adapt = Instant::now();
     let mut frame_no: u32 = 0;
     // Frames sent: number, capture time (µs, for latency) and when they went out (for the round trip).
@@ -1226,6 +1282,8 @@ fn stream(
                             }
                         }
                     };
+                    enc_in += 1;
+                    enc_out += done.len() as u64;
                     for e in done {
                         record(&recorder, &e, out);
                         send_frame(e, &mut *link, &mut encoding, &mut captured, &mut frame_no, &stats)?;
@@ -1236,6 +1294,7 @@ fn stream(
         // Frames a pipelined encoder finished since: out at once.
         if enc.in_flight() > 0 || !encoding.is_empty() {
             for e in enc.poll()? {
+                enc_out += 1;
                 record(&recorder, &e, out);
                 send_frame(e, &mut *link, &mut encoding, &mut captured, &mut frame_no, &stats)?;
             }
@@ -1248,6 +1307,11 @@ fn stream(
         if last_adapt.elapsed() > Duration::from_millis(250) {
             last_adapt = Instant::now();
             let off = std::env::var("RR_ADAPT").as_deref() == Ok("off");
+            let (fed, got) = (enc_in - enc_seen.0, enc_out - enc_seen.1);
+            enc_seen = (enc_in, enc_out);
+            if fed >= 8 && got * 10 < fed * 9 {
+                adapt.encoder_short(last_adapt);
+            }
             if let Some(t) = adapt.tick(last_adapt).filter(|_| !off) {
                 enc.set_bitrate(t.kbps)?;
                 frame_time = Duration::from_secs_f64(1.0 / t.fps.max(1) as f64);
@@ -1292,6 +1356,16 @@ fn stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_top_bitrate_follows_pixels_a_second() {
+        assert_eq!(top_kbps(5000, 3840, 2160, 240), 5000, "--bitrate wins");
+        assert_eq!(top_kbps(0, 1280, 720, 60), 8000);
+        assert_eq!(top_kbps(0, 640, 360, 30), 8000, "never under 8 Mbit/s");
+        assert_eq!(top_kbps(0, 1920, 1080, 120), 29_859);
+        assert_eq!(top_kbps(0, 3840, 2160, 240), 238_878);
+        assert_eq!(top_kbps(0, 7680, 4320, 240), 955_514);
+    }
 
     /// A connection in memory: what the session sends is kept, what the client says is queued.
     struct MemLink {

@@ -55,7 +55,7 @@ use capture::{Source, TestPattern};
 
 fn usage() -> ! {
     eprintln!(
-        "rein-remote {}\n\nusage:\n  rein-remote serve [--config FILE.toml] [--display :N | --window APP|TITLE|ID | --app NAME | --kms [CONNECTOR] | --vnc HOST:PORT [--vnc-password P] | --pipe WxH | --test-pattern [WxH] [--motion full]] [--listen ADDR] [--fps auto|N] [--codec h264|h265|auto] [--bitrate KBPS] [--token T] [--webtransport on|off] [--tls-cert PEM --tls-key PEM] [--tailscale-cert on|off] [--mdns on|off] [--pair on|off] [--relay ws(s)://HOST:PORT ... [--room CODE] [--relay-secret S]] [--audio on|off] [--public-url URL --oidc-issuer URL --oidc-client-id ID [--oidc-client-secret-file F] [--oidc-scopes S] [--oidc-user-claim C] [--oidc-groups-claim C] | --saml-idp-metadata FILE|URL [--saml-entity-id ID] [--saml-user-attr A] [--saml-groups-attr A]] [--policy FILE] [--audit FILE] [--record DIR]\n  rein-remote relay [--config FILE.toml] [--listen ADDR] [--secret S] [--metrics-listen ADDR|PORT|off]\n  rein-remote install-service [serve|relay] [--config FILE.toml] [--system] [--name NAME] [--print]\n  rein-remote uninstall-service [serve|relay] [--system] [--name NAME] [--print]\n  rein-remote windows [--json]\n  rein-remote displays\n  rein-remote discover [SECONDS]\n  rein-remote paired | unpair ID\n  rein-remote connect URL|NAME [--seconds N] [--pair CODE] [--json] [--webtransport on|off] [--datagrams on|off] [--direct on|off]\n  rein-remote selftest [--window Q | --display :N | --kms [CONNECTOR] | --test-pattern [WxH]] [--type TEXT] [--encode OUT.h264 [--frames N]]\n  rein-remote --version",
+        "rein-remote {}\n\nusage:\n  rein-remote serve [--config FILE.toml] [--display :N | --window APP|TITLE|ID | --app NAME | --kms [CONNECTOR] | --vnc HOST:PORT [--vnc-password P] | --pipe WxH | --test-pattern [WxH] [--motion full]] [--listen ADDR] [--fps auto|N] [--codec h264|h265|auto] [--bitrate KBPS|auto] [--token T] [--webtransport on|off] [--tls-cert PEM --tls-key PEM] [--tailscale-cert on|off] [--mdns on|off] [--pair on|off] [--relay ws(s)://HOST:PORT ... [--room CODE] [--relay-secret S]] [--audio on|off] [--public-url URL --oidc-issuer URL --oidc-client-id ID [--oidc-client-secret-file F] [--oidc-scopes S] [--oidc-user-claim C] [--oidc-groups-claim C] | --saml-idp-metadata FILE|URL [--saml-entity-id ID] [--saml-user-attr A] [--saml-groups-attr A]] [--policy FILE] [--audit FILE] [--record DIR]\n  rein-remote relay [--config FILE.toml] [--listen ADDR] [--secret S] [--metrics-listen ADDR|PORT|off]\n  rein-remote install-service [serve|relay] [--config FILE.toml] [--system] [--name NAME] [--print]\n  rein-remote uninstall-service [serve|relay] [--system] [--name NAME] [--print]\n  rein-remote windows [--json]\n  rein-remote displays\n  rein-remote discover [SECONDS]\n  rein-remote paired | unpair ID\n  rein-remote connect URL|NAME [--seconds N] [--pair CODE] [--json] [--webtransport on|off] [--datagrams on|off] [--direct on|off]\n  rein-remote selftest [--window Q | --display :N | --kms [CONNECTOR] | --test-pattern [WxH]] [--type TEXT] [--encode OUT.h264 [--frames N]]\n  rein-remote --version",
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(2);
@@ -206,7 +206,8 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
         listen: "auto".into(),
         fps: 0,
         codec: Some(rr_proto::Codec::H264),
-        bitrate_kbps: 8000,
+        // Not given (0): from the picture's size and frame rate (serve::top_kbps).
+        bitrate_kbps: 0,
         token: std::env::var("REIN_REMOTE_TOKEN").ok().filter(|t| !t.is_empty()),
         webtransport: true,
         relay: None,
@@ -266,7 +267,7 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
                     _ => return Err("--codec is h264, h265 or auto".into()),
                 }
             }
-            "--bitrate" => opts.bitrate_kbps = val()?.parse().map_err(|_| "--bitrate is kbit/s")?,
+            "--bitrate" => opts.bitrate_kbps = match val()?.as_str() { "auto" => 0, v => v.parse().map_err(|_| "--bitrate is kbit/s (or auto)")? },
             "--display" => display = Some(val()?),
             "--window" => window = Some(val()?),
             "--app" => app = Some(val()?),
