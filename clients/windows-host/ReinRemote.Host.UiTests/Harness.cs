@@ -226,7 +226,7 @@ sealed class AppSession : IDisposable
         {
             // A WinUI combo box's item may refuse UIA's Select: click it as a person would.
             output.WriteLine($"Select refused ({e.GetType().Name}): clicking it");
-            item.ScrollIntoView();
+            item.Patterns.ScrollItem.PatternOrDefault?.ScrollIntoView();
             item.Click();
         }
         Thread.Sleep(300);
