@@ -161,7 +161,7 @@ Either:
 2. Switch the system to dark (GNOME Settings, Appearance; KDE Global Theme, Breeze Dark). **Expect:**
    the app follows at once; QR codes stay black on white.
 3. **Orca** (Super+Alt+S): Tab through each page. **Expect:** every button, box and switch is read with
-   a name (for example "Kick Gary's iPhone", "Copy the link for this network", "Pairing code").
+   a name (for example "Kick Gary's iPhone", "Copy the link for this network", "Share This display", "New code").
 4. Make the window narrow (under 640 px): the sidebar folds away, with a back button.
 
 Note what didn't match, with `~/.rein-remote/host.log` and the app's output (run it from a terminal).
