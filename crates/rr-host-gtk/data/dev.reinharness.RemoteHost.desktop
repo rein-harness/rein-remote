@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Rein Remote
+GenericName=Screen sharing
+Comment=Share this screen with your phone or another computer
+Exec=rein-remote-host-gtk
+Icon=dev.reinharness.RemoteHost
+Terminal=false
+Categories=Network;RemoteAccess;GTK;
+Keywords=remote;screen;share;desktop;vnc;
+StartupNotify=true
+SingleMainWindow=true
+DBusActivatable=false

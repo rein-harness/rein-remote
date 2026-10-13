@@ -1,0 +1,34 @@
+[package]
+name = "rr-host-gtk"
+description = "Rein Remote's Linux host app (GTK4, libadwaita, a StatusNotifierItem tray icon) on `rein-remote host`'s control API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# gtk4-rs 0.11's.
+rust-version = "1.92"
+
+[[bin]]
+name = "rein-remote-host-gtk"
+path = "src/main.rs"
+
+# The control API's client (lib) builds and is tested everywhere; the app itself needs GTK4 and
+# libadwaita, so it's behind the `gtk` feature (Linux only). Without it the binary only says so: the
+# workspace's builds and tests on macOS, Windows and Linux runners need no GTK packages.
+[features]
+gtk = ["dep:gtk", "dep:adw", "dep:ksni", "dep:async-channel"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "3.2", default-features = false }
+qrcode = { version = "0.14", default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = { package = "gtk4", version = "0.11", features = ["v4_14"], optional = true }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"], optional = true }
+ksni = { version = "0.3.6", default-features = false, features = ["blocking", "async-io"], optional = true }
+async-channel = { version = "2", optional = true }
