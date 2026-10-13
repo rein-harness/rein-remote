@@ -111,6 +111,7 @@ jobs:
           max=$(find squashfs-root -type f \( -name '*.so*' -o -path '*/usr/bin/*' \) -exec objdump -T {} + 2> /dev/null |
             grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
           echo "highest glibc symbol version: $max"
+          [ -n "$max" ]
           [ "$(printf '%s\nGLIBC_2.35\n' "$max" | sort -V | tail -1)" = GLIBC_2.35 ]
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

@@ -37,6 +37,14 @@ function Arp {
   }
 }
 
+# Per user without UAC is what the package says of itself: Summary Information's Word Count (property
+# 15), bit 3 (8): "elevated privileges are not required". The runner is an administrator, so this is
+# the check that a standard user isn't asked.
+$installer = New-Object -ComObject WindowsInstaller.Installer
+$si = $installer.GetType().InvokeMember('SummaryInformation', 'GetProperty', $null, $installer, @($Msi, 0))
+$wc = $si.GetType().InvokeMember('Property', 'GetProperty', $null, $si, @(15))
+Check (($wc -band 8) -ne 0) "the .msi needs no elevation (Word Count $wc, bit 3)"
+
 Write-Host "== install ($Scope$(if ($NoStartAtLogin) { ', STARTATLOGIN=0' }))"
 Msiexec (@('/i', "`"$Msi`"") + $extra) "$logs\install.log"
 foreach ($f in 'ReinRemoteHost.exe', 'rein-remote.exe', 'Assets\rein-remote.ico', 'Microsoft.WindowsAppRuntime.dll') {
