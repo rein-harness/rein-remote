@@ -7,3 +7,4 @@
 /tests/relay-fleet/out/
 /tests/netem/logs/
 /tests/netem/rein-remote.linux
+/tests/netem/rein-remote-viewer.linux

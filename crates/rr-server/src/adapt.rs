@@ -11,6 +11,9 @@
 //!   cut neither overshoots the link nor stays above it, which is what made it oscillate.
 //! - **Come back carefully.** After a cut it climbs quickly to just under where it last congested,
 //!   then probes above that slowly.
+//! - **Frame rate last.** Games need it: the frame rate holds (at the viewer's display rate, 60 at
+//!   least) while the bitrate falls, then the picture shrinks; only at the lowest bitrate and the
+//!   smallest picture does the frame rate go down.
 //! - **Resolution follows.** When the bitrate is low for the picture's size, the picture is scaled
 //!   down (¾, then ½) rather than smeared; it goes back up once the link has room, with hysteresis
 //!   so it doesn't flap.
@@ -30,6 +33,8 @@ pub struct Adapt {
     max: Target,
     min: Target,
     now: Target,
+    /// The target last given out (tick says when `now` differs from it).
+    given: Target,
     /// One-way delays (ms, with the clock offset) of the last few seconds, for the baseline.
     delays: VecDeque<(Instant, f64)>,
     /// Queuing (ms over the baseline) of the last half second.
@@ -37,10 +42,17 @@ pub struct Adapt {
     /// Bytes the client confirmed getting, and when: what the link delivers.
     delivered: VecDeque<(Instant, usize)>,
     backed_up: bool,
+    /// The client lost a frame while nothing it got was coming back: nothing gets through.
+    starved: bool,
     last_cut: Instant,
     last_step: Instant,
     /// Until the first congestion: climbing fast.
     starting: bool,
+    /// The encoder skipped frames since the last tick: too few bits for the picture's size.
+    encoder_short: bool,
+    short_until: Option<Instant>,
+    first_sent: Option<Instant>,
+    last_sent: Option<Instant>,
     /// The target when it last congested: climbing back slows down below it.
     ceiling: Option<u32>,
     /// Since when the bitrate has been enough for a bigger picture (scaling back up waits a while).
@@ -50,6 +62,8 @@ pub struct Adapt {
 const BASELINE_WINDOW: Duration = Duration::from_secs(10);
 const RECENT: Duration = Duration::from_millis(500);
 const DELIVERED_WINDOW: Duration = Duration::from_secs(1);
+/// No feedback for this long: nothing is known about the link now.
+const STALE: Duration = Duration::from_millis(500);
 /// Queuing that means the link is full, and queuing low enough to try more.
 const CONGESTED_MS: f64 = 40.0;
 /// (The round trip includes the client's decoding, which wanders by 10–15 ms with the content.)
@@ -57,7 +71,9 @@ const CLEAR_MS: f64 = 20.0;
 /// The first keyframe's bitrate: small on a slow link, quickly left behind on a fast one.
 pub const START_KBPS: u32 = 800;
 /// The scales, and the share of the top bitrate under which each is used.
-const SCALES: [(f32, f64); 3] = [(1.0, 0.0), (0.75, 0.22), (0.5, 0.1)];
+const SCALES: [(f32, f64); 4] = [(1.0, 0.0), (0.75, 0.22), (0.5, 0.1), (1.0 / 3.0, 0.05)];
+/// The smallest picture.
+const SMALLEST: f32 = 1.0 / 3.0;
 
 impl Adapt {
     pub fn new(max_kbps: u32, max_fps: u32) -> Self {
@@ -72,9 +88,14 @@ impl Adapt {
             min: Target {
                 kbps: 250.min(max.kbps),
                 fps: 5.min(max.fps),
-                scale: 0.5,
+                scale: SMALLEST,
             },
             now: Target {
+                kbps: START_KBPS.min(max.kbps),
+                fps: max.fps,
+                scale: 1.0,
+            },
+            given: Target {
                 kbps: START_KBPS.min(max.kbps),
                 fps: max.fps,
                 scale: 1.0,
@@ -83,6 +104,11 @@ impl Adapt {
             queuing: VecDeque::new(),
             delivered: VecDeque::new(),
             backed_up: false,
+            starved: false,
+            encoder_short: false,
+            short_until: None,
+            first_sent: None,
+            last_sent: None,
             last_cut: long_ago,
             last_step: long_ago,
             starting: true,
@@ -121,6 +147,46 @@ impl Adapt {
         }
     }
 
+    /// The client asked for a keyframe (it lost a frame). With feedback coming back that's the odd
+    /// lost frame (random loss, which parity is for); with none for a while, nothing is getting
+    /// through: as congested as it gets, even before the first feedback.
+    pub fn frame_lost(&mut self, at: Instant) {
+        if !self.feedback_lately(at) {
+            self.starved = true;
+        }
+    }
+
+    /// The encoder skipped more than a tenth of the frames given it since the last tick (a hardware
+    /// encoder's rate control does, when a frame can't fit its share of the bitrate): the frame rate
+    /// is kept by making the picture smaller.
+    /// Starting, when it gave out nothing at all (`none_out`), it's the modest first bitrate that's
+    /// short (a big fast picture at 800 kbit/s had every frame skipped, and with nothing sent no
+    /// feedback comes to climb on): up it goes, as fast as starting climbs. Starting with some out,
+    /// the feedback decides (on a slow link the bitrate must not climb blind).
+    pub fn encoder_short(&mut self, _at: Instant, none_out: bool) {
+        if self.starting && !(none_out && self.now.kbps >= self.max.kbps) {
+            if none_out {
+                self.now.kbps = ((self.now.kbps as f64 * 1.5) as u32).min(self.max.kbps);
+            }
+        } else {
+            // Nothing out even at the top bitrate (an encoder that can't do this size at this rate:
+            // H.264 at 4K and 240 fps): smaller.
+            self.starting = false;
+            self.encoder_short = true;
+        }
+    }
+
+    /// A frame went out. Frames going out for a second with no feedback for a while: nothing gets
+    /// through (or nothing the client can use: no feedback comes until a frame decodes).
+    pub fn sent(&mut self, at: Instant) {
+        self.first_sent.get_or_insert(at);
+        self.last_sent = Some(at);
+    }
+
+    fn feedback_lately(&self, at: Instant) -> bool {
+        self.delivered.back().is_some_and(|(t, _)| at.duration_since(*t) < STALE)
+    }
+
     /// Queuing now: the median of the last half second (ms).
     pub fn queuing_ms(&self) -> f64 {
         let mut v: Vec<f64> = self.queuing.iter().map(|(_, q)| *q).collect();
@@ -142,8 +208,12 @@ impl Adapt {
     /// Called a few times a second: a new target when it should change.
     pub fn tick(&mut self, at: Instant) -> Option<Target> {
         let q = self.queuing_ms();
-        let before = self.now;
-        if (self.backed_up || q > CONGESTED_MS) && at.duration_since(self.last_cut) > Duration::from_millis(300) {
+        let sending = self.last_sent.is_some_and(|l| at.duration_since(l) < Duration::from_millis(250))
+            && self.first_sent.is_some_and(|f| at.duration_since(f) > Duration::from_secs(1));
+        if sending && !self.feedback_lately(at) {
+            self.starved = true;
+        }
+        if (self.backed_up || self.starved || q > CONGESTED_MS) && at.duration_since(self.last_cut) > Duration::from_millis(300) {
             // Congested: to a little under what got through (or by 30% when that's not known yet).
             let got = self.delivered_kbps(at);
             let to = if got > 0 {
@@ -155,13 +225,19 @@ impl Adapt {
             if at.duration_since(self.last_cut) > Duration::from_secs(2) {
                 self.ceiling = Some(self.now.kbps);
             }
+            // The frame rate goes down only once there's nothing else left to give.
+            if self.now.kbps <= self.min.kbps && self.now.scale <= SMALLEST {
+                self.now.fps = ((self.now.fps as f64 * 0.75) as u32).max(self.min.fps);
+            }
             self.now.kbps = to.min((self.now.kbps as f64 * 0.9) as u32).max(self.min.kbps);
-            self.now.fps = ((self.now.fps as f64 * 0.75) as u32).max(self.min.fps);
             self.last_cut = at;
             self.starting = false;
             self.room_since = None;
         } else if q < CLEAR_MS
             && !self.backed_up
+            && !self.starved
+            // Only on what came back: with no feedback, no queuing shows, which says nothing.
+            && self.feedback_lately(at)
             && at.duration_since(self.last_cut) > Duration::from_secs(1)
             && at.duration_since(self.last_step) > Duration::from_millis(250)
         {
@@ -176,25 +252,47 @@ impl Adapt {
                 }
             };
             self.now.kbps = (next as u32).max(self.now.kbps + 1).min(self.max.kbps);
-            self.now.fps = (self.now.fps + 3).min(self.max.fps);
+            // At the top: started.
+            if self.now.kbps >= self.max.kbps {
+                self.starting = false;
+            }
+            self.now.fps = ((self.now.fps as f64 * 1.25) as u32 + 1).min(self.max.fps);
             self.last_step = at;
         }
         self.backed_up = false;
+        self.starved = false;
         // Starting, the picture stays whole (its first keyframe is small by its bitrate already).
         if !self.starting {
             self.now.scale = self.scale_for(at);
         }
-        (self.now != before).then_some(self.now)
+        // (A second between: each new size is a new encoder, which takes a moment to give out frames.)
+        let shrunk_lately = self.short_until.is_some_and(|u| u > at + Duration::from_secs(4));
+        if std::mem::take(&mut self.encoder_short) && !shrunk_lately {
+            // A size smaller than both what the bitrate picks and what it is now.
+            let smaller = SCALES.iter().map(|(s, _)| *s).filter(|s| *s < self.now.scale).fold(0.0f32, f32::max);
+            if smaller > 0.0 {
+                self.now.scale = smaller;
+            }
+            self.room_since = None;
+            self.short_until = Some(at + Duration::from_secs(5));
+        }
+        if self.now == self.given {
+            return None;
+        }
+        self.given = self.now;
+        Some(self.now)
     }
 
     /// The picture's scale for the bitrate now: down at once when it's low, back up only after
     /// the bitrate has had room for the bigger picture for two seconds.
     fn scale_for(&mut self, at: Instant) -> f32 {
+        // Not back up for a while after the encoder ran short at a bigger size.
+        let held = self.short_until.is_some_and(|u| at < u);
         let share = self.now.kbps as f64 / self.max.kbps as f64;
         let fits = SCALES.iter().filter(|(_, under)| share < *under).map(|(s, _)| *s).fold(1.0f32, f32::min);
-        if fits <= self.now.scale {
+        if fits <= self.now.scale || held {
             self.room_since = None;
-            return fits;
+            return fits.min(self.now.scale);
         }
         // Room for a bigger picture: a third above the threshold, held for two seconds.
         let bigger = SCALES.iter().map(|(s, _)| *s).filter(|s| *s > self.now.scale).fold(1.0f32, f32::min);
@@ -243,6 +341,34 @@ mod tests {
     }
 
     #[test]
+    fn no_feedback_no_climbing_and_lost_frames_with_none_cut() {
+        // A link so full nothing comes back: the first keyframe never arrives. Climbing on silence
+        // sent 8 Mbit/s into a 1.5 Mbit/s link and stayed there (tests/netem).
+        let mut a = Adapt::new(8000, 60);
+        let mut t = Instant::now();
+        for _ in 0..40 {
+            t += Duration::from_millis(250);
+            a.tick(t);
+        }
+        assert_eq!(a.target().kbps, START_KBPS, "no feedback, no climbing");
+        // The client keeps losing frames and asking for keyframes: each is a cut.
+        for _ in 0..8 {
+            t += Duration::from_millis(400);
+            a.frame_lost(t);
+            a.tick(t);
+        }
+        assert_eq!(a.target().kbps, 250, "down to the floor");
+        // With feedback coming back, a lost frame is random loss (parity's job), not congestion.
+        let mut a = Adapt::new(8000, 60);
+        let mut t = Instant::now();
+        run(&mut a, &mut t, 10.0, |_| 20.0);
+        let before = a.target().kbps;
+        a.frame_lost(t);
+        a.tick(t);
+        assert_eq!(a.target().kbps, before);
+    }
+
+    #[test]
     fn backs_off_when_delay_builds_and_climbs_back_when_clear() {
         let mut a = Adapt::new(8000, 60);
         let mut t = Instant::now();
@@ -258,7 +384,8 @@ mod tests {
         );
         // The link (2 Mbit/s) fills: queuing grows by 30 ms a second.
         run_on(&mut a, &mut t, 3.0, 2000, |s| 20.0 + s * 30.0);
-        assert!(a.target().kbps < 3000 && a.target().fps < 30, "it backed off: {:?}", a.target());
+        assert!(a.target().kbps < 3000, "it backed off: {:?}", a.target());
+        assert_eq!(a.target().fps, 60, "the frame rate held");
         // Clear again (the queue drains for a moment first): it climbs back, slowly.
         let low = run(&mut a, &mut t, 3.0, |_| 20.0);
         let mid = a.target();
@@ -284,8 +411,84 @@ mod tests {
         let t = t + Duration::from_secs(1);
         a.feedback(30.0, 1000, t);
         a.backed_up();
-        // Cut to under what got through (a trickle here: the floor), frames a quarter fewer.
-        assert_eq!(a.tick(t).map(|t| (t.kbps, t.fps)), Some((250, 45)));
+        // Cut to under what got through (a trickle here: the floor), the frame rate kept.
+        assert_eq!(a.tick(t).map(|t| (t.kbps, t.fps)), Some((250, 60)));
+    }
+
+    #[test]
+    fn the_frame_rate_goes_last() {
+        // Congested again and again: bitrate and size give way first; the full frame rate until both are at
+        // their least.
+        let mut a = Adapt::new(8000, 120);
+        let mut t = Instant::now();
+        a.feedback(30.0, 1000, t);
+        let mut seen = vec![];
+        for _ in 0..40 {
+            t += Duration::from_millis(400);
+            a.backed_up();
+            a.tick(t);
+            seen.push(a.target());
+        }
+        for s in &seen {
+            assert!(s.fps == 120 || (s.kbps == 250 && s.scale == SMALLEST), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn an_encoder_skipping_frames_makes_the_picture_smaller_not_the_frame_rate() {
+        // Starting, the bitrate climbs instead, feedback or none (with every frame skipped, none comes).
+        let mut a = Adapt::new(8000, 240);
+        let mut t = Instant::now();
+        a.encoder_short(t, true);
+        a.tick(t);
+        assert_eq!((a.target().scale, a.target().kbps), (1.0, START_KBPS * 3 / 2));
+        // Some frames out: the feedback decides, not the encoder.
+        a.encoder_short(t, false);
+        assert_eq!(a.target().kbps, START_KBPS * 3 / 2);
+        // Nothing out even at the top: smaller.
+        let mut b = Adapt::new(8000, 240);
+        for _ in 0..10 {
+            b.encoder_short(t, true);
+            b.tick(t);
+        }
+        // (Held a second before it shrinks again.)
+        assert_eq!((b.target().kbps, b.target().scale, b.target().fps), (8000, 0.75, 240));
+        a.feedback(1_000_020.0, 1000, t);
+        // At the top, the picture gives way.
+        run(&mut a, &mut t, 5.0, |_| 20.0);
+        assert_eq!(a.target().scale, 1.0);
+        a.encoder_short(t, false);
+        a.tick(t);
+        assert_eq!((a.target().scale, a.target().fps), (0.75, 240));
+        // Not again at once (the new encoder needs a moment); a second later, yes.
+        a.encoder_short(t, false);
+        a.tick(t);
+        assert_eq!(a.target().scale, 0.75);
+        run(&mut a, &mut t, 1.1, |_| 20.0);
+        a.encoder_short(t, false);
+        a.tick(t);
+        assert_eq!(a.target().scale, 0.5);
+        // Held there a while, then back up with room.
+        run(&mut a, &mut t, 2.0, |_| 20.0);
+        assert_eq!(a.target().scale, 0.5);
+        run(&mut a, &mut t, 20.0, |_| 20.0);
+        assert_eq!(a.target().scale, 1.0);
+    }
+
+    #[test]
+    fn frames_going_out_with_no_feedback_is_starved() {
+        // A link too slow for even the first keyframe: frames go, nothing decodes, nothing comes back.
+        let mut a = Adapt::new(8000, 60);
+        let t0 = Instant::now();
+        let mut t = t0;
+        for _ in 0..120 {
+            t += Duration::from_millis(16);
+            a.sent(t);
+            if (t - t0).as_millis() % 250 < 16 {
+                a.tick(t);
+            }
+        }
+        assert!(a.target().kbps < START_KBPS, "{:?}", a.target());
     }
 
     #[test]
@@ -298,7 +501,14 @@ mod tests {
             a.backed_up();
             a.tick(t);
         }
-        assert_eq!(a.target(), Target { kbps: 250, fps: 5, scale: 0.5 });
+        assert_eq!(
+            a.target(),
+            Target {
+                kbps: 250,
+                fps: 5,
+                scale: SMALLEST
+            }
+        );
     }
 
     #[test]
@@ -341,7 +551,7 @@ mod tests {
             a.backed_up();
             a.tick(t);
         }
-        assert_eq!(a.target().scale, 0.5, "250 kbit/s of 8000: half size");
+        assert_eq!(a.target().scale, SMALLEST, "250 kbit/s of 8000: a third of the size");
         run(&mut a, &mut t, 60.0, |_| 20.0);
         assert_eq!(a.target().scale, 1.0, "room again: full size");
     }

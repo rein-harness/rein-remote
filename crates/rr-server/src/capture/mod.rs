@@ -264,10 +264,12 @@ impl Source for TestPattern {
         }
         // The capture time as a barcode along the bottom, for measuring glass to glass: a client
         // that shares this clock reads it from the decoded frame (rein-remote.js, `measure`).
-        // Blocks of 24×24: white, black (sync), then the time in milliseconds, 32 bits, high first.
+        // Blocks of 24×24 (smaller on a picture under 816 wide, down to 8): white, black (sync),
+        // then the time in milliseconds, 32 bits, high first. A reader takes the block's size from
+        // the white one, so it reads a scaled-down picture too.
         let ms = (now / 1000) as u32;
-        const B: usize = 24;
-        if w >= 34 * B && h >= B {
+        let bs = (w / 34).min(24);
+        if bs >= 8 && h >= bs {
             for k in 0..34 {
                 let on = match k {
                     0 => true,
@@ -275,9 +277,9 @@ impl Source for TestPattern {
                     _ => ms >> (33 - k) & 1 == 1,
                 };
                 let v = if on { 255 } else { 0 };
-                for y in h - B..h {
-                    let i = (y * w + k * B) * 4;
-                    for px in self.buf[i..i + B * 4].chunks_exact_mut(4) {
+                for y in h - bs..h {
+                    let i = (y * w + k * bs) * 4;
+                    for px in self.buf[i..i + bs * 4].chunks_exact_mut(4) {
                         px.copy_from_slice(&[v, v, v, 255]);
                     }
                 }

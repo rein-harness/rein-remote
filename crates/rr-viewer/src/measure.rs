@@ -10,19 +10,21 @@ use crate::decode::Picture;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const BLOCK: usize = 24;
-
-/// The capture time the test pattern drew into `pic` (ms, mod 2^32), when it has one.
+/// The capture time the test pattern drew into `pic` (ms, mod 2^32), when it has one. The blocks are
+/// 24 px, less on a picture under 816 wide or one the server scaled down: their size is taken from
+/// the white sync block, as the web client does.
 pub fn barcode(pic: &Picture) -> Option<u32> {
-    if pic.h < BLOCK || pic.w < 34 * BLOCK {
+    if pic.h < 8 || pic.w < 34 * 4 {
         return None;
     }
-    // The middle of each block, half a block up from the bottom; green, as the web client reads.
-    let row = pic.row(pic.h - BLOCK / 2);
-    if row.len() < 34 * BLOCK {
+    // Two rows from the bottom (inside a block of any size); green, as the web client reads.
+    let row = pic.row(pic.h - 2);
+    let green = |x: usize| (row[x] >> 8 & 255) > 128;
+    let bs = (0..30.min(row.len())).take_while(|&x| green(x)).count();
+    if !(4..30).contains(&bs) || row.len() < 34 * bs {
         return None;
     }
-    let bit = |k: usize| (row[k * BLOCK + BLOCK / 2] >> 8 & 255) > 128;
+    let bit = |k: usize| green(k * bs + bs / 2);
     if !bit(0) || bit(1) {
         return None;
     }
@@ -90,6 +92,8 @@ pub fn cpu_time() -> Duration {
 mod tests {
     use super::*;
 
+    const BLOCK: usize = 24;
+
     #[test]
     fn reads_the_barcode_the_test_pattern_draws() {
         // Drawn as rr-server's TestPattern draws it.
@@ -111,6 +115,20 @@ mod tests {
             }
         }
         assert_eq!(barcode(&pic), Some(ms));
+        // Smaller blocks (a 640-wide picture: 18 px) read the same.
+        let (w, h, bs) = (640, 360, 18);
+        let mut small = Picture::default();
+        small.reshape(w, h);
+        for k in 0..34 {
+            let on = k == 0 || (k > 1 && ms >> (33 - k) & 1 == 1);
+            for y in h - bs..h {
+                for x in k * bs..(k + 1) * bs {
+                    let v = if on { 235 } else { 20 };
+                    small.bytes_mut()[(y * w + x) * 4..(y * w + x) * 4 + 4].copy_from_slice(&[v, v, v, 255]);
+                }
+            }
+        }
+        assert_eq!(barcode(&small), Some(ms));
         // No sync blocks: no time.
         pic.px.fill(0);
         assert_eq!(barcode(&pic), None);

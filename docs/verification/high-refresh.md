@@ -59,3 +59,34 @@ rein-remote serve --listen 127.0.0.1:7979    # the screen (macOS: the main displ
 
 Open the page, then leave the screen untouched for 30 s: the server's `/stats?token=…` `frames`
 must not grow (only `still` does), and its CPU time stays flat.
+
+## 4. Games: 120–240 fps on a GPU encoder, with the machine busy
+
+Frame rate comes first for games: the controller keeps it while it lowers the bitrate and then
+the picture's size. The top bitrate follows the picture (8 Mbit/s at 720p60, about 30 at 1080p120,
+about 240 at 4K240 when `--bitrate` isn't given). Needs a machine with a fast hardware encoder
+(NVIDIA RTX with NVENC, recent AMD or Intel Arc) and the native viewer on the same machine (or
+two machines with synced clocks).
+
+```sh
+# The full-motion scene (all of it scrolling, as a game's camera moves) at each size and rate:
+for res in 1280x720 1920x1080 2560x1440 3840x2160; do for fps in 120 240; do
+  rein-remote serve --test-pattern $res --motion full --fps $fps --listen 127.0.0.1:7979 --mdns off --audio off &
+  sleep 3
+  rein-remote-viewer http://127.0.0.1:7979 --headless --measure --frames 1000000 --seconds 15 --json
+  kill %1; wait
+done; done
+# The same under load: every core busy at normal priority while it runs (a game's own work).
+for i in $(seq $(nproc)); do yes > /dev/null & done   # macOS: sysctl -n hw.ncpu
+# ... repeat the loop above ..., then: kill $(jobs -p)
+```
+
+Write down, for each: `fps`, `glass_ms.p50/p95`, `size` (the picture actually sent: smaller than
+asked means the encoder or link ran short and the controller kept the frame rate), the server's
+`encode_ms` (`/stats`). Pass: 1080p at 240 shows ≥ 230 fps and p50 ≤ 15 ms; 4K at 120 shows ≥ 115
+fps; under load, nothing under 60 fps at any size (the picture may shrink).
+
+Measured on an A18 Pro MacBook (VideoToolbox both ends, load average 3): 720p asked 240, 200 fps
+at 11 / 13 ms; 720p asked 120, 116 fps at 7 / 9 ms; 1080p asked 240, 133 fps at 17 / 21 ms (its
+encoder takes ~13 ms a frame there: the limit of that machine); at load average 17–21, 720p asked
+240 still 170 fps at 13 ms. 4K there is ~22 fps (~45 ms a frame to encode).

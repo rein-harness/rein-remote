@@ -196,6 +196,30 @@ has been verified.
     capture: [manual test](docs/verification/audio.md).
 - **Verified:** latency and quality measured on LAN, on a throttled link (tc netem: loss, delay,
   low bandwidth) and through the relay; a fast-moving game scene stays smooth on the bad link.
+- **Status (verification):** LAN and the relay measured on a Mac (Chrome over datagrams 60 fps,
+  10 ms glass to glass; the native viewer 9 / 12 ms; through the relay then punched direct 13 / 15
+  ms). Bad links: `tests/netem/run.sh` (tc netem on a Linux container's loopback, every link with
+  each transport and client) found and fixed four faults on the way: the page never asked again for
+  a lost first keyframe; with nothing coming back the controller climbed blind (8 Mbit/s into a
+  1.5 Mbit/s link, nothing ever decoded) and now counts frames going out with no feedback as
+  starvation; a tbf on the loopback's 64 KB MTU dropped every TCP packet (the rig's own bug); the
+  barcode couldn't be read on small or scaled pictures. Frame rate first, for games: the controller
+  keeps the frame rate (the viewer's display rate) while it cuts the bitrate, then the picture (¾,
+  ½, ⅓); only at the lowest of both do frames go. With the native viewer, 1280×720 full motion
+  (software both ends in a 4-core VM), 15 s each, datagrams / WebSocket: LAN 55 / 39 fps (6 / 18 ms
+  p50); 40 ms RTT with 2% loss 53 / 46 fps (28 / 40 ms); 5% loss 50 / 51 fps (36 / 63 ms); 80 ms
+  with jitter 33 / 55 fps (57 / 68 ms); 1.5 Mbit/s 41 / 38 fps (27 / 39 ms); 800 kbit/s 24 / 41 fps
+  (30 / 44 ms), the picture down to 640×360 or 426×240 to keep frames coming. That VM is short of
+  CPU even on the LAN (it shrinks the picture there too), so a game at 60+ fps on a bad link is
+  still to verify on a Linux machine with a GPU encoder and decoder:
+  [manual test](docs/verification/bad-link-game.md). High frame rates on this Mac (A18 Pro,
+  VideoToolbox both ends, full motion): 1280×720 at 240 asked, 188–200 fps at 11 / 13 ms; at 120,
+  116 fps at 7 / 9 ms; 1080p at 240, 133 fps (that encoder's limit there, ~13 ms a frame); with
+  the machine at load average 17–21, 720p at 240 still 170 fps at 13 ms. The top bitrate follows the
+  picture (0.12 bits a pixel a frame: 8 Mbit/s at 720p60, ~240 at 4K240, up to 1 Gbit/s); an
+  encoder that can't keep up gets a smaller picture, not fewer frames (a 4K source at 240 streams
+  at 1280×720, 60 fps, on this Mac). A GPU machine at 120–240 fps:
+  [manual test](docs/verification/high-refresh.md).
 
 ## Phase 5 — native clients
 

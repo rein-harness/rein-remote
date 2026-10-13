@@ -17,6 +17,16 @@ test('frames come back whole from datagrams, lost ones rebuilt from parity, in a
   }
 });
 
+test('a frame rebuilt from parity counts as recovered', () => {
+  // The first data shard lost: the parity makes it up, and the count says so.
+  for (const c of [cases[0], cases[2]]) {
+    const r = new FecReassembler(8);
+    const out = c.datagrams.map(hex).filter((d) => d[8] !== 0).map((d) => r.push(d)).filter(Boolean);
+    assert.deepEqual(out[0], hex(c.frame));
+    assert.equal(r.recovered, 1);
+  }
+});
+
 test('any k of k + m shards rebuild the data', () => {
   // Shards from the 2500-byte case: k data and m parity of its one block.
   const c = cases[1];
