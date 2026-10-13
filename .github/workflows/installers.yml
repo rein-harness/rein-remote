@@ -1,0 +1,177 @@
+name: Installers
+# Rein Remote's installers for Linux and macOS, built on every pull request, uploaded as artifacts, and
+# each installed and run the way a user would: the .deb in a clean Ubuntu 24.04 (apt resolves every
+# dependency from nothing), the AppImage on Ubuntu 22.04 and 24.04, the .dmg on macOS. The Windows
+# .msi is ci.yml's windows-installer job (it reuses the app windows-host builds).
+# docs/verification/installers.md has what these can't check (a reboot, SmartScreen, Gatekeeper).
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  # The .deb: built on 24.04 (GTK 4.14, libadwaita 1.5, what the app needs). packaging/linux/build-deb.sh.
+  deb:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Packages
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libgtk-4-dev libadwaita-1-dev libudev-dev > /dev/null
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: deb
+      - name: Build (rein-remote and the app)
+        run: cargo build --release -p rr-server -p rr-host-gtk --features rr-host-gtk/gtk
+      - name: The .deb
+        run: packaging/linux/build-deb.sh out
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-deb
+          path: out/*.deb
+          retention-days: 14
+  deb-test:
+    needs: deb
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # Nothing installed but Ubuntu itself: what the .deb needs, apt must find from its Depends.
+    container: ubuntu:24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: linux-deb
+          path: deb
+      - name: apt install ./rein-remote.deb
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ./deb/*.deb > /tmp/apt.log || { cat /tmp/apt.log; exit 1; }
+          grep -E '^(Setting up|Unpacking) ' /tmp/apt.log | wc -l | xargs echo "packages set up:"
+          dpkg -s rein-remote | grep -E '^(Version|Depends|Recommends):'
+      - name: What it installed
+        run: |
+          rein-remote --version
+          test -x /usr/bin/rein-remote-host-gtk
+          dpkg -L rein-remote
+      - name: The menu entry and icon
+        run: |
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq desktop-file-utils > /dev/null
+          desktop-file-validate /usr/share/applications/dev.reinharness.RemoteHost.desktop
+          test -f /usr/share/icons/hicolor/scalable/apps/dev.reinharness.RemoteHost.svg
+          grep -E '^(Exec|Icon)=' /usr/share/applications/dev.reinharness.RemoteHost.desktop
+      - name: The app on Xvfb starts the installed host and connects to it
+        run: |
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq xvfb dbus curl iproute2 procps > /dev/null
+          packaging/linux/smoke-app.sh /usr/bin/rein-remote-host-gtk
+      - name: apt remove
+        run: |
+          apt-get remove -y -qq rein-remote
+          for f in /usr/bin/rein-remote /usr/bin/rein-remote-host-gtk /usr/share/applications/dev.reinharness.RemoteHost.desktop \
+                   /usr/share/icons/hicolor/scalable/apps/dev.reinharness.RemoteHost.svg; do
+            if [ -e "$f" ]; then echo "left behind: $f"; exit 1; fi
+          done
+          if dpkg -s rein-remote 2> /dev/null | grep -q '^Status: install'; then echo "still installed"; exit 1; fi
+          echo "removed: nothing left"
+
+  # The AppImage: built on 22.04 (so it runs there and on anything newer) against GTK 4.14 and
+  # libadwaita 1.5 built from source (packaging/linux/gtk-stack.sh; cached, 20+ minutes cold).
+  appimage:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      GTK_PREFIX: /opt/rr-gtk
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Packages (to build the GTK stack and the app)
+        run: sudo packaging/linux/gtk-stack.sh deps && sudo mkdir -p $GTK_PREFIX && sudo chown "$USER" $GTK_PREFIX
+      - name: The GTK stack (cached)
+        id: stack
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /opt/rr-gtk
+          key: gtk-stack-ubuntu-22.04-${{ runner.arch }}-${{ hashFiles('packaging/linux/gtk-stack.sh') }}
+      - name: Build GTK 4.14 and libadwaita 1.5
+        if: steps.stack.outputs.cache-hit != 'true'
+        run: packaging/linux/gtk-stack.sh
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: appimage
+      - name: Build (rein-remote and the app, against that GTK)
+        run: PKG_CONFIG_PATH=$GTK_PREFIX/lib/pkgconfig:$GTK_PREFIX/share/pkgconfig cargo build --release -p rr-server -p rr-host-gtk --features rr-host-gtk/gtk
+      - name: The AppImage
+        run: packaging/linux/build-appimage.sh out
+      - name: Needs no newer glibc than 22.04's (2.35)
+        run: |
+          cd "$RUNNER_TEMP" && "$GITHUB_WORKSPACE"/out/*.AppImage --appimage-extract > /dev/null
+          max=$(find squashfs-root -type f \( -name '*.so*' -o -path '*/usr/bin/*' \) -exec objdump -T {} + 2> /dev/null |
+            grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+          echo "highest glibc symbol version: $max"
+          [ "$(printf '%s\nGLIBC_2.35\n' "$max" | sort -V | tail -1)" = GLIBC_2.35 ]
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-appimage
+          path: out/*.AppImage
+          retention-days: 14
+  appimage-test:
+    needs: appimage
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: linux-appimage
+          path: appimage
+      - name: Xvfb
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq xvfb > /dev/null
+      - name: The system has no GTK 4.14 of its own
+        run: |
+          . /etc/os-release && echo "$PRETTY_NAME"
+          dpkg-query -W -f '${Package} ${Version}\n' libgtk-4-1 libadwaita-1-0 2> /dev/null || echo "no GTK 4 or libadwaita installed"
+      - name: The AppImage on Xvfb starts its host and connects to it
+        run: |
+          chmod +x appimage/*.AppImage
+          packaging/linux/smoke-app.sh "$(ls "$PWD"/appimage/*.AppImage)" --appimage-extract-and-run
+
+  # The .dmg: Rein Remote.app (clients/macos-host) with rein-remote inside it. Skipped until the macOS
+  # host app is on this branch. packaging/macos/build-dmg.sh.
+  dmg:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Is the macOS host app here?
+        id: app
+        run: |
+          if [ -f clients/macos-host/project.yml ]; then echo "present=true" >> "$GITHUB_OUTPUT"
+          else echo "::notice::clients/macos-host isn't on this branch yet: no .dmg"; fi
+      - name: Rust
+        if: steps.app.outputs.present == 'true'
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.app.outputs.present == 'true'
+        with:
+          key: dmg
+      - name: The .dmg (ad-hoc signed)
+        if: steps.app.outputs.present == 'true'
+        run: |
+          brew install xcodegen
+          packaging/macos/build-dmg.sh out
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.app.outputs.present == 'true'
+        with:
+          name: macos-dmg
+          path: out/*.dmg
+          retention-days: 14
+      - name: Mount, copy the app, verify, run its host, detach
+        if: steps.app.outputs.present == 'true'
+        run: packaging/macos/smoke.sh out/*.dmg

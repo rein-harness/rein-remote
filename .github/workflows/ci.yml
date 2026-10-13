@@ -357,6 +357,51 @@ jobs:
             screenshots/
             ${{ runner.temp }}/rr-app-*/*.log
           if-no-files-found: warn
+  # The Windows installer (packaging/windows): the app windows-host built (windows-host-app-build) as an
+  # .msi with WiX v5, its executables and the .msi signed with a certificate made here (as `signing`
+  # does), then installed and uninstalled silently, per user and for all users:
+  # packaging/windows/smoke.ps1 says what each checks. docs/verification/installers.md has the rest.
+  windows-installer:
+    needs: windows-host
+    # The artifact is made before the UI test's result is known: build the installer either way.
+    if: ${{ !cancelled() }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-host-app-build
+          path: ${{ runner.temp }}/Rein Remote
+      - name: WiX v5
+        run: dotnet tool install --global wix --version 5.0.2
+      - name: Sign the executables (a self-signed certificate, as release.yml would with a real one)
+        shell: pwsh
+        run: ./tools/sign/windows.ps1 "$env:RUNNER_TEMP\Rein Remote\ReinRemoteHost.exe" "$env:RUNNER_TEMP\Rein Remote\rein-remote.exe" -SelfSigned
+      - name: The .msi
+        shell: pwsh
+        run: ./packaging/windows/build.ps1 -AppDir "$env:RUNNER_TEMP\Rein Remote" -OutDir out
+      - name: Sign the .msi
+        shell: pwsh
+        run: ./tools/sign/windows.ps1 (Get-Item out\*.msi).FullName -SelfSigned
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-installer
+          path: out/*.msi
+          retention-days: 14
+      - name: Install, run, uninstall (per user, no administrator)
+        shell: pwsh
+        run: ./packaging/windows/smoke.ps1 -Msi (Get-Item out\*.msi).FullName -Scope user
+      - name: Install, run, uninstall (ALLUSERS=1, Program Files, STARTATLOGIN=0)
+        shell: pwsh
+        run: ./packaging/windows/smoke.ps1 -Msi (Get-Item out\*.msi).FullName -Scope machine -NoStartAtLogin
+      - name: msiexec logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-installer-logs
+          path: ${{ runner.temp }}/rr-msi-*
+          if-no-files-found: warn
   # SAML sign-in (`--features saml`): samael verifies signatures with xmlsec1, which needs libxml2,
   # libxmlsec1 (OpenSSL) and clang for its bindings; off by default, so the other builds don't need them.
   saml:

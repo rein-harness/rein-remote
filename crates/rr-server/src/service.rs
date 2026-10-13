@@ -571,8 +571,23 @@ pub fn host_at_login() -> Result<(bool, &'static str, Option<PathBuf>), String> 
 /// host now nor stopping this one.
 pub fn set_host_at_login(on: bool) -> Result<(), String> {
     let s = spec("host".into(), HOST_NAME.into(), None, false, false)?;
+    if on {
+        in_appimage(&s.exe)?;
+    }
     let os = Os::current();
     carry_out(&if on { install_plan(&s, os) } else { uninstall_plan(&s, os) })
+}
+
+/// Inside an AppImage (`$APPDIR`, set by its AppRun), this binary's path is the AppImage's mount,
+/// gone when it exits: a service pointing there would fail at the next login. The app's own login
+/// item (which starts the host) is the way there.
+fn in_appimage(exe: &Path) -> Result<(), String> {
+    match std::env::var_os("APPDIR").filter(|d| !d.is_empty()) {
+        Some(dir) if std::env::var_os("APPIMAGE").is_some() && exe.starts_with(absolute(Path::new(&dir))) => Err(
+            "rein-remote is running from an AppImage, whose files are gone when it quits: start the app at login instead (it starts the host), or install the .deb".into(),
+        ),
+        _ => Ok(()),
+    }
 }
 
 fn absolute(p: &Path) -> PathBuf {

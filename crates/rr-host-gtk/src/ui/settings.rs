@@ -421,7 +421,12 @@ fn set_autostart(on: bool) -> Result<(), String> {
             _ => Ok(()),
         };
     }
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    // From an AppImage, the AppImage itself: the binary's own path is inside its mount, which is
+    // gone once the app quits.
+    let exe = match std::env::var_os("APPIMAGE").filter(|a| !a.is_empty()) {
+        Some(appimage) => PathBuf::from(appimage),
+        None => std::env::current_exe().map_err(|e| e.to_string())?,
+    };
     let text = format!(
         "[Desktop Entry]\nType=Application\nName=Rein Remote\nComment=Share this screen: the tray icon\nExec=\"{}\" --hidden\nIcon={}\nX-GNOME-Autostart-enabled=true\nNoDisplay=true\n",
         exe.display(),
