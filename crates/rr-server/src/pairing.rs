@@ -49,8 +49,9 @@ pub struct Gate {
     pub signin: Option<Arc<SignIn>>,
     pub policy: Option<Policy>,
     pub audit: Arc<Audit>,
-    /// What this server shows, as a policy's `sources` name it (`display`, `window:Simulator`…).
-    pub source: String,
+    /// What this server shows, as a policy's `sources` name it (`display`, `window:Simulator`…): the
+    /// host can switch it while sharing.
+    source: Mutex<String>,
 }
 
 /// A device that paired.
@@ -192,7 +193,7 @@ impl Gate {
             signin: None,
             policy: None,
             audit: Arc::default(),
-            source: String::new(),
+            source: Mutex::default(),
         }
     }
 
@@ -201,8 +202,30 @@ impl Gate {
         self.signin = signin;
         self.policy = policy;
         self.audit = audit;
-        self.source = source;
+        self.source = Mutex::new(source);
         self
+    }
+
+    /// What it shows now, as a policy names it.
+    pub fn source(&self) -> String {
+        self.source.lock().unwrap().clone()
+    }
+
+    /// What it shows from now on (the host switched it): new viewers are let in by it.
+    pub fn set_source(&self, label: String) {
+        *self.source.lock().unwrap() = label;
+    }
+
+    /// Whether this gate pairs devices (it has this machine's key and `--pair` is on).
+    pub fn pairs(&self) -> bool {
+        self.identity.is_some()
+    }
+
+    /// The open pairing code and when it stops working, if there's one that still can be used.
+    pub fn code(&self) -> Option<(String, SystemTime)> {
+        let slot = self.code.lock().unwrap();
+        let c = slot.as_ref().filter(|c| c.expires > Instant::now() && c.tries_left > 0)?;
+        Some((c.code.clone(), SystemTime::now() + c.expires.saturating_duration_since(Instant::now())))
     }
 
     /// Whether anything at all guards the stream (a token, pairing, or sign-in).
@@ -276,7 +299,7 @@ impl Gate {
     /// What the policy lets `p` do here (everything, without a policy).
     pub fn decide(&self, p: &Principal) -> Decision {
         match &self.policy {
-            Some(policy) => policy.decide(&p.who(), &self.source),
+            Some(policy) => policy.decide(&p.who(), &self.source()),
             None => Decision::Allow {
                 rule: "none".into(),
                 perms: Perms::FULL,
@@ -298,7 +321,7 @@ impl Gate {
             Decision::Deny { rule, reason } => {
                 self.audit.log(
                     "session_refused",
-                    serde_json::json!({"user": p.user, "groups": p.groups, "via": p.via, "addr": addr, "transport": transport, "source": self.source, "rule": rule, "reason": reason}),
+                    serde_json::json!({"user": p.user, "groups": p.groups, "via": p.via, "addr": addr, "transport": transport, "source": self.source(), "rule": rule, "reason": reason}),
                 );
                 eprintln!("rein-remote: refused {} ({reason})", p.user);
                 Err(reason)

@@ -264,13 +264,15 @@ impl Link for WtLink {
 /// address beyond NAT), with a certificate made for it (valid 14 days, as browsers require for a
 /// certificate they're given by hash). Each session runs `session` on a thread of its own; returns the
 /// certificate's SHA-256 for the page. With `tls` (a real certificate), the browser checks it as for
-/// any site and there's no hash.
+/// any site and there's no hash. It takes sessions until `stop` is set, then closes (its socket freed
+/// once the thread returned with it is done).
 pub fn webtransport<F>(
     socket: std::net::UdpSocket,
     gate: Arc<crate::pairing::Gate>,
     tls: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
     session: F,
-) -> Result<Option<[u8; 32]>, String>
+) -> Result<(Option<[u8; 32]>, std::thread::JoinHandle<()>), String>
 where
     F: Fn(Box<dyn Link + Send>, crate::auth::Admission) + Send + Sync + 'static,
 {
@@ -315,10 +317,17 @@ where
         .block_on(async { Endpoint::server(config) })
         .map_err(|e| format!("WebTransport on {addr}: {e}"))?;
     let session = Arc::new(session);
-    std::thread::spawn(move || {
+    let thread = std::thread::spawn(move || {
         rt.block_on(async move {
             loop {
-                let incoming = endpoint.accept().await;
+                // A look at `stop` a few times a second (accepting is cancel-safe).
+                let Ok(incoming) = tokio::time::timeout(Duration::from_millis(200), endpoint.accept()).await else {
+                    if stop.load(Ordering::SeqCst) {
+                        endpoint.close(0u32.into(), b"stopped");
+                        break;
+                    }
+                    continue;
+                };
                 let (session, gate) = (session.clone(), gate.clone());
                 tokio::spawn(async move {
                     let Ok(request) = incoming.await else { return };
@@ -421,7 +430,7 @@ where
             }
         });
     });
-    Ok(hash)
+    Ok((hash, thread))
 }
 
 /// The length of the first whole protocol frame in `b`, if it's all there (header: kind, version,

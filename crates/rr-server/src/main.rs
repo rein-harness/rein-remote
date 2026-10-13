@@ -228,6 +228,7 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
         record: None,
         source_label: String::new(),
         prefer: adapt::Prefer::Framerate,
+        shared: Default::default(),
     };
     // Sign-in with an identity provider; a policy; the audit log; recording.
     let (mut public_url, mut oidc_issuer, mut oidc_client, mut oidc_secret_file) = (None, None, None, None);
