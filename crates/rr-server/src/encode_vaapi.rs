@@ -1302,7 +1302,7 @@ impl Vaapi {
                 self.packed_header(&mut bufs, VA_ENC_PACKED_HEADER_TYPE_SEQUENCE, &headers, headers.len() * 8)?;
             }
             if self.intra_refresh && !idr {
-                let (location, size) = rir_band(p.height_mbs() as u32, self.fps, self.since_idr);
+                let (location, size) = rir_band(p.height_mbs(), self.fps, self.since_idr);
                 bufs.push(d.buffer(
                     ctx,
                     VA_ENC_MISC_PARAMETER_BUFFER,
