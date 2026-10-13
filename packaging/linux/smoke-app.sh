@@ -38,8 +38,9 @@ app="" host="" port="" token=""
 for _ in $(seq 120); do
   sleep 0.5
   kill -0 $launched 2>/dev/null || fail "the app exited"
-  app=$(pgrep -n -x rein-remote-hos || true)        # comm: 15 characters
   host=$(pgrep -n -f '/rein-remote host' || true)
+  # The app: the host's parent (whatever started it: AppRun, the AppImage runtime), checked below.
+  app=$([ -n "$host" ] && ps -o ppid= -p "$host" | tr -d ' ' || true)
   if [ -n "$host" ] && [ -s "$home/control.json" ]; then
     url=$(sed -n 's/.*"url":"\([^"]*\)".*/\1/p' "$home/control.json")
     token=$(sed -n 's/.*"token":"\([^"]*\)".*/\1/p' "$home/control.json")
@@ -50,11 +51,12 @@ for _ in $(seq 120); do
     fi
   fi
 done
-[ -n "$app" ] || fail "no rein-remote-host-gtk process"
 [ -n "$host" ] || fail "no rein-remote host started"
-ok "the app (pid $app: $(readlink /proc/$app/exe)) started the host (pid $host: $(readlink /proc/$host/exe))"
-[ "$(ps -o ppid= -p "$host" | tr -d ' ')" = "$app" ] || fail "the host isn't the app's child"
-ok "the host is the app's child"
+case "$(readlink "/proc/$app/exe")" in
+  */rein-remote-host-gtk) ;;
+  *) ps -ef; fail "the host's parent (pid $app: $(readlink "/proc/$app/exe")) isn't the app" ;;
+esac
+ok "the app (pid $app: $(readlink "/proc/$app/exe")) started the host (pid $host: $(readlink "/proc/$host/exe")) as its child"
 curl -sf -H "Authorization: Bearer $token" "$url/control/state" > /dev/null || fail "no answer from $url/control/state"
 ok "the host's control API answers on $url"
 ss -tnp state established "( dport = :$port )" | grep "pid=$app," || fail "the app has no connection to the host's API"
