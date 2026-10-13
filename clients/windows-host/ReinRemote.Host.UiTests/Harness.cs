@@ -183,6 +183,62 @@ sealed class AppSession : IDisposable
         return e.Patterns.Value.IsSupported ? e.Patterns.Value.Pattern.Value.Value ?? "" : e.Name ?? "";
     }
 
+    /// <summary>An element's name and every name under it (an InfoBar's title and message, a list's rows).</summary>
+    public string AllText(string automationId)
+    {
+        var e = Find(automationId);
+        if (e is null)
+            return "";
+        var names = new List<string> { e.Name ?? "" };
+        foreach (var d in e.FindAllDescendants())
+        {
+            try
+            {
+                names.Add(d.Name ?? "");
+                if (d.Patterns.Value.IsSupported)
+                    names.Add(d.Patterns.Value.Pattern.Value.Value ?? "");
+            }
+            catch (Exception)
+            {
+            }
+        }
+        return string.Join(" | ", names.Where(n => n.Length > 0));
+    }
+
+    /// <summary>Picks the first item of a combo box whose name starts with <paramref name="prefix"/>.</summary>
+    public string Pick(string comboId, string prefix)
+    {
+        var combo = ById(comboId);
+        combo.Patterns.ExpandCollapse.Pattern.Expand();
+        Thread.Sleep(500);
+        var item = Env.Until(() => combo.FindAllDescendants(cf => cf.ByControlType(ControlType.ListItem))
+                .Concat(Window.FindAllDescendants(cf => cf.ByControlType(ControlType.ListItem)))
+                .FirstOrDefault(i => (i.Name ?? "").StartsWith(prefix, StringComparison.Ordinal)),
+            $"an item starting {prefix} in {comboId}");
+        var name = item.Name;
+        item.Patterns.SelectionItem.Pattern.Select();
+        Thread.Sleep(300);
+        try
+        {
+            if (combo.Patterns.ExpandCollapse.Pattern.ExpandCollapseState.Value == ExpandCollapseState.Expanded)
+                combo.Patterns.ExpandCollapse.Pattern.Collapse();
+        }
+        catch (Exception)
+        {
+        }
+        return name;
+    }
+
+    /// <summary>The button of the open dialog (ContentDialog's PrimaryButton), pressed.</summary>
+    public void Dialog(string reason = "")
+    {
+        var primary = ById("PrimaryButton");
+        if (reason.Length > 0 && Find("ConfirmReason") is { } box)
+            box.Patterns.Value.Pattern.SetValue(reason);
+        primary.Patterns.Invoke.Pattern.Invoke();
+        Env.Until(() => Find("PrimaryButton") is null, "the dialog closed");
+    }
+
     public void Press(string automationId)
     {
         var e = ById(automationId);

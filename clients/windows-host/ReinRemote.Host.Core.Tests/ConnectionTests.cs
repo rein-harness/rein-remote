@@ -172,7 +172,7 @@ public class ConnectionTests : IDisposable
         Assert.All(states, s => Assert.Equal(1001, s.Pid));
         Assert.Equal("5f1c2a9b0e7d4c31", viewers.Last().Viewers[0].Id);
         Assert.NotNull(c.Client);
-        Assert.Contains(first.Seen, s => s == $"GET /control/events Bearer {first.Token}");
+        await Until(() => first.Seen.Contains($"GET /control/events Bearer {first.Token}"), "the first host's events followed");
 
         // The host exits: its stream ends, the app says so and keeps trying.
         first.Dispose();
@@ -183,7 +183,7 @@ public class ConnectionTests : IDisposable
         // A new host (a new port, a new token) writes its control.json: the app finds it.
         using var second = new FakeHost(home, 1002);
         await Until(() => c.Status == LinkStatus.Connected && states.Any(s => s.Pid == 1002), "the second host");
-        Assert.Contains(second.Seen, s => s == $"GET /control/events Bearer {second.Token}");
+        await Until(() => second.Seen.Contains($"GET /control/events Bearer {second.Token}"), "the second host's events followed");
         Assert.Equal(c.Client!.Info.Token, second.Token);
     }
 
@@ -224,6 +224,8 @@ public class ConnectionTests : IDisposable
         Assert.Contains(LinkStatus.Starting, statuses);
         Assert.Equal("host", File.ReadAllText(Path.Combine(dir, "launched.txt")).Trim());
         Assert.EndsWith("can't open the display", c.StatusMessage);
-        Assert.Contains("can't open the display", File.ReadAllText(Path.Combine(home, "host.log")));
+        // (Opened as a viewer of a log being written would: it may still be open for writing.)
+        using var log = new StreamReader(new FileStream(Path.Combine(home, "host.log"), FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete));
+        Assert.Contains("can't open the display", log.ReadToEnd());
     }
 }

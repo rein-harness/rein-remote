@@ -123,6 +123,25 @@ public sealed class HostLauncher : IDisposable
             };
             p.ErrorDataReceived += line;
             p.OutputDataReceived += line;
+            // When it ends: its last lines read, then the log closed (so it can be read, moved, deleted).
+            p.Exited += (_, _) =>
+            {
+                try
+                {
+                    p.WaitForExit();
+                }
+                catch (Exception)
+                {
+                }
+                lock (gate)
+                {
+                    if (child == p)
+                    {
+                        log?.Dispose();
+                        log = null;
+                    }
+                }
+            };
             p.Start();
             p.BeginErrorReadLine();
             p.BeginOutputReadLine();
