@@ -16,6 +16,7 @@
 //!   rein-remote selftest --window Notepad --type hi   # capture works, and typing changes what's seen
 //!   rein-remote selftest --test-pattern 1920x1080 --encode out.h264   # the encoder in use, timed; its stream saved
 //!   rein-remote serve --listen 0.0.0.0:7979 --fps 60 --bitrate 8000   # --fps auto (the default): the viewer's display rate
+//!   rein-remote serve --prefer quality     # on a slow link frames give way before the picture (default: framerate)
 //!   rein-remote serve --listen 127.0.0.1:0 --token T   # a free port (printed), the stream needs ?token=T
 //!                                                      # (or REIN_REMOTE_TOKEN; kept out of `ps`)
 
@@ -55,7 +56,7 @@ use capture::{Source, TestPattern};
 
 fn usage() -> ! {
     eprintln!(
-        "rein-remote {}\n\nusage:\n  rein-remote serve [--config FILE.toml] [--display :N | --window APP|TITLE|ID | --app NAME | --kms [CONNECTOR] | --vnc HOST:PORT [--vnc-password P] | --pipe WxH | --test-pattern [WxH] [--motion full]] [--listen ADDR] [--fps auto|N] [--codec h264|h265|auto] [--bitrate KBPS|auto] [--token T] [--webtransport on|off] [--tls-cert PEM --tls-key PEM] [--tailscale-cert on|off] [--mdns on|off] [--pair on|off] [--relay ws(s)://HOST:PORT ... [--room CODE] [--relay-secret S]] [--audio on|off] [--public-url URL --oidc-issuer URL --oidc-client-id ID [--oidc-client-secret-file F] [--oidc-scopes S] [--oidc-user-claim C] [--oidc-groups-claim C] | --saml-idp-metadata FILE|URL [--saml-entity-id ID] [--saml-user-attr A] [--saml-groups-attr A]] [--policy FILE] [--audit FILE] [--record DIR]\n  rein-remote relay [--config FILE.toml] [--listen ADDR] [--secret S] [--metrics-listen ADDR|PORT|off]\n  rein-remote install-service [serve|relay] [--config FILE.toml] [--system] [--name NAME] [--print]\n  rein-remote uninstall-service [serve|relay] [--system] [--name NAME] [--print]\n  rein-remote windows [--json]\n  rein-remote displays\n  rein-remote discover [SECONDS]\n  rein-remote paired | unpair ID\n  rein-remote connect URL|NAME [--seconds N] [--pair CODE] [--json] [--webtransport on|off] [--datagrams on|off] [--direct on|off]\n  rein-remote selftest [--window Q | --display :N | --kms [CONNECTOR] | --test-pattern [WxH]] [--type TEXT] [--encode OUT.h264 [--frames N]]\n  rein-remote --version",
+        "rein-remote {}\n\nusage:\n  rein-remote serve [--config FILE.toml] [--display :N | --window APP|TITLE|ID | --app NAME | --kms [CONNECTOR] | --vnc HOST:PORT [--vnc-password P] | --pipe WxH | --test-pattern [WxH] [--motion full]] [--listen ADDR] [--fps auto|N] [--codec h264|h265|auto] [--bitrate KBPS|auto] [--prefer framerate|quality] [--token T] [--webtransport on|off] [--tls-cert PEM --tls-key PEM] [--tailscale-cert on|off] [--mdns on|off] [--pair on|off] [--relay ws(s)://HOST:PORT ... [--room CODE] [--relay-secret S]] [--audio on|off] [--public-url URL --oidc-issuer URL --oidc-client-id ID [--oidc-client-secret-file F] [--oidc-scopes S] [--oidc-user-claim C] [--oidc-groups-claim C] | --saml-idp-metadata FILE|URL [--saml-entity-id ID] [--saml-user-attr A] [--saml-groups-attr A]] [--policy FILE] [--audit FILE] [--record DIR]\n  rein-remote relay [--config FILE.toml] [--listen ADDR] [--secret S] [--metrics-listen ADDR|PORT|off]\n  rein-remote install-service [serve|relay] [--config FILE.toml] [--system] [--name NAME] [--print]\n  rein-remote uninstall-service [serve|relay] [--system] [--name NAME] [--print]\n  rein-remote windows [--json]\n  rein-remote displays\n  rein-remote discover [SECONDS]\n  rein-remote paired | unpair ID\n  rein-remote connect URL|NAME [--seconds N] [--pair CODE] [--json] [--webtransport on|off] [--datagrams on|off] [--direct on|off]\n  rein-remote selftest [--window Q | --display :N | --kms [CONNECTOR] | --test-pattern [WxH]] [--type TEXT] [--encode OUT.h264 [--frames N]]\n  rein-remote --version",
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(2);
@@ -226,6 +227,7 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
         audit: Default::default(),
         record: None,
         source_label: String::new(),
+        prefer: adapt::Prefer::Framerate,
     };
     // Sign-in with an identity provider; a policy; the audit log; recording.
     let (mut public_url, mut oidc_issuer, mut oidc_client, mut oidc_secret_file) = (None, None, None, None);
@@ -267,6 +269,7 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
                     _ => return Err("--codec is h264, h265 or auto".into()),
                 }
             }
+            "--prefer" => opts.prefer = adapt::Prefer::parse(&val()?).ok_or("--prefer is framerate or quality")?,
             "--bitrate" => opts.bitrate_kbps = match val()?.as_str() { "auto" => 0, v => v.parse().map_err(|_| "--bitrate is kbit/s (or auto)")? },
             "--display" => display = Some(val()?),
             "--window" => window = Some(val()?),

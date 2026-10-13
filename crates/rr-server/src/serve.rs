@@ -69,6 +69,8 @@ pub struct Options {
     pub record: Option<std::path::PathBuf>,
     /// What this server shows, as a policy's `sources` name it (`display`, `window:Simulator`…).
     pub source_label: String,
+    /// What gives way first on a slow link (`--prefer`): frames or the picture.
+    pub prefer: crate::adapt::Prefer,
 }
 
 /// Latency and throughput, kept per session and shown by /stats.
@@ -1073,7 +1075,7 @@ fn stream(
     }
 
     let mut frame_time = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
-    let mut adapt = crate::adapt::Adapt::new(top, fps);
+    let mut adapt = crate::adapt::Adapt::new(top, fps).prefer(opts.prefer);
     // Frames into the encoder and out of it: an encoder that skips frames (its rate control, when a
     // frame can't fit its share of the bitrate) is short of bits for the picture's size.
     let (mut enc_in, mut enc_out, mut enc_seen) = (0u64, 0u64, (0u64, 0u64));
@@ -1483,6 +1485,7 @@ mod tests {
             audit: Default::default(),
             record: None,
             source_label: "test-pattern".into(),
+            prefer: Default::default(),
         };
         tx.send(hello).unwrap();
         let source: Arc<Mutex<Box<dyn Source>>> = Arc::new(Mutex::new(Box::new(crate::capture::TestPattern::new(320, 240))));
@@ -1741,6 +1744,7 @@ max_session_minutes = 0.05
             audit: Arc::new(crate::audit::Audit::open(&audit_path).unwrap()),
             record: Some(dir.join("rec")),
             source_label: "test-pattern".into(),
+            prefer: Default::default(),
         };
         let spy = Spy(crate::capture::TestPattern::new(320, 240), inputs.clone());
         std::thread::spawn(move || run(Box::new(spy), opts));
