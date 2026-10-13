@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Page
+    x:Class="ReinRemote.Host.Pages.PolicyPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    NavigationCacheMode="Required">
+    <Grid Padding="24,8,24,24" RowSpacing="10" MaxWidth="1100">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+        <TextBlock Text="Policy" Style="{StaticResource PageTitle}" AutomationProperties.HeadingLevel="Level1" AutomationProperties.AutomationId="PageTitle" />
+        <TextBlock Grid.Row="1" Style="{StaticResource Hint}"
+                   Text="Who may watch, and what they may do: rules matched in order, the first that matches decides (view only, clipboard, sound, sources, a time limit). rein-remote's own parser checks it before anything changes. The README's --policy has every key." />
+        <Grid Grid.Row="2" ColumnSpacing="12">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <TextBlock x:Name="PolicyStatus" VerticalAlignment="Center" Style="{StaticResource BodyStrongTextBlockStyle}" TextWrapping="Wrap"
+                       AutomationProperties.AutomationId="PolicyStatus" AutomationProperties.LiveSetting="Polite" />
+            <ComboBox x:Name="PolicyFormat" Grid.Column="1" Width="120" SelectedIndex="0"
+                      AutomationProperties.AutomationId="PolicyFormat" AutomationProperties.Name="Policy format">
+                <ComboBoxItem Content="TOML" Tag="toml" />
+                <ComboBoxItem Content="JSON" Tag="json" />
+            </ComboBox>
+        </Grid>
+        <TextBox x:Name="PolicyText" Grid.Row="3" AcceptsReturn="True" TextWrapping="NoWrap" FontFamily="Cascadia Mono, Consolas" FontSize="13"
+                 ScrollViewer.HorizontalScrollBarVisibility="Auto" ScrollViewer.VerticalScrollBarVisibility="Auto" IsSpellCheckEnabled="False"
+                 PlaceholderText="[[rule]]&#x0a;name = &quot;admins&quot;&#x0a;groups = [&quot;rr-admins&quot;]&#x0a;&#x0a;[[rule]]&#x0a;name = &quot;everyone else, view only&quot;&#x0a;view_only = true"
+                 AutomationProperties.AutomationId="PolicyText" AutomationProperties.Name="Policy text" />
+        <InfoBar x:Name="PolicyResult" Grid.Row="4" IsClosable="True" AutomationProperties.AutomationId="PolicyResult" AutomationProperties.Name="Policy result"
+                 AutomationProperties.LiveSetting="Assertive" />
+        <StackPanel Grid.Row="5" Orientation="Horizontal" Spacing="8">
+            <Button x:Name="SavePolicy" Content="Check and save" Style="{StaticResource AccentButtonStyle}" Click="Save_Click"
+                    AutomationProperties.AutomationId="SavePolicy" AutomationProperties.Name="Check and save the policy" />
+            <Button x:Name="ReloadPolicy" Content="Undo changes" Click="Reload_Click"
+                    AutomationProperties.AutomationId="ReloadPolicy" AutomationProperties.Name="Undo policy changes" />
+            <Button x:Name="PolicyOff" Content="Turn the policy off" Click="Off_Click"
+                    AutomationProperties.AutomationId="PolicyOff" AutomationProperties.Name="Turn the policy off" />
+        </StackPanel>
+    </Grid>
+</Page>

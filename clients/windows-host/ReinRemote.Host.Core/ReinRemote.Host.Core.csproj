@@ -1,0 +1,7 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- The control API's client (docs/control-api.md), with nothing of WinUI: built and tested on any OS. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>ReinRemote.Host.Core</RootNamespace>
+  </PropertyGroup>
+</Project>
