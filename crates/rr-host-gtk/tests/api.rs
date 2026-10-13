@@ -19,7 +19,9 @@ const DOC: &str = include_str!("../../../docs/control-api.md");
 /// The doc's ```json blocks, made parseable (`…` in an object stands for more keys).
 fn doc_json() -> Vec<Value> {
     let mut out = Vec::new();
-    let mut rest = DOC;
+    // (A Windows checkout may have CRLF line ends.)
+    let doc = DOC.replace("\r\n", "\n");
+    let mut rest = doc.as_str();
     while let Some(i) = rest.find("```json\n") {
         rest = &rest[i + 8..];
         let end = rest.find("```").unwrap();

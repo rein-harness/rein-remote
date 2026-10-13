@@ -369,7 +369,7 @@ const PAGES: &[(&str, &str, &str)] = &[
     ("policy", "Policy", "document-edit-symbolic"),
     ("sessions", "Live sessions", "network-transmit-receive-symbolic"),
     ("audit", "Audit log", "view-list-symbolic"),
-    ("metrics", "Metrics", "utilities-system-monitor-symbolic"),
+    ("metrics", "Metrics", "preferences-system-details-symbolic"),
 ];
 
 fn build(app: &adw::Application, args: &Args) -> Rc<Ctx> {

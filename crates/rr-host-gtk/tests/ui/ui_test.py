@@ -210,8 +210,12 @@ def goto(page):
 
 
 def shot(name):
+    """The app's window (else the whole screen) as a PNG."""
     os.makedirs(SHOTS, exist_ok=True)
-    subprocess.run(["import", "-window", "root", os.path.join(SHOTS, f"{name}.png")], check=False)
+    wins = subprocess.run(["xdotool", "search", "--onlyvisible", "--pid", str(APP_PID)],
+                          capture_output=True, text=True).stdout.split()
+    target = wins[-1] if wins else "root"
+    subprocess.run(["import", "-window", target, os.path.join(SHOTS, f"{name}.png")], check=False)
 
 
 def dump_tree():
