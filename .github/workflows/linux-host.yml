@@ -1,7 +1,7 @@
 name: Linux host app
 on:
   push:
-    branches: [main, phase-7-linux]
+    branches: [main]
   pull_request:
 permissions:
   contents: read
