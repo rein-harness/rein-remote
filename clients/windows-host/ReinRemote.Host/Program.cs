@@ -12,7 +12,7 @@ public static class Program
         // One app per home folder: a second start shows the first one's window and leaves.
         if (!SingleInstance.Claim(App.HomeFolder()))
             return 0;
-        Application.Start(_ =>
+        Application.Start(p =>
         {
             var context = new DispatcherQueueSynchronizationContext(DispatcherQueue.GetForCurrentThread());
             SynchronizationContext.SetSynchronizationContext(context);
