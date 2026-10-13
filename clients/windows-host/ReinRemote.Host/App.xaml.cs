@@ -7,7 +7,7 @@ namespace ReinRemote.Host;
 public partial class App : Application
 {
     public static HostModel Model { get; private set; } = null!;
-    public static MainWindow? MainWindow { get; private set; }
+    public static MainWindow? Shell { get; private set; }
     static TrayIcon? tray;
     static HostLauncher? launcher;
     static readonly object logGate = new();
@@ -62,7 +62,7 @@ public partial class App : Application
         }
         Log($"start: home {home}, host binary {launcher?.ExePath ?? "(none)"}");
         Model = new HostModel(ui, new HostConnection(home, launcher));
-        MainWindow = new MainWindow();
+        Shell = new MainWindow();
         try
         {
             tray = new TrayIcon(Model);
@@ -73,14 +73,14 @@ public partial class App : Application
         }
         var background = Environment.GetCommandLineArgs().Contains("--background");
         if (!background)
-            MainWindow.Activate();
+            Shell.Activate();
         SingleInstance.Listen(() => ui.TryEnqueue(ShowWindow));
         Model.Start();
     }
 
     public static bool HasTray => tray is not null;
 
-    public static void ShowWindow() => MainWindow?.ShowAndFocus();
+    public static void ShowWindow() => Shell?.ShowAndFocus();
 
     /// <summary>Quit: the tray icon removed, and the host this app started stopped with it.</summary>
     public static void Quit()
@@ -89,7 +89,7 @@ public partial class App : Application
         tray?.Dispose();
         tray = null;
         launcher?.Stop();
-        MainWindow?.CloseForGood();
+        Shell?.CloseForGood();
         Current.Exit();
     }
 }

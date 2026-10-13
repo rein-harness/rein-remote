@@ -30,7 +30,7 @@
   </ItemGroup>
   <ItemGroup>
     <Content Include="Assets\*.ico" CopyToOutputDirectory="PreserveNewest" />
-    <!-- The server, from `cargo build --release -p rr-server`, shipped beside the app. -->
+    <!-- The server, from cargo build (release, rr-server), shipped beside the app. -->
     <None Include="..\..\..\target\release\rein-remote.exe" Link="rein-remote.exe" CopyToOutputDirectory="PreserveNewest"
           Condition="Exists('..\..\..\target\release\rein-remote.exe')" />
   </ItemGroup>

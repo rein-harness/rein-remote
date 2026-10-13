@@ -46,7 +46,7 @@ public sealed partial class MainWindow : Window
         SetTitleBar(AppTitleBar);
         ThemeTitleBar();
         Root.ActualThemeChanged += (_, _) => ThemeTitleBar();
-        Size();
+        FitToScreen();
         // Closing the window keeps the app in the notification area; Quit (its menu) ends it.
         AppWindow.Closing += (_, e) =>
         {
@@ -72,14 +72,19 @@ public sealed partial class MainWindow : Window
         bar.ButtonInactiveBackgroundColor = Colors.Transparent;
         bar.ButtonForegroundColor = dark ? Colors.White : Colors.Black;
         bar.ButtonHoverForegroundColor = dark ? Colors.White : Colors.Black;
-        bar.ButtonHoverBackgroundColor = dark ? Windows.UI.Color.FromArgb(0x20, 0xff, 0xff, 0xff) : Windows.UI.Color.FromArgb(0x20, 0, 0, 0);
+        bar.ButtonHoverBackgroundColor = dark ? ColorHelper.FromArgb(0x20, 0xff, 0xff, 0xff) : ColorHelper.FromArgb(0x20, 0, 0, 0);
         bar.ButtonInactiveForegroundColor = Colors.Gray;
     }
 
-    void Size()
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    static extern uint GetDpiForWindow(IntPtr hwnd);
+
+    /// <summary>1100 × 780 (at this display's scale), smaller when the screen is, centered.</summary>
+    void FitToScreen()
     {
         var area = DisplayArea.GetFromWindowId(AppWindow.Id, DisplayAreaFallback.Primary).WorkArea;
-        var scale = (Content as FrameworkElement)?.XamlRoot?.RasterizationScale ?? 1.0;
+        var dpi = GetDpiForWindow(WinRT.Interop.WindowNative.GetWindowHandle(this));
+        var scale = dpi == 0 ? 1.0 : dpi / 96.0;
         int w = Math.Min((int)(1100 * scale), area.Width), h = Math.Min((int)(780 * scale), area.Height);
         AppWindow.MoveAndResize(new Windows.Graphics.RectInt32(area.X + (area.Width - w) / 2, area.Y + (area.Height - h) / 2, w, h));
     }

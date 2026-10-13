@@ -10,6 +10,8 @@ namespace ReinRemote.Host.Pages;
 public sealed partial class SharingPage : Page
 {
     HostModel M => App.Model;
+    static readonly SolidColorBrush Green = new(Microsoft.UI.ColorHelper.FromArgb(255, 0x16, 0xa3, 0x4a));
+    static readonly SolidColorBrush Grey = new(Microsoft.UI.ColorHelper.FromArgb(255, 0x8a, 0x8a, 0x94));
     readonly DispatcherTimer tick = new() { Interval = TimeSpan.FromSeconds(1) };
     List<SourceItem> sources = new();
     bool settingSource;
@@ -54,12 +56,12 @@ public sealed partial class SharingPage : Page
         {
             SharingStatus.Text = M.Status == LinkStatus.Connected ? "Connecting…" : "Not connected";
             SharingDetail.Text = M.StatusMessage ?? "";
-            StatusDot.Fill = (Brush)Application.Current.Resources["ControlStrongFillColorDisabledBrush"];
+            StatusDot.Fill = Grey;
             SetStartStop(false);
             return;
         }
         SharingStatus.Text = s!.Sharing ? "Sharing" : "Not sharing";
-        StatusDot.Fill = (Brush)Application.Current.Resources[s.Sharing ? "SystemFillColorSuccessBrush" : "ControlStrongFillColorDisabledBrush"];
+        StatusDot.Fill = s.Sharing ? Green : Grey;
         SharingDetail.Text = s.Sharing
             ? $"{(s.Viewers == 1 ? "1 viewer" : $"{s.Viewers} viewers")} · viewers connect on {s.Listen}"
             : s.Error is { Length: > 0 } e ? $"Didn't start: {e}" : "No one can connect until you start sharing.";
