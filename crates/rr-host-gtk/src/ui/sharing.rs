@@ -1,7 +1,7 @@
 //! Sharing: on or off, what's shared, the links (each a key to the screen) with a QR code, and the
 //! pairing code with its countdown.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -19,10 +19,9 @@ struct Page {
     error: gtk::Label,
     sources: adw::PreferencesGroup,
     source_rows: Rows,
-    source_checks: RefCell<Vec<(String, gtk::CheckButton)>>,
+    /// Each source's row: its id, the mark on the one shared, its Share button.
+    source_marks: RefCell<Vec<(String, String, gtk::Image, gtk::Button)>>,
     source_error: gtk::Label,
-    /// Set while the page sets the radio buttons itself (so it doesn't switch the source).
-    quiet: Cell<bool>,
     last_sources: RefCell<Sources>,
     links: adw::PreferencesGroup,
     link_rows: Rows,
@@ -95,7 +94,6 @@ pub fn page(ctx: &Rc<Ctx>) -> adw::PreferencesPage {
     let code = gtk::Label::new(Some("–"));
     code.add_css_class("title-1");
     code.set_selectable(true);
-    widgets::name(&code, "Pairing code");
     let countdown = gtk::Label::new(None);
     countdown.add_css_class("dim-label");
     countdown.add_css_class("numeric");
@@ -120,9 +118,8 @@ pub fn page(ctx: &Rc<Ctx>) -> adw::PreferencesPage {
         error,
         sources,
         source_rows: Rows::default(),
-        source_checks: RefCell::new(vec![]),
+        source_marks: RefCell::new(vec![]),
         source_error,
-        quiet: Cell::new(false),
         last_sources: RefCell::new(Sources::default()),
         links,
         link_rows: Rows::default(),
@@ -253,7 +250,7 @@ fn switch_source(ctx: &Rc<Ctx>, p: &Rc<Page>, id: String) {
 /// The sources as radio buttons, the current one chosen.
 fn draw_sources(ctx: &Rc<Ctx>, p: &Rc<Page>) {
     p.source_rows.clear(&p.sources);
-    p.source_checks.borrow_mut().clear();
+    p.source_marks.borrow_mut().clear();
     let s = p.last_sources.borrow().clone();
     let current = ctx.state.borrow().source.clone();
     let mut entries: Vec<(String, String, String)> = Vec::new();
@@ -271,21 +268,17 @@ fn draw_sources(ctx: &Rc<Ctx>, p: &Rc<Page>) {
     if !known && !current.is_empty() {
         entries.insert(0, (current.clone(), source_label(&current), "shared now".into()));
     }
-    p.quiet.set(true);
-    let mut first: Option<gtk::CheckButton> = None;
-    let mut add = |id: &str, title: &str, sub: &str, parent: Option<&adw::ExpanderRow>| {
-        let (row, check) = widgets::choice_row(title, sub, first.as_ref());
-        if first.is_none() {
-            first = Some(check.clone());
-        }
-        check.set_active(id == current);
+    let add = |id: &str, title: &str, sub: &str, parent: Option<&adw::ExpanderRow>| {
+        let row = widgets::row(title, sub);
+        let mark = gtk::Image::from_icon_name("object-select-symbolic");
+        mark.set_tooltip_text(Some("Shared now"));
+        row.add_prefix(&mark);
+        let b = widgets::button("Share");
+        widgets::name(&b, &format!("Share {title}"));
         let (ctx2, p2, id2) = (ctx.clone(), p.clone(), id.to_owned());
-        check.connect_toggled(move |c| {
-            if c.is_active() && !p2.quiet.get() && ctx2.state.borrow().source != id2 {
-                switch_source(&ctx2, &p2, id2.clone());
-            }
-        });
-        p.source_checks.borrow_mut().push((id.to_owned(), check));
+        b.connect_clicked(move |_| switch_source(&ctx2, &p2, id2.clone()));
+        row.add_suffix(&b);
+        p.source_marks.borrow_mut().push((id.to_owned(), title.to_owned(), mark, b));
         match parent {
             Some(e) => e.add_row(&row),
             None => p.source_rows.add(&p.sources, &row),
@@ -306,8 +299,20 @@ fn draw_sources(ctx: &Rc<Ctx>, p: &Rc<Page>) {
         }
         p.source_rows.add(&p.sources, &exp);
     }
-    p.quiet.set(false);
+    mark_source(&current, p);
     widgets::set_text(&p.source_error, s.error.as_deref().unwrap_or(""));
+}
+
+/// The mark on the source shared; its button says so.
+fn mark_source(current: &str, p: &Page) {
+    for (id, title, mark, b) in p.source_marks.borrow().iter() {
+        let on = id == current;
+        mark.set_opacity(if on { 1.0 } else { 0.0 });
+        b.set_label(if on { "Shared" } else { "Share" });
+        // (A new label renames the button: named again.)
+        widgets::name(b, &format!("Share {title}"));
+        b.set_sensitive(!on);
+    }
 }
 
 fn draw(ctx: &Rc<Ctx>, p: &Rc<Page>) {
@@ -331,17 +336,11 @@ fn draw(ctx: &Rc<Ctx>, p: &Rc<Page>) {
     p.restart.set_visible(connected && s.sharing && s.restart_needed);
     widgets::set_text(&p.error, if connected { s.error.as_deref().unwrap_or("") } else { "" });
 
-    // The source chosen follows the state.
-    p.quiet.set(true);
-    for (id, c) in p.source_checks.borrow().iter() {
-        if *id == s.source && !c.is_active() {
-            c.set_active(true);
-        }
-    }
-    p.quiet.set(false);
-    if !p.source_checks.borrow().iter().any(|(id, _)| *id == s.source) && connected && !p.last_sources.borrow().displays.is_empty() {
+    // The source shared follows the state.
+    if !p.source_marks.borrow().iter().any(|(id, _, _, _)| *id == s.source) && connected && !p.last_sources.borrow().displays.is_empty() {
         draw_sources(ctx, p);
     }
+    mark_source(&s.source, p);
 
     draw_links(ctx, p, &s.links);
 

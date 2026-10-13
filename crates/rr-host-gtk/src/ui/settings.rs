@@ -14,11 +14,10 @@ use super::widgets::{self, Rows};
 use super::{Change, Ctx};
 
 struct Form {
-    framerate: gtk::CheckButton,
-    quality: gtk::CheckButton,
+    prefer: Vec<(&'static str, gtk::ToggleButton)>,
     fps: gtk::Entry,
     bitrate: gtk::Entry,
-    codecs: Vec<(&'static str, gtk::CheckButton)>,
+    codecs: Vec<(&'static str, gtk::ToggleButton)>,
     audio: gtk::Switch,
     listen: gtk::Entry,
     mdns: gtk::Switch,
@@ -52,19 +51,10 @@ fn num_or_text(s: &str) -> Value {
 impl Form {
     fn fill(self: &Rc<Self>, s: &Settings) {
         *self.loaded.borrow_mut() = s.settings.clone();
-        if s.str("prefer") == "quality" {
-            self.quality.set_active(true);
-        } else {
-            self.framerate.set_active(true);
-        }
+        widgets::choose(&self.prefer, &s.str("prefer"));
         self.fps.set_text(&s.str("fps"));
         self.bitrate.set_text(&s.str("bitrate"));
-        let codec = s.str("codec");
-        for (c, b) in &self.codecs {
-            if *c == codec {
-                b.set_active(true);
-            }
-        }
+        widgets::choose(&self.codecs, &s.str("codec"));
         self.audio.set_active(s.bool("audio"));
         self.listen.set_text(&s.str("listen"));
         self.mdns.set_active(s.bool("mdns"));
@@ -92,11 +82,13 @@ impl Form {
     /// The form's values, keyed as `host.toml` (secrets only when typed).
     fn values(&self) -> Map<String, Value> {
         let mut m = Map::new();
-        m.insert("prefer".into(), Value::from(if self.quality.is_active() { "quality" } else { "framerate" }));
+        if let Some(p) = widgets::chosen(&self.prefer) {
+            m.insert("prefer".into(), Value::from(p));
+        }
         m.insert("fps".into(), num_or_text(&self.fps.text()));
         m.insert("bitrate".into(), num_or_text(&self.bitrate.text()));
-        if let Some((c, _)) = self.codecs.iter().find(|(_, b)| b.is_active()) {
-            m.insert("codec".into(), Value::from(*c));
+        if let Some(c) = widgets::chosen(&self.codecs) {
+            m.insert("codec".into(), Value::from(c));
         }
         m.insert("audio".into(), Value::from(self.audio.is_active()));
         m.insert("listen".into(), Value::from(self.listen.text().trim()));
@@ -159,41 +151,24 @@ pub fn page(ctx: &Rc<Ctx>) -> adw::PreferencesPage {
     overridden.set_visible(false);
     pp.add(&overridden);
 
-    let picture = widgets::group("Picture", "On a slow link something gives way: choose what.");
-    let (r1, framerate) = widgets::choice_row(
-        "Frame rate first",
-        "The bitrate, then the picture's size give way before frames do (games, motion)",
-        None,
+    let picture = widgets::group("Picture", "");
+    let (pr0, prefer) = widgets::segmented(
+        "On a slow link",
+        "Frame rate first: the bitrate, then the picture's size give way before frames do (games, motion). Quality first: frames give way first, the picture keeps its size (text, detail).",
+        &[("framerate", "Frame rate first"), ("quality", "Quality first")],
     );
-    let (r2, quality) = widgets::choice_row(
-        "Quality first",
-        "Frames give way first; the picture keeps its size (text, detail)",
-        Some(&framerate),
-    );
-    picture.add(&r1);
-    picture.add(&r2);
+    picture.add(&pr0);
     let (fr, fps) = widgets::entry_row("Frame rate", "auto (the viewer's display rate) or 1 to 240", "auto");
     let (br, bitrate) = widgets::entry_row("Bitrate", "auto, or the most kbit/s to send", "auto");
     picture.add(&fr);
     picture.add(&br);
+    let (cr, codecs) = widgets::segmented(
+        "Codec",
+        "H.264: every viewer decodes it. H.265: less bitrate for the same picture. Automatic: HEVC where both sides have it in hardware.",
+        &[("h264", "H.264"), ("h265", "H.265"), ("auto", "Automatic")],
+    );
+    picture.add(&cr);
     pp.add(&picture);
-
-    let codec_group = widgets::group("Codec", "");
-    let mut codecs = Vec::new();
-    let mut first: Option<gtk::CheckButton> = None;
-    for (id, title, sub) in [
-        ("h264", "H.264", "Every viewer decodes it"),
-        ("h265", "H.265 (HEVC)", "Less bitrate for the same picture, where viewers have it"),
-        ("auto", "Automatic", "HEVC where both sides have it in hardware"),
-    ] {
-        let (r, c) = widgets::choice_row(title, sub, first.as_ref());
-        if first.is_none() {
-            first = Some(c.clone());
-        }
-        codec_group.add(&r);
-        codecs.push((id, c));
-    }
-    pp.add(&codec_group);
 
     let sound = widgets::group("Sound", "");
     let (ar, audio) = widgets::switch_row("Sound", "This computer's sound to viewers");
@@ -271,8 +246,7 @@ pub fn page(ctx: &Rc<Ctx>) -> adw::PreferencesPage {
     pp.add(&login);
 
     let f = Rc::new(Form {
-        framerate,
-        quality,
+        prefer,
         fps,
         bitrate,
         codecs,

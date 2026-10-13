@@ -34,12 +34,13 @@ const SAML: &[(&str, &str, &str)] = &[
 pub fn signin_page(ctx: &Rc<Ctx>) -> adw::PreferencesPage {
     let pp = adw::PreferencesPage::new();
     let kind = widgets::group("Sign-in", "Viewers sign in with your identity provider before they see the screen.");
-    let (r0, off) = widgets::choice_row("Off", "Links and pairing only", None);
-    let (r1, oidc) = widgets::choice_row("OpenID Connect", "Okta, Entra ID, Google, Keycloak…", Some(&off));
-    let (r2, saml) = widgets::choice_row("SAML", "", Some(&off));
-    for r in [&r0, &r1, &r2] {
-        kind.add(r);
-    }
+    let (r2, kinds) = widgets::segmented(
+        "Sign in with",
+        "OpenID Connect: Okta, Entra ID, Google, Keycloak…",
+        &[("off", "Off"), ("oidc", "OpenID Connect"), ("saml", "SAML")],
+    );
+    kind.add(&r2);
+    let (off, oidc, saml) = (kinds[0].1.clone(), kinds[1].1.clone(), kinds[2].1.clone());
     pp.add(&kind);
 
     let og = widgets::group("OpenID Connect", "");
@@ -121,7 +122,11 @@ pub fn signin_page(ctx: &Rc<Ctx>) -> adw::PreferencesPage {
             }
             let available = s.bool("saml_available");
             saml.set_sensitive(available);
-            r2.set_subtitle(if available { "" } else { "Not in this build (built without --features saml)" });
+            r2.set_subtitle(if available {
+                "OpenID Connect: Okta, Entra ID, Google, Keycloak…"
+            } else {
+                "OpenID Connect: Okta, Entra ID, Google, Keycloak…. SAML isn't in this build (built without --features saml)."
+            });
             *loaded.borrow_mut() = s;
             sg();
         })
@@ -223,11 +228,10 @@ pub fn policy_page(ctx: &Rc<Ctx>) -> adw::PreferencesPage {
     let status = widgets::row("No policy", "");
     status.set_subtitle_selectable(true);
     g.add(&status);
-    let (tr, toml) = widgets::choice_row("TOML", "", None);
-    let (jr, json) = widgets::choice_row("JSON", "", Some(&toml));
+    let (fr, formats) = widgets::segmented("Format", "", &[("toml", "TOML"), ("json", "JSON")]);
+    let (toml, json) = (formats[0].1.clone(), formats[1].1.clone());
     toml.set_active(true);
-    g.add(&tr);
-    g.add(&jr);
+    g.add(&fr);
     pp.add(&g);
 
     let eg = adw::PreferencesGroup::new();
@@ -451,6 +455,7 @@ pub fn sessions_page(ctx: &Rc<Ctx>) -> adw::PreferencesPage {
 pub fn audit_page(ctx: &Rc<Ctx>) -> adw::PreferencesPage {
     let pp = adw::PreferencesPage::new();
     let fg = widgets::group("Audit log", "Newest first. Choose events to see only those (none chosen: all).");
+    pp.add(&fg);
     let flow = gtk::FlowBox::new();
     flow.set_selection_mode(gtk::SelectionMode::None);
     flow.set_max_children_per_line(4);
@@ -458,12 +463,13 @@ pub fn audit_page(ctx: &Rc<Ctx>) -> adw::PreferencesPage {
     flow.set_row_spacing(2);
     let mut checks = Vec::new();
     for ev in AUDIT_EVENTS {
-        let c = gtk::CheckButton::with_label(ev);
+        let c = gtk::ToggleButton::with_label(ev);
         widgets::name(&c, &format!("Event {ev}"));
         flow.insert(&c, -1);
         checks.push((*ev, c));
     }
-    fg.add(&flow);
+    let eg = widgets::group("Events", "");
+    eg.add(&flow);
     let (ur, user) = widgets::entry_row("User", "Entries whose user contains this", "alice");
     let (sr, since) = widgets::entry_row("Since", "A date or a time (RFC 3339)", "2026-10-12");
     fg.add(&ur);
@@ -475,8 +481,10 @@ pub fn audit_page(ctx: &Rc<Ctx>) -> adw::PreferencesPage {
     search.add_css_class("suggested-action");
     widgets::name(&search, "Search the audit log");
     bar.append(&search);
-    fg.add(&bar);
-    pp.add(&fg);
+    let sg = adw::PreferencesGroup::new();
+    sg.add(&bar);
+    pp.add(&eg);
+    pp.add(&sg);
 
     let rg = widgets::group("Entries", "");
     pp.add(&rg);

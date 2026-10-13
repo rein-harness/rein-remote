@@ -1,12 +1,14 @@
 //! Viewers: who's watching now, each with Kick (asked first).
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use adw::prelude::*;
+use gtk::glib;
 use rr_host_gtk::model::Viewer;
 use rr_host_gtk::time;
 
-use super::widgets::{self, Rows};
+use super::widgets;
 use super::{Change, Ctx};
 
 /// A viewer's line: who, how, and how it's going.
@@ -89,36 +91,47 @@ pub fn page(ctx: &Rc<Ctx>) -> adw::PreferencesPage {
         "One row per session. Kicking ends it; they may connect again with their link or pairing.",
     );
     pp.add(&g);
-    let rows = Rc::new(Rows::default());
+    // One row per session, kept while it lasts (its numbers change every second; the row, its
+    // button and their focus stay).
+    let rows: Rc<RefCell<Vec<(String, adw::ActionRow)>>> = Rc::default();
+    let empty = widgets::row("No one is watching", "");
+    g.add(&empty);
     let draw = {
         let (ctx, g, rows) = (ctx.clone(), g.clone(), rows.clone());
         move || {
-            rows.clear(&g);
             let vs = ctx.viewers.borrow().clone();
-            if vs.is_empty() {
-                let r = widgets::row(
-                    if !ctx.connected() {
-                        "Not connected to the host"
-                    } else if ctx.state.borrow().sharing {
-                        "No one is watching"
-                    } else {
-                        "Not sharing"
-                    },
-                    "",
-                );
-                rows.add(&g, &r);
-                return;
-            }
+            empty.set_visible(vs.is_empty());
+            empty.set_title(if !ctx.connected() {
+                "Not connected to the host"
+            } else if ctx.state.borrow().sharing {
+                "No one is watching"
+            } else {
+                "Not sharing"
+            });
+            let mut rows = rows.borrow_mut();
+            rows.retain(|(id, r)| {
+                let keep = vs.iter().any(|v| v.id == *id);
+                if !keep {
+                    g.remove(r);
+                }
+                keep
+            });
             for v in vs {
+                if let Some((_, r)) = rows.iter().find(|(id, _)| *id == v.id) {
+                    r.set_subtitle(&glib::markup_escape_text(&describe(&v)));
+                    continue;
+                }
                 let r = widgets::row(&title(&v), &describe(&v));
                 r.set_subtitle_lines(3);
                 let b = widgets::button("Kick");
                 b.add_css_class("destructive-action");
                 widgets::name(&b, &format!("Kick {}", title(&v)));
                 let ctx2 = ctx.clone();
-                b.connect_clicked(move |_| kick(&ctx2, &v, |_| {}));
+                let v2 = v.clone();
+                b.connect_clicked(move |_| kick(&ctx2, &v2, |_| {}));
                 r.add_suffix(&b);
-                rows.add(&g, &r);
+                g.add(&r);
+                rows.push((v.id.clone(), r));
             }
         }
     };

@@ -15,6 +15,7 @@ import time
 import urllib.request
 
 import pyatspi
+from gi.repository import Gio, GLib
 
 HOME = os.environ["REIN_REMOTE_HOME"]
 SHOTS = os.environ.get("SHOTS", "shots")
@@ -186,7 +187,7 @@ PAGE_TITLES = {"sharing": "Sharing", "viewers": "Viewers", "devices": "Paired de
 def goto(page):
     """A page, by its row in the sidebar (AT-SPI: the row's action, else selecting it in the list)."""
     title = PAGE_TITLES[page]
-    rows = [r for r in nodes(title, ("list item", "list box row", "row")) if r]
+    rows = [r for r in nodes(title, ("list item", "list box row", "row")) if r.parent and r.parent.name == "Pages"]
     done = False
     if rows:
         r = rows[0]
@@ -265,24 +266,25 @@ def main():
     time.sleep(1)
     shot("sharing")
 
-    # The source: the display (Xvfb), then the test pattern, each by its radio button.
+    # The source: the display (Xvfb), then the test pattern, each by its Share button.
     src = api("GET", "/control/sources")
     log("sources:", json.dumps(src)[:400])
     display = src["displays"][0]
-    click(display["name"], ("radio button", "check box"))
+    click(f"Share {display['name']}")
     until(f"source {display['id']}", lambda: api("GET", "/control/state")["source"] == display["id"])
     pattern = src["other"][0]
-    click(pattern["name"], ("radio button", "check box"))
+    click(f"Share {pattern['name']}")
     until(f"source {pattern['id']}", lambda: api("GET", "/control/state")["source"] == pattern["id"])
     log("source switched to", display["id"], "and back to", pattern["id"])
 
     # A new pairing code: the label shows the host's new code.
-    code_label = find("Pairing code", "label")
     old = api("GET", "/control/state")["pairing"]["code"]
-    until("a pairing code in the app", lambda: text_of(code_label) == old)
+    find(old, "label")
     click("New code")
     new = until("a new code at the host", lambda: (lambda c: c if c and c != old else None)(api("GET", "/control/state")["pairing"]["code"]))
-    until("the new code in the app", lambda: text_of(find("Pairing code", "label")) == new)
+    find(new, "label")
+    if nodes(old, "label"):
+        fail(f"the old code {old} is still shown")
     log("pairing code", old, "->", new)
     find("QR code for pairing")
 
@@ -309,7 +311,7 @@ def main():
 
     # The audit log shows the kick.
     goto("audit")
-    click("Event session_kicked", ("check box", "toggle button"))
+    click("Event session_kicked", "toggle button")
     click("Search the audit log")
     row = until("the kick in the audit log",
                 lambda: [n for n in nodes(contains="session_kicked") if not (n.name or "").startswith("Event ")])
@@ -321,7 +323,7 @@ def main():
     # A setting saved to host.toml: quality first, mDNS (off from the command line) left alone, then
     # the frame rate.
     goto("settings")
-    click("Quality first", ("radio button", "check box"))
+    click("Quality first", "toggle button")
     click("Save settings")
     toml = os.path.join(HOME, "host.toml")
     until("prefer = quality in host.toml", lambda: re.search(r'^prefer\s*=\s*"quality"', open(toml).read(), re.M))
@@ -361,7 +363,7 @@ def main():
     find(contains="sessions total", timeout=20)
     shot("metrics")
     goto("signin")
-    find("OpenID Connect", ("radio button", "check box"))
+    find("OpenID Connect", "toggle button")
     shot("signin")
     goto("devices")
     find("No paired devices")
@@ -377,9 +379,12 @@ def main():
     intro = subprocess.run(["gdbus", "introspect", "--session", "--dest", sni[0], "--object-path", "/StatusNotifierItem"],
                            check=True, capture_output=True, text=True).stdout
     assert "org.kde.StatusNotifierItem" in intro, intro
-    menu = subprocess.run(["gdbus", "call", "--session", "--dest", sni[0], "--object-path", "/MenuBar", "--method",
-                           "com.canonical.dbusmenu.GetLayout", "0", "-1", "[]"],
-                          check=True, capture_output=True, text=True).stdout
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    menu = str(bus.call_sync(sni[0], "/MenuBar", "com.canonical.dbusmenu", "GetLayout",
+                             GLib.Variant("(iias)", (0, -1, [])), None, Gio.DBusCallFlags.NONE, 5000, None))
+    tip = str(bus.call_sync(sni[0], "/StatusNotifierItem", "org.freedesktop.DBus.Properties", "Get",
+                            GLib.Variant("(ss)", ("org.kde.StatusNotifierItem", "ToolTip")), None, Gio.DBusCallFlags.NONE, 5000, None))
+    assert "Sharing, no one watching" in tip, tip
     for label in ("Sharing, no one watching", "Stop sharing", "Pairing code: ", "0 viewers", "Open Rein Remote", "Quit"):
         if label not in menu:
             fail(f"the tray menu has no {label!r}: {menu}")
@@ -389,7 +394,10 @@ def main():
     goto("sharing")
     old_pid = control()["pid"]
     os.kill(old_pid, signal.SIGKILL)
-    find(contains="looking for it again", timeout=20)
+    # The banner: the host stopped (then, as the app starts it again, "Starting …").
+    gone = until("the app saying the host went",
+                 lambda: nodes(contains="looking for it again") or nodes(contains="Starting ") or nodes(contains="isn't running"), 20)
+    log("banner:", gone[0].name)
     shot("host-gone")
     log("host killed: the app says so")
     until("a new host", lambda: control()["pid"] != old_pid and api("GET", "/control/state"), 40)

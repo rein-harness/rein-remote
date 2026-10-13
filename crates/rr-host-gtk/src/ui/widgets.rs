@@ -4,7 +4,10 @@ use adw::prelude::*;
 use gtk::{gdk, glib};
 
 /// Sets what assistive technologies (and the AT-SPI UI test) call `w`.
+/// (A button's own label names it through "labelled by", which wins over a name given: that goes,
+/// so call this again after changing the button's label.)
 pub fn name(w: &impl IsA<gtk::Accessible>, label: &str) {
+    w.reset_relation(gtk::AccessibleRelation::LabelledBy);
     w.update_property(&[gtk::accessible::Property::Label(label)]);
 }
 
@@ -65,18 +68,36 @@ pub fn entry_row(title: &str, subtitle: &str, placeholder: &str) -> (adw::Action
     (r, e)
 }
 
-/// One of a set of choices (a radio button) in a row.
-pub fn choice_row(title: &str, subtitle: &str, group: Option<&gtk::CheckButton>) -> (adw::ActionRow, gtk::CheckButton) {
+/// One choice of several, as a row of linked toggle buttons (a segmented control; unlike check
+/// buttons, GTK gives toggle buttons an action assistive technologies can do).
+pub fn segmented(title: &str, subtitle: &str, choices: &[(&'static str, &str)]) -> (adw::ActionRow, Vec<(&'static str, gtk::ToggleButton)>) {
     let r = row(title, subtitle);
-    let c = gtk::CheckButton::new();
-    c.set_valign(gtk::Align::Center);
-    if let Some(g) = group {
-        c.set_group(Some(g));
+    let b = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    b.add_css_class("linked");
+    b.set_valign(gtk::Align::Center);
+    let mut out: Vec<(&'static str, gtk::ToggleButton)> = Vec::new();
+    for (id, label) in choices {
+        let t = gtk::ToggleButton::with_label(label);
+        if let Some((_, first)) = out.first() {
+            t.set_group(Some(first));
+        }
+        b.append(&t);
+        out.push((id, t));
     }
-    name(&c, title);
-    r.add_prefix(&c);
-    r.set_activatable_widget(Some(&c));
-    (r, c)
+    r.add_suffix(&b);
+    (r, out)
+}
+
+/// The id of the choice that's on.
+pub fn chosen(choices: &[(&'static str, gtk::ToggleButton)]) -> Option<&'static str> {
+    choices.iter().find(|(_, t)| t.is_active()).map(|(id, _)| *id)
+}
+
+/// Turns on the choice `id` (or the first, when none is `id`).
+pub fn choose(choices: &[(&'static str, gtk::ToggleButton)], id: &str) {
+    if let Some((_, t)) = choices.iter().find(|(c, _)| *c == id).or(choices.first()) {
+        t.set_active(true);
+    }
 }
 
 /// A label for errors: red, wrapping, selectable, hidden while empty.

@@ -256,7 +256,10 @@ impl Ctx {
                     *self.client.borrow_mut() = Some(client.clone());
                     *self.state.borrow_mut() = (**state).clone();
                 } else {
+                    // Nothing the host said before holds now (its links died with it).
                     *self.client.borrow_mut() = None;
+                    *self.state.borrow_mut() = State::default();
+                    self.viewers.borrow_mut().clear();
                 }
                 *self.link.borrow_mut() = l;
                 match banner {
@@ -264,7 +267,11 @@ impl Ctx {
                         self.banner.set_title(&glib::markup_escape_text(&b));
                         self.banner.set_revealed(true);
                     }
-                    None => self.banner.set_revealed(false),
+                    None => {
+                        self.banner.set_revealed(false);
+                        // (A hidden banner is still in the accessibility tree: no stale text there.)
+                        self.banner.set_title("");
+                    }
                 }
                 self.changed(Change::Link);
                 self.changed(Change::State);
@@ -412,6 +419,8 @@ fn build(app: &adw::Application, args: &Args) -> Rc<Ctx> {
         .title("Rein Remote")
         .default_width(980)
         .default_height(760)
+        .width_request(360)
+        .height_request(480)
         .content(&toasts)
         .build();
     let bp = adw::Breakpoint::new(adw::BreakpointCondition::parse("max-width: 640sp").unwrap());
