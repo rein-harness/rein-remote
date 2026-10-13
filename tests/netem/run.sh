@@ -10,4 +10,4 @@ docker run --rm -v "$ROOT":/src -w /src \
 docker build -q -f "$ROOT/tests/netem/Dockerfile" -t rr-netem "$ROOT" >/dev/null
 rm -f "$ROOT/tests/netem/rein-remote.linux" "$ROOT/tests/netem/rein-remote-viewer.linux"
 mkdir -p "${LOGS:-$ROOT/tests/netem/logs}"
-docker run --rm -v "${LOGS:-$ROOT/tests/netem/logs}":/logs --cap-add NET_ADMIN --shm-size 1g -e SECS="${SECS:-15}" -e MOTION="${MOTION:-full}" -e RES="${RES:-1280x720}" -e CLIENTS="${CLIENTS:-native web}" rr-netem
+docker run --rm -v "${LOGS:-$ROOT/tests/netem/logs}":/logs --cap-add NET_ADMIN --shm-size 1g -e SECS="${SECS:-15}" -e MOTION="${MOTION:-full}" -e RES="${RES:-1280x720}" -e CLIENTS="${CLIENTS:-native web}" -e FPS="${FPS:-auto}" rr-netem

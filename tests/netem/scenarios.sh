@@ -7,6 +7,7 @@ SECS=${SECS:-15}
 MOTION=${MOTION:-full}
 RES=${RES:-1280x720}
 CLIENTS=${CLIENTS:-native web}
+FPS=${FPS:-auto}
 # name|netem (delay, loss, jitter)|rate (a token bucket under it, with 100 ms of buffer, like a router's)
 links=(
   "lan||"
@@ -29,7 +30,7 @@ link() { # netem rate
 run() { # name transport url-extra
   local name=$1 transport=$2
   local wt=on; [ "$transport" = websocket ] && wt=off
-  rein-remote serve --test-pattern "$RES" --motion "$MOTION" --listen 127.0.0.1:7979 --webtransport $wt --mdns off > "$LOGS/$name-$transport.serve.log" 2>&1 &
+  rein-remote serve --test-pattern "$RES" --motion "$MOTION" --fps "$FPS" --listen 127.0.0.1:7979 --webtransport $wt --mdns off > "$LOGS/$name-$transport.serve.log" 2>&1 &
   local sp=$!
   sleep 1
   local out
@@ -40,7 +41,7 @@ run() { # name transport url-extra
 native() { # name transport: the native viewer (rr-client, openh264), headless, reading the barcode
   local name=$1 transport=$2
   local wt=on; [ "$transport" = websocket ] && wt=off
-  rein-remote serve --test-pattern "$RES" --motion "$MOTION" --listen 127.0.0.1:7979 --webtransport $wt --mdns off > "$LOGS/$name-native-$transport.serve.log" 2>&1 &
+  rein-remote serve --test-pattern "$RES" --motion "$MOTION" --fps "$FPS" --listen 127.0.0.1:7979 --webtransport $wt --mdns off > "$LOGS/$name-native-$transport.serve.log" 2>&1 &
   local sp=$!
   sleep 1
   local out
@@ -54,7 +55,7 @@ relay() { # through the relay, sealed end to end (localhost is a secure page: th
   rein-remote relay --listen 127.0.0.1:7990 > "$LOGS/$name-relay.relay.log" 2>&1 &
   local rp=$!
   sleep 0.5
-  rein-remote serve --test-pattern "$RES" --motion "$MOTION" --listen 127.0.0.1:7979 --webtransport off --mdns off --relay ws://127.0.0.1:7990 > "$LOGS/$name-relay.serve.log" 2>&1 &
+  rein-remote serve --test-pattern "$RES" --motion "$MOTION" --fps "$FPS" --listen 127.0.0.1:7979 --webtransport off --mdns off --relay ws://127.0.0.1:7990 > "$LOGS/$name-relay.serve.log" 2>&1 &
   local sp=$!
   sleep 2
   local u; u=$(grep -o 'open http://[^ ]*' "$LOGS/$name-relay.serve.log" | head -1 | cut -c6- | sed 's|http://127.0.0.1|http://localhost|; s|/?room=|/?measure\&room=|')
