@@ -443,7 +443,9 @@ jobs:
         run: ./gradlew --no-daemon -Prr.testBuildType=release assembleRelease assembleReleaseAndroidTest
       - name: The server
         run: |
-          ./target/release/rein-remote serve --test-pattern 1280x720 --listen 127.0.0.1:7979 --token ci --mdns off 2> serve.log &
+          # The picture's size held (as in the ios job): on a slow runner the controller would make it
+          # smaller mid-test, and the pointer checks would look at the wrong place.
+          RR_ADAPT=off ./target/release/rein-remote serve --test-pattern 1280x720 --listen 127.0.0.1:7979 --token ci --mdns off 2> serve.log &
           sleep 2
       - name: Instrumented tests in the emulator
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
