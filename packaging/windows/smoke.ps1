@@ -43,6 +43,7 @@ function Arp {
 $installer = New-Object -ComObject WindowsInstaller.Installer
 $si = $installer.GetType().InvokeMember('SummaryInformation', 'GetProperty', $null, $installer, @($Msi, 0))
 $wc = $si.GetType().InvokeMember('Property', 'GetProperty', $null, $si, @(15))
+[void][Runtime.InteropServices.Marshal]::ReleaseComObject($si)   # the .msi open no longer
 Check (($wc -band 8) -ne 0) "the .msi needs no elevation (Word Count $wc, bit 3)"
 
 Write-Host "== install ($Scope$(if ($NoStartAtLogin) { ', STARTATLOGIN=0' }))"
