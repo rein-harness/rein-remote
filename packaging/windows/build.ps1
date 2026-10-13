@@ -30,12 +30,11 @@ if ($LASTEXITCODE -ne 0) { throw "wix build failed ($LASTEXITCODE)" }
 # Per user without UAC: Summary Information's Word Count (property 15) gets bit 3, "elevated privileges
 # are not required" (WiX 5's perUserOrMachine leaves it off, so a standard user would be asked for an
 # administrator). ALLUSERS=1 is then for an elevated prompt (msiexec doesn't ask on its own).
-$installer = New-Object -ComObject WindowsInstaller.Installer
-$si = $installer.GetType().InvokeMember('SummaryInformation', 'GetProperty', $null, $installer, @($Out, 1))
-$wc = [int]$si.GetType().InvokeMember('Property', 'GetProperty', $null, $si, @(15))
-$new = [int]($wc -bor 8)   # plain Int32s: COM refuses a PowerShell-wrapped value (DISP_E_TYPEMISMATCH)
-$si.GetType().InvokeMember('Property', 'SetProperty', $null, $si, [object[]]@([int]15, $new)) | Out-Null
-$si.GetType().InvokeMember('Persist', 'InvokeMethod', $null, $si, $null) | Out-Null
-[void][Runtime.InteropServices.Marshal]::ReleaseComObject($si)
-Write-Host "Word Count: $wc -> $new (no elevation needed)"
+# MsiInfo.exe (Windows SDK) sets it: /w is Word Count, 2 (compressed) + 8 = 10.
+$msiinfo = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\MsiInfo.exe" |
+  Sort-Object FullName -Descending | Select-Object -First 1
+if (-not $msiinfo) { throw 'MsiInfo.exe not found (Windows SDK)' }
+& $msiinfo.FullName $Out /w 10 | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "MsiInfo /w failed ($LASTEXITCODE)" }
+& $msiinfo.FullName $Out | Select-String 'Word Count'
 Get-Item $Out | Format-Table Name, Length
