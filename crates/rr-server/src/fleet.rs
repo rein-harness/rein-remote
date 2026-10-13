@@ -68,8 +68,8 @@ pub fn link(ranked: &[String], room: &str, key: &[u8; 32]) -> String {
 }
 
 /// Asks each relay's `/healthz` from now on, for the metrics, and says when one stops answering or
-/// comes back.
-pub fn watch(relays: Vec<String>) {
+/// comes back; until `stop` is set (sharing stopped).
+pub fn watch(relays: Vec<String>, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) {
     std::thread::spawn(move || {
         let mut was: Vec<bool> = relays
             .iter()
@@ -77,6 +77,9 @@ pub fn watch(relays: Vec<String>) {
             .collect();
         loop {
             std::thread::sleep(EVERY);
+            if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
             for (i, r) in relays.iter().enumerate() {
                 let rtt = probe(r);
                 crate::metrics::relay_update(r, |s| {

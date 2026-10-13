@@ -129,6 +129,13 @@ Secrets stay out of the service's command line: `token = { file = "/etc/rein-rem
 (for sign-in, `oidc-client-secret-file = "/etc/rein-remote/oidc-secret"`). The
 command line wins over the file. See [docs/verification/service-install.md](docs/verification/service-install.md).
 
+### For apps: `rein-remote host`
+
+`rein-remote host` is the long-running process the platform apps drive: sharing on and off, the
+source switched live, viewers listed and ended, pairing, settings (`~/.rein-remote/host.toml`) and
+the admin pages, through a local HTTP + JSON control API with live events. The contract:
+[docs/control-api.md](docs/control-api.md).
+
 ### Signed binaries
 
 Releases are signed when the repository has the certificates (macOS: Developer ID and notarized;

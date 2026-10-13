@@ -39,8 +39,14 @@ pub fn expand(args: &[String]) -> Result<Vec<String>, String> {
 /// The file's flags, in its order, leaving out those in `skip` (given on the command line).
 fn flags(text: &str, dir: &Path, skip: &[&str]) -> Result<Vec<String>, String> {
     let table: toml::Table = text.parse().map_err(|e: toml::de::Error| e.message().to_string())?;
+    table_flags(&table, dir, skip)
+}
+
+/// A table's flags (as a config file's), in its order, leaving out those in `skip`; a secret's
+/// `{ file = … }` is relative to `dir`.
+pub fn table_flags(table: &toml::Table, dir: &Path, skip: &[&str]) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
-    for (key, value) in &table {
+    for (key, value) in table {
         if key.starts_with('-') || key.contains(char::is_whitespace) || key.is_empty() {
             return Err(format!("{key:?}: a key is a flag's name without its dashes (listen, not --listen)"));
         }

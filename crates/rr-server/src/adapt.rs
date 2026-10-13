@@ -17,6 +17,10 @@
 //! - **Resolution follows.** When the bitrate is low for the picture's size, the picture is scaled
 //!   down (¾, then ½) rather than smeared; it goes back up once the link has room, with hysteresis
 //!   so it doesn't flap.
+//!
+//! That's `--prefer framerate` (the default). `--prefer quality` (text, detail) swaps the last two:
+//! frames give way with the bitrate on each congestion, and the picture keeps its size until the
+//! frame rate is at its least (roughly how the controller worked before frame rate came first).
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -29,7 +33,35 @@ pub struct Target {
     pub scale: f32,
 }
 
+/// What gives way first on a slow link: frames or the picture (`--prefer`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Prefer {
+    /// The frame rate holds; the bitrate, then the picture's size give way (games, motion).
+    #[default]
+    Framerate,
+    /// The picture keeps its size; frames give way with the bitrate (text, detail).
+    Quality,
+}
+
+impl Prefer {
+    pub fn parse(s: &str) -> Option<Prefer> {
+        match s {
+            "framerate" | "frame-rate" | "fps" => Some(Prefer::Framerate),
+            "quality" => Some(Prefer::Quality),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Prefer::Framerate => "framerate",
+            Prefer::Quality => "quality",
+        }
+    }
+}
+
 pub struct Adapt {
+    prefer: Prefer,
     max: Target,
     min: Target,
     now: Target,
@@ -84,6 +116,7 @@ impl Adapt {
         };
         let long_ago = Instant::now() - Duration::from_secs(60);
         Self {
+            prefer: Prefer::Framerate,
             max,
             min: Target {
                 kbps: 250.min(max.kbps),
@@ -115,6 +148,12 @@ impl Adapt {
             ceiling: None,
             room_since: None,
         }
+    }
+
+    /// What gives way first (`Prefer::Framerate` unless set).
+    pub fn prefer(mut self, p: Prefer) -> Self {
+        self.prefer = p;
+        self
     }
 
     pub fn target(&self) -> Target {
@@ -225,8 +264,9 @@ impl Adapt {
             if at.duration_since(self.last_cut) > Duration::from_secs(2) {
                 self.ceiling = Some(self.now.kbps);
             }
-            // The frame rate goes down only once there's nothing else left to give.
-            if self.now.kbps <= self.min.kbps && self.now.scale <= SMALLEST {
+            // Frame rate first: it goes down only once there's nothing else left to give. Quality:
+            // it goes down with the bitrate, each time.
+            if self.prefer == Prefer::Quality || self.now.kbps <= self.min.kbps && self.now.scale <= SMALLEST {
                 self.now.fps = ((self.now.fps as f64 * 0.75) as u32).max(self.min.fps);
             }
             self.now.kbps = to.min((self.now.kbps as f64 * 0.9) as u32).max(self.min.kbps);
@@ -256,18 +296,32 @@ impl Adapt {
             if self.now.kbps >= self.max.kbps {
                 self.starting = false;
             }
-            self.now.fps = ((self.now.fps as f64 * 1.25) as u32 + 1).min(self.max.fps);
+            let held = self.prefer == Prefer::Quality && self.short_until.is_some_and(|u| at < u);
+            if !held {
+                self.now.fps = ((self.now.fps as f64 * 1.25) as u32 + 1).min(self.max.fps);
+            }
             self.last_step = at;
         }
         self.backed_up = false;
         self.starved = false;
         // Starting, the picture stays whole (its first keyframe is small by its bitrate already).
         if !self.starting {
-            self.now.scale = self.scale_for(at);
+            let scale = self.scale_for(at);
+            // Quality: the picture shrinks only once the frame rate is at its least.
+            let keep = self.prefer == Prefer::Quality && scale < self.now.scale && self.now.fps > self.min.fps;
+            if !keep {
+                self.now.scale = scale;
+            }
         }
         // (A second between: each new size is a new encoder, which takes a moment to give out frames.)
         let shrunk_lately = self.short_until.is_some_and(|u| u > at + Duration::from_secs(4));
-        if std::mem::take(&mut self.encoder_short) && !shrunk_lately {
+        let short = std::mem::take(&mut self.encoder_short);
+        if short && self.prefer == Prefer::Quality && self.now.fps > self.min.fps {
+            // Quality: fewer frames for the encoder before a smaller picture (held a while: climbing
+            // straight back would only be short again).
+            self.now.fps = ((self.now.fps as f64 * 0.75) as u32).max(self.min.fps);
+            self.short_until = Some(at + Duration::from_secs(5));
+        } else if short && !shrunk_lately {
             // A size smaller than both what the bitrate picks and what it is now.
             let smaller = SCALES.iter().map(|(s, _)| *s).filter(|s| *s < self.now.scale).fold(0.0f32, f32::max);
             if smaller > 0.0 {
@@ -432,6 +486,54 @@ mod tests {
         for s in &seen {
             assert!(s.fps == 120 || (s.kbps == 250 && s.scale == SMALLEST), "{s:?}");
         }
+    }
+
+    #[test]
+    fn quality_gives_up_frames_before_the_picture() {
+        // Congested again and again: frames go with the bitrate, and the picture keeps its size until
+        // the frame rate is at its least.
+        let mut a = Adapt::new(8000, 120).prefer(Prefer::Quality);
+        let mut t = Instant::now();
+        a.feedback(30.0, 1000, t);
+        let mut seen = vec![];
+        for _ in 0..40 {
+            t += Duration::from_millis(400);
+            a.backed_up();
+            a.tick(t);
+            seen.push(a.target());
+        }
+        for s in &seen {
+            assert!(s.scale == 1.0 || s.fps == 5, "the picture shrank before the frames went: {s:?}");
+        }
+        assert!(seen.iter().any(|s| s.fps < 60 && s.scale == 1.0), "frames went first: {seen:?}");
+        assert_eq!(
+            a.target(),
+            Target {
+                kbps: 250,
+                fps: 5,
+                scale: SMALLEST
+            },
+            "and at the end, both at their least"
+        );
+        // With room again, all of it comes back.
+        run(&mut a, &mut t, 60.0, |_| 20.0);
+        assert_eq!(
+            a.target(),
+            Target {
+                kbps: 8000,
+                fps: 120,
+                scale: 1.0
+            }
+        );
+        // An encoder short of time: fewer frames, the same picture.
+        a.encoder_short(t, false);
+        a.tick(t);
+        assert_eq!((a.target().fps, a.target().scale), (90, 1.0));
+        // Frame rate first stays the default.
+        assert_eq!(Adapt::new(8000, 60).prefer, Prefer::Framerate);
+        assert_eq!(Prefer::parse("quality"), Some(Prefer::Quality));
+        assert_eq!(Prefer::parse("framerate"), Some(Prefer::Framerate));
+        assert_eq!(Prefer::parse("speed"), None);
     }
 
     #[test]

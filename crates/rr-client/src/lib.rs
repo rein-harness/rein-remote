@@ -132,7 +132,8 @@ pub enum Event {
     Clipboard(String),
     /// The session moved to another path (`Transport::label`).
     Transport(&'static str),
-    /// Something worth saying (a direct path tried, and how it went).
+    /// Something worth saying (a direct path tried, and how it went; the server's Notice before it
+    /// ends the session: a time limit, the host ending it).
     Note(String),
     /// The session ended (and why, when it wasn't the server closing it).
     Closed(Option<String>),
@@ -539,6 +540,11 @@ impl Run {
                 }
                 Message::Clipboard { text } => {
                     let _ = self.events.send(Event::Clipboard(text));
+                }
+                // What the server says before it ends the session (a time limit, the host ending it):
+                // for the app to show.
+                Message::Notice(n) => {
+                    let _ = self.events.send(Event::Note(n.text));
                 }
                 _ => {}
             }

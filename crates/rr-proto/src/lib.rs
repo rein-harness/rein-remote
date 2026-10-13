@@ -322,6 +322,8 @@ pub struct Notice {
 pub const NOTICE_TIME_LIMIT: u16 = 1;
 /// The viewer isn't allowed (any more) and the session ends.
 pub const NOTICE_REFUSED: u16 = 2;
+/// The host ended the session: it stopped sharing, or let this viewer go (the text says which).
+pub const NOTICE_ENDED: u16 = 3;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {

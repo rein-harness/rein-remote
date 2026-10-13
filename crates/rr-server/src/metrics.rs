@@ -253,6 +253,25 @@ pub fn serve_healthz() -> String {
     )
 }
 
+/// `serve`'s counters as JSON (the host's control API).
+pub fn serve_json() -> serde_json::Value {
+    serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptime_s": uptime_s().round(),
+        "viewers": {"direct": VIEWERS_DIRECT.get(), "relayed": VIEWERS_RELAYED.get()},
+        "sessions_total": SESSIONS.get(),
+        "frames_sent_total": FRAMES.get(),
+        "keyframes_sent_total": KEYFRAMES.get(),
+        "video_bytes_sent_total": VIDEO_BYTES.get(),
+        "frames_skipped_total": SKIPPED_BACKED_UP.get(),
+        "direct_offers_total": DIRECT_OFFERS.get(),
+        "direct_answers_total": DIRECT_ANSWERS.get(),
+        "relays": relays().iter().map(|r| serde_json::json!({
+            "relay": r.name, "up": r.up, "rtt_ms": r.rtt_ms, "registered": r.registered, "registrations": r.registrations,
+        })).collect::<Vec<_>>(),
+    })
+}
+
 /// The relay's `/metrics`.
 pub fn relay_prometheus() -> String {
     let mut out = String::new();

@@ -6,11 +6,12 @@ use crate::capture::Source;
 use crate::link::{E2eLink, Link, Recv, WsLink};
 use rr_proto::{
     Access, Codec, Config, Cursor, DirectOffer, Hello, Message, Notice, Video, ACCESS_NO_AUDIO, ACCESS_NO_CLIPBOARD, ACCESS_RECORDED, ACCESS_VIEW_ONLY,
-    FEATURE_AUDIO_DATAGRAMS, FEATURE_DIRECT, FEATURE_PASTE, FEATURE_VIDEO_DATAGRAMS, INPUT_GAMEPAD, INPUT_KEYBOARD, INPUT_POINTER, INPUT_TOUCH, NOTICE_REFUSED,
-    NOTICE_TIME_LIMIT, VERSION_MAX, VERSION_MIN,
+    FEATURE_AUDIO_DATAGRAMS, FEATURE_DIRECT, FEATURE_PASTE, FEATURE_VIDEO_DATAGRAMS, INPUT_GAMEPAD, INPUT_KEYBOARD, INPUT_POINTER, INPUT_TOUCH, NOTICE_ENDED,
+    NOTICE_REFUSED, NOTICE_TIME_LIMIT, VERSION_MAX, VERSION_MIN,
 };
 use std::io::Write;
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -69,6 +70,154 @@ pub struct Options {
     pub record: Option<std::path::PathBuf>,
     /// What this server shows, as a policy's `sources` name it (`display`, `window:Simulator`…).
     pub source_label: String,
+    /// What gives way first on a slow link (`--prefer`): frames or the picture.
+    pub prefer: crate::adapt::Prefer,
+    /// What the host running this server shares with it (`rein-remote host`).
+    pub shared: Arc<Shared>,
+}
+
+/// What a host shares with the server it runs (`rein-remote host`): a way to stop it, the sessions
+/// open now (to list and end them), and which source is shown (to switch it live). `serve` has one
+/// too, which nothing else looks at.
+#[derive(Default)]
+pub struct Shared {
+    /// Set when sharing stops: the listeners close and the sessions end.
+    pub stop: Arc<AtomicBool>,
+    sessions: Mutex<Vec<Arc<Live>>>,
+    /// Up by one each time the source is switched: the sessions take the new one.
+    source_gen: AtomicU64,
+    /// What it shows, as a policy names it.
+    pub source_label: Mutex<String>,
+    /// What viewers are told when sharing stops.
+    stop_text: Mutex<String>,
+}
+
+impl Shared {
+    /// The sessions open now, oldest first.
+    pub fn sessions(&self) -> Vec<Arc<Live>> {
+        self.sessions.lock().unwrap().clone()
+    }
+
+    pub fn session(&self, id: &str) -> Option<Arc<Live>> {
+        self.sessions.lock().unwrap().iter().find(|l| l.adm.id == id).cloned()
+    }
+}
+
+/// A session open now: who, over what, how it's going, and a way to end it.
+pub struct Live {
+    pub adm: crate::auth::Admission,
+    /// The name the viewer's app gave (its Hello).
+    pub device: String,
+    pub since: SystemTime,
+    pub now: Mutex<LiveStats>,
+    /// Set to end it: the Notice's code and text, and the reason for the audit log.
+    end: Mutex<Option<(u16, String, &'static str)>>,
+}
+
+/// How a session is going, updated a few times a second.
+#[derive(Default, Clone, Debug)]
+pub struct LiveStats {
+    /// Frames sent over the last second.
+    pub fps: u32,
+    pub rtt_ms: f64,
+    /// What the controller sends now.
+    pub kbps: u32,
+    pub width: u32,
+    pub height: u32,
+    pub recorded: bool,
+    /// When the policy's time limit ends it.
+    pub ends_at: Option<SystemTime>,
+}
+
+impl Live {
+    /// Ends the session: the viewer is told `text` (a Notice with `code`), then it closes; `why` is the
+    /// audit log's reason.
+    pub fn end(&self, code: u16, text: String, why: &'static str) {
+        *self.end.lock().unwrap() = Some((code, text, why));
+    }
+}
+
+/// A session in the list for as long as it's open (however it ends).
+struct Listed<'a>(&'a Shared, String);
+
+impl Drop for Listed<'_> {
+    fn drop(&mut self) {
+        self.0.sessions.lock().unwrap().retain(|l| l.adm.id != self.1);
+    }
+}
+
+/// A link to open the server from: `tailnet`, `lan`, `local` or `relay`, its label as printed, the URL.
+#[derive(Clone, Debug)]
+pub struct Place {
+    pub kind: &'static str,
+    pub label: String,
+    pub url: String,
+}
+
+/// A server started with [`start`], running until [`Running::stop`].
+pub struct Running {
+    pub shared: Arc<Shared>,
+    pub gate: Arc<crate::pairing::Gate>,
+    source: Arc<Mutex<Box<dyn Source>>>,
+    /// Where it listens.
+    pub addr: SocketAddr,
+    /// The links to open it from, best first (the token, or the relay's key, in each).
+    pub links: Vec<Place>,
+    /// The page a pairing link opens (`http://HOST:PORT/`), on this network when there's one.
+    pub pair_page: String,
+    accept: Option<std::thread::JoinHandle<()>>,
+    webtransport: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Running {
+    /// Runs until the process ends (`serve`).
+    pub fn wait(mut self) {
+        if let Some(t) = self.accept.take() {
+            let _ = t.join();
+        }
+    }
+
+    /// Shows `source` from now on (`label`: as a policy names it). Open sessions take it at once (a new
+    /// Config, then a keyframe); a viewer whose policy rule doesn't allow it is told why and let go.
+    pub fn switch(&self, source: Box<dyn Source>, label: String) {
+        *self.source.lock().unwrap() = source;
+        *self.shared.source_label.lock().unwrap() = label.clone();
+        self.gate.set_source(label);
+        self.shared.source_gen.fetch_add(1, Ordering::SeqCst);
+        for live in self.shared.sessions() {
+            if let crate::policy::Decision::Deny { reason, .. } = self.gate.decide(&live.adm.principal) {
+                live.end(NOTICE_REFUSED, reason, "policy");
+            }
+        }
+    }
+
+    /// Stops it: every viewer is told `text` and let go, the listeners close (their ports free when
+    /// this returns), the relays' rooms close.
+    pub fn stop(mut self, text: &str) {
+        *self.shared.stop_text.lock().unwrap() = text.to_string();
+        for live in self.shared.sessions() {
+            live.end(NOTICE_ENDED, text.to_string(), "sharing stopped");
+        }
+        self.shared.stop.store(true, Ordering::SeqCst);
+        // The viewers told, for up to 3 s.
+        let t = Instant::now();
+        while !self.shared.sessions.lock().unwrap().is_empty() && t.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Waking the listener (it looks at `stop` with each connection).
+        let mut wake = self.addr;
+        if wake.ip().is_unspecified() {
+            wake.set_ip(if wake.is_ipv4() {
+                std::net::Ipv4Addr::LOCALHOST.into()
+            } else {
+                std::net::Ipv6Addr::LOCALHOST.into()
+            });
+        }
+        let _ = TcpStream::connect_timeout(&wake, Duration::from_secs(1));
+        for t in [self.accept.take(), self.webtransport.take()].into_iter().flatten() {
+            let _ = t.join();
+        }
+    }
 }
 
 /// Latency and throughput, kept per session and shown by /stats.
@@ -108,6 +257,13 @@ fn now_us() -> u64 {
 }
 
 pub fn run(source: Box<dyn Source>, opts: Options) -> Result<(), String> {
+    start(source, opts)?.wait();
+    Ok(())
+}
+
+/// The server, started (and printing what `serve` prints): listening, waiting on its relays and found
+/// on the network, until it's stopped.
+pub fn start(source: Box<dyn Source>, opts: Options) -> Result<Running, String> {
     crate::metrics::start();
     let tailnet_name = if opts.listen == "auto" { crate::links::magic_dns() } else { None };
     // "auto": every interface, the first free port from 7979.
@@ -139,6 +295,7 @@ pub fn run(source: Box<dyn Source>, opts: Options) -> Result<(), String> {
     let addr = listener.local_addr().map_or(opts.listen.clone(), |a| a.to_string());
     eprintln!("rein-remote: streaming a {w}×{h} screen on http://{addr} (open it in a browser)");
     // On every interface: the links to open, with the token (they're the key: share them as such).
+    let mut links = Vec::new();
     if let Ok(at) = listener.local_addr() {
         if at.ip().is_unspecified() {
             let token = opts.token.as_deref().map(|t| format!("/?token={t}")).unwrap_or_default();
@@ -150,7 +307,18 @@ pub fn run(source: Box<dyn Source>, opts: Options) -> Result<(), String> {
                 } else {
                     "http"
                 };
-                eprintln!("  {:<14} {scheme}://{}:{}{token}", p.label, p.host, at.port());
+                let url = format!("{scheme}://{}:{}{token}", p.host, at.port());
+                eprintln!("  {:<14} {url}", p.label);
+                let kind = match p.label {
+                    "your tailnet" => "tailnet",
+                    "this network" => "lan",
+                    _ => "local",
+                };
+                links.push(Place {
+                    kind,
+                    label: p.label.to_string(),
+                    url,
+                });
             }
         }
     }
@@ -158,6 +326,7 @@ pub fn run(source: Box<dyn Source>, opts: Options) -> Result<(), String> {
     let reachable = listener.local_addr().is_ok_and(|a| a.ip().is_unspecified());
     // With sign-in, pairing only when asked for (the identity provider says who may connect).
     let pairing = opts.pair.unwrap_or(reachable && opts.signin.is_none());
+    *opts.shared.source_label.lock().unwrap() = opts.source_label.clone();
     let gate = Arc::new(crate::pairing::Gate::new(opts.token.clone(), pairing).with_access(
         opts.signin.clone(),
         opts.policy.take(),
@@ -185,21 +354,20 @@ pub fn run(source: Box<dyn Source>, opts: Options) -> Result<(), String> {
             serde_json::json!({"source": opts.source_label, "signin": opts.signin.as_ref().map(|s| s.kind()), "policy": gate.policy.is_some(), "record": opts.record.as_ref().map(|d| d.display().to_string()), "version": env!("CARGO_PKG_VERSION")}),
         );
     }
-    if let (Some(code), Ok(at)) = (gate.new_code(), listener.local_addr()) {
+    let addr = listener.local_addr().map_err(|e| e.to_string())?;
+    // A pairing link opens this machine's page on the local network (where a phone is).
+    let pair_page = if addr.ip().is_unspecified() {
         let host = crate::links::places()
             .into_iter()
             .find(|p| p.label == "this network")
             .map_or("localhost".to_string(), |p| p.host);
-        let url = format!(
-            "http://{host}:{}/#pair={}&id={}",
-            at.port(),
-            code.replace('-', ""),
-            gate.fingerprint().unwrap_or_default()
-        );
-        eprintln!(
-            "rein-remote: or pair a device once, then no link is needed: open this machine's page on it (http://{host}:{}/) and enter {code}, or scan:",
-            at.port()
-        );
+        format!("http://{host}:{}/", addr.port())
+    } else {
+        format!("http://{addr}/")
+    };
+    if let Some(code) = gate.new_code() {
+        let url = format!("{pair_page}#pair={}&id={}", code.replace('-', ""), gate.fingerprint().unwrap_or_default());
+        eprintln!("rein-remote: or pair a device once, then no link is needed: open this machine's page on it ({pair_page}) and enter {code}, or scan:");
         eprintln!("{}", crate::links::qr(&url));
         eprintln!("rein-remote: (the code works for 10 minutes, once; `rein-remote paired` lists the devices)");
     }
@@ -216,7 +384,13 @@ pub fn run(source: Box<dyn Source>, opts: Options) -> Result<(), String> {
     // its address beyond NAT), and the room open on every one.
     let ranked = opts.relay.as_ref().map(|(relays, ..)| crate::fleet::rank(relays));
     if let (Some((_, room, secret)), Some(ranked)) = (opts.relay.clone(), ranked.clone()) {
-        eprintln!("rein-remote: through the relay: open {}", crate::fleet::link(&ranked, &room, &opts.e2e_key));
+        let url = crate::fleet::link(&ranked, &room, &opts.e2e_key);
+        eprintln!("rein-remote: through the relay: open {url}");
+        links.push(Place {
+            kind: "relay",
+            label: format!("through {}", crate::metrics::relay_name(&ranked[0])),
+            url,
+        });
         for relay in ranked.clone() {
             let (source, stats, opts, direct, room, secret, gate) = (
                 source.clone(),
@@ -229,9 +403,10 @@ pub fn run(source: Box<dyn Source>, opts: Options) -> Result<(), String> {
             );
             std::thread::spawn(move || through_relay(&relay, &room, secret.as_deref(), source, stats, &opts, &direct, &gate));
         }
-        crate::fleet::watch(ranked);
+        crate::fleet::watch(ranked, opts.shared.stop.clone());
     }
     // WebTransport on the same port over UDP: the page connects with it when the browser can.
+    let mut wt_thread = None;
     let wt: Arc<Option<(u16, Option<[u8; 32]>)>> = Arc::new(match (opts.webtransport, listener.local_addr()) {
         (true, Ok(at)) => {
             let (source, stats, o) = (source.clone(), stats.clone(), opts.clone());
@@ -243,11 +418,12 @@ pub fn run(source: Box<dyn Source>, opts: Options) -> Result<(), String> {
                     .zip(ranked.as_ref())
                     .map(|((_, room, _), ranked)| beyond_nat(&udp, &ranked[0], room));
                 let punch = udp.try_clone().ok();
-                let hash = crate::link::webtransport(udp, gate.clone(), opts.tls.clone(), move |link, adm| {
+                let (hash, thread) = crate::link::webtransport(udp, gate.clone(), opts.tls.clone(), opts.shared.stop.clone(), move |link, adm| {
                     if let Err(e) = session(link, source.clone(), stats.clone(), &o, None, adm) {
                         eprintln!("rein-remote: {e}");
                     }
                 })?;
+                wt_thread = Some(thread);
                 if let (Some(mapped), Some(cert), Some(socket)) = (relayed, hash, punch) {
                     let mut candidates: Vec<SocketAddr> = mapped.into_iter().collect();
                     if at.ip().is_unspecified() {
@@ -278,7 +454,7 @@ pub fn run(source: Box<dyn Source>, opts: Options) -> Result<(), String> {
         _ => None,
     });
     // Found on the local network (mDNS), when it's reachable from there: by its fingerprint, nothing secret.
-    let _advert = match listener.local_addr() {
+    let advert = match listener.local_addr() {
         Ok(at) if opts.mdns && at.ip().is_unspecified() => crate::identity::Identity::load_or_create()
             .and_then(|id| {
                 let a = rr_client::discover::advertise(at.port(), &id.fingerprint(), wt.as_ref().as_ref().map(|w| w.0), opts.tls.is_some())?;
@@ -293,16 +469,35 @@ pub fn run(source: Box<dyn Source>, opts: Options) -> Result<(), String> {
             .ok(),
         _ => None,
     };
-    for conn in listener.incoming() {
-        let Ok(stream) = conn else { continue };
-        let (source, stats, opts, wt, tls, gate) = (source.clone(), stats.clone(), opts.clone(), wt.clone(), tls.clone(), gate.clone());
+    let accept = {
+        let (source, opts, gate) = (source.clone(), opts.clone(), gate.clone());
         std::thread::spawn(move || {
-            if let Err(e) = handle(stream, source, stats, &opts, &wt, tls.as_ref(), &gate).or_else(|e| if e.is_empty() { Ok(()) } else { Err(e) }) {
-                eprintln!("rein-remote: {e}");
+            // Found on the network for as long as it listens.
+            let _advert = advert;
+            for conn in listener.incoming() {
+                if opts.shared.stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Ok(stream) = conn else { continue };
+                let (source, stats, opts, wt, tls, gate) = (source.clone(), stats.clone(), opts.clone(), wt.clone(), tls.clone(), gate.clone());
+                std::thread::spawn(move || {
+                    if let Err(e) = handle(stream, source, stats, &opts, &wt, tls.as_ref(), &gate).or_else(|e| if e.is_empty() { Ok(()) } else { Err(e) }) {
+                        eprintln!("rein-remote: {e}");
+                    }
+                });
             }
-        });
-    }
-    Ok(())
+        })
+    };
+    Ok(Running {
+        shared: opts.shared.clone(),
+        gate,
+        source,
+        addr,
+        links,
+        pair_page,
+        accept: Some(accept),
+        webtransport: wt_thread,
+    })
 }
 
 /// The address `udp` has beyond this machine's NAT, as the relay sees it (asked over UDP, for this
@@ -345,6 +540,9 @@ fn through_relay(
     // Said once, then again only after the relay was lost (not after each viewer).
     let mut lost = false;
     loop {
+        if opts.shared.stop.load(Ordering::SeqCst) {
+            return;
+        }
         match tungstenite::connect(&url) {
             Ok((ws, _)) => {
                 use crate::link::Sock;
@@ -820,7 +1018,7 @@ fn session(
     let started = Instant::now();
     let _timing = FrameTiming::begin();
     let mut start = adm.audit_fields();
-    start["source"] = opts.source_label.clone().into();
+    start["source"] = opts.shared.source_label.lock().unwrap().clone().into();
     opts.audit.log("session_start", start);
     let mut out = Outcome::default();
     let r = stream(link, source, stats, opts, direct, &adm, &mut out);
@@ -888,7 +1086,9 @@ fn stream(
     out: &mut Outcome,
 ) -> Result<(), String> {
     let perms = &adm.perms;
-    let (w, h) = source.lock().unwrap().size();
+    // The source as of now (read before its size: a switch from here on is seen in the loop).
+    let mut source_gen = opts.shared.source_gen.load(Ordering::SeqCst);
+    let (mut w, mut h) = source.lock().unwrap().size();
     // What this machine encodes, the codec asked for first (H.264 by default: every device decodes
     // it); with `auto`, HEVC first when this machine encodes it in hardware.
     let mut codecs = crate::encode::capabilities().to_vec();
@@ -924,6 +1124,9 @@ fn stream(
     // relay says one joined.
     let mut deadline = Instant::now() + Duration::from_secs(10);
     let client = loop {
+        if opts.shared.stop.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         if link.waiting_for_viewer() {
             deadline = Instant::now() + Duration::from_secs(10);
         }
@@ -962,7 +1165,7 @@ fn stream(
     eprintln!("rein-remote: encoding {}", enc.name());
     let (mut ew, mut eh) = enc.size();
     // The picture at full size, and a buffer for it scaled down (when the link asks for that).
-    let enc_full = (ew, eh);
+    let mut enc_full = (ew, eh);
     let mut small: Vec<u8> = Vec::new();
     link.send(&Message::Config(Config {
         codec,
@@ -1033,6 +1236,25 @@ fn stream(
         flags,
         seconds_left: deadline.map_or(0, |d| d.saturating_duration_since(Instant::now()).as_secs().max(1) as u32),
     }))?;
+    // In the host's list of viewers while it lasts (to show it, and to end it).
+    let live = Arc::new(Live {
+        adm: adm.clone(),
+        device: client.name.clone(),
+        since: SystemTime::now(),
+        now: Mutex::new(LiveStats {
+            kbps: crate::adapt::START_KBPS.min(top),
+            width: ew as u32,
+            height: eh as u32,
+            recorded: recorder.is_some(),
+            ends_at: deadline.map(|d| SystemTime::now() + d.saturating_duration_since(Instant::now())),
+            ..Default::default()
+        }),
+        end: Mutex::default(),
+    });
+    opts.shared.sessions.lock().unwrap().push(live.clone());
+    let _listed = Listed(&opts.shared, adm.id.clone());
+    // Frames sent since when, for its frame rate.
+    let mut fps_since = (Instant::now(), 0u32);
     eprintln!(
         "rein-remote: {} connected ({:?} {ew}×{eh} at {fps} fps{refresh}{}{})",
         client.name,
@@ -1073,7 +1295,7 @@ fn stream(
     }
 
     let mut frame_time = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
-    let mut adapt = crate::adapt::Adapt::new(top, fps);
+    let mut adapt = crate::adapt::Adapt::new(top, fps).prefer(opts.prefer);
     // Frames into the encoder and out of it: an encoder that skips frames (its rate control, when a
     // frame can't fit its share of the bitrate) is short of bits for the picture's size.
     let (mut enc_in, mut enc_out, mut enc_seen) = (0u64, 0u64, (0u64, 0u64));
@@ -1183,7 +1405,9 @@ fn stream(
                             }
                             Some(Message::Pong { id, .. }) => {
                                 if let Some(t) = pings.remove(&id) {
-                                    stats.lock().unwrap().rtt_ms = t.elapsed().as_secs_f64() * 1000.0;
+                                    let rtt = t.elapsed().as_secs_f64() * 1000.0;
+                                    stats.lock().unwrap().rtt_ms = rtt;
+                                    live.now.lock().unwrap().rtt_ms = rtt;
                                 }
                             }
                             Some(Message::Ping { id, sent_us }) => link.send(&Message::Pong { id, sent_us })?,
@@ -1206,6 +1430,48 @@ fn stream(
                 Recv::Nothing => break,
                 Recv::Closed => return Ok(()),
             }
+        }
+        // Ended by the host (a kick, sharing stopped, a device unpaired, a source its rule doesn't
+        // allow): the viewer is told why, then it closes.
+        let ended = live.end.lock().unwrap().take().or_else(|| {
+            opts.shared
+                .stop
+                .load(Ordering::SeqCst)
+                .then(|| (NOTICE_ENDED, opts.shared.stop_text.lock().unwrap().clone(), "sharing stopped"))
+        });
+        if let Some((code, text, why)) = ended {
+            link.send(&Message::Notice(Notice { code, text }))?;
+            let _ = link.flushed();
+            // A moment for it to be on its way before the connection closes.
+            std::thread::sleep(Duration::from_millis(100));
+            eprintln!("rein-remote: {}'s session ended by the host ({why})", adm.principal.user);
+            out.ended = Some(why);
+            return Ok(());
+        }
+        // The host switched the source: the new one's size, a new encoder (its first frame a keyframe)
+        // and a Config, as when the picture is scaled.
+        let gen = opts.shared.source_gen.load(Ordering::SeqCst);
+        if gen != source_gen {
+            source_gen = gen;
+            (w, h) = source.lock().unwrap().size();
+            enc = crate::encode::open(codec, w, h, fps as f32, adapt.target().kbps)?;
+            enc_full = enc.size();
+            let size = scaled_size(enc_full, adapt.target().scale);
+            if size != enc_full {
+                enc = crate::encode::open(codec, size.0, size.1, fps as f32, adapt.target().kbps)?;
+            }
+            (ew, eh) = enc.size();
+            encoding.clear();
+            (seen_generation, cursor_sent) = (None, None);
+            link.send(&Message::Config(Config {
+                codec,
+                width: ew as u16,
+                height: eh as u16,
+                fps: fps as u16,
+                bitrate_kbps: adapt.target().kbps,
+            }))?;
+            let label = opts.shared.source_label.lock().unwrap().clone();
+            eprintln!("rein-remote: {} now sees {label} ({ew}×{eh})", client.name);
         }
         // Sound as it comes (small, and never held back with the video when the link backs up: a late
         // packet is the client's to drop).
@@ -1387,6 +1653,15 @@ fn stream(
             if std::env::var_os("RR_DEBUG_ADAPT").is_some() {
                 eprintln!("adapt: queuing {:.0} ms, target {:?}", adapt.queuing_ms(), t);
             }
+            {
+                let mut l = live.now.lock().unwrap();
+                (l.kbps, l.width, l.height) = (t.kbps, ew as u32, eh as u32);
+                let span = fps_since.0.elapsed().as_secs_f64();
+                if span >= 1.0 {
+                    l.fps = (frame_no.wrapping_sub(fps_since.1) as f64 / span).round() as u32;
+                    fps_since = (Instant::now(), frame_no);
+                }
+            }
             let mut s = stats.lock().unwrap();
             (s.kbps, s.fps, s.queuing_ms) = (t.kbps, t.fps, adapt.queuing_ms());
         }
@@ -1483,6 +1758,8 @@ mod tests {
             audit: Default::default(),
             record: None,
             source_label: "test-pattern".into(),
+            prefer: Default::default(),
+            shared: Default::default(),
         };
         tx.send(hello).unwrap();
         let source: Arc<Mutex<Box<dyn Source>>> = Arc::new(Mutex::new(Box::new(crate::capture::TestPattern::new(320, 240))));
@@ -1741,6 +2018,8 @@ max_session_minutes = 0.05
             audit: Arc::new(crate::audit::Audit::open(&audit_path).unwrap()),
             record: Some(dir.join("rec")),
             source_label: "test-pattern".into(),
+            prefer: Default::default(),
+            shared: Default::default(),
         };
         let spy = Spy(crate::capture::TestPattern::new(320, 240), inputs.clone());
         std::thread::spawn(move || run(Box::new(spy), opts));

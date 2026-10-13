@@ -285,3 +285,16 @@ has been verified.
   (codesign with the hardened runtime and notarytool, signtool, cosign on SHA256SUMS); CI signs with
   identities made on the runner and refuses a tampered copy on all three. Real certificates
   (Developer ID with notarization, an OV/EV certificate): [manual test](docs/verification/signing.md).
+
+## Phase 7 — Server UI
+
+- Native host apps on macOS (SwiftUI), Windows (WinUI 3) and Linux (GTK4), on `rein-remote host` and
+  its local control API ([docs/control-api.md](docs/control-api.md)):
+  - host basics: share or stop, pick what's shared (a display, a window, an app), the links and a QR
+    code, pairing a device, the viewers connected and kicking one;
+  - settings: frame rate first or quality, bitrate, codec, frame rate, sound, the network (listen,
+    mDNS, pairing, relays), start at login, macOS's permissions;
+  - admin: sign-in (OIDC, SAML), the policy, live sessions, the audit log, metrics.
+- Installers that start the host at login on each OS.
+- **Verified:** on each OS, install, share, pair a phone, see and kick a viewer, change settings, admin
+  pages work.
