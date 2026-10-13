@@ -28,6 +28,7 @@ rein-remote host                              # settings from ~/.rein-remote/hos
 rein-remote host --config /path/to/host.toml  # another settings file
 rein-remote host --test-pattern 640x480       # any `serve` flag: wins over host.toml for this run
 rein-remote host --control-listen 127.0.0.1:7980   # a fixed port for the API (default: a random one)
+rein-remote host --sharing on                 # share now, whatever the settings say (for this run)
 ```
 
 - **Not sharing is a valid state.** The host starts with sharing off unless the settings say
@@ -56,7 +57,7 @@ devices).
 | File | What | Who writes it |
 |---|---|---|
 | `host.toml` | The settings (below). | You, or the host when they change through the API. |
-| `control.json` | Where the API is and its token. Owner-only. | The host, at start (removed at a clean exit). |
+| `control.json` | Where the API is and its token. Owner-only. | The host, each time it starts. |
 | `audit.jsonl` | The audit log, unless `audit` says elsewhere (or `off`). | The host. |
 | `policy.toml` / `policy.json` | The policy, when set through the API. | The host (`PUT /control/admin/policy`). |
 | `oidc-client-secret`, `relay-secret` | Secrets set through the API. Owner-only. | The host. |
@@ -89,7 +90,9 @@ audit = "/Users/me/.rein-remote/audit.jsonl"
 {"url":"http://127.0.0.1:52817","token":"4f9c0d…(64 hex)","pid":41237,"version":"0.1.1","api":1}
 ```
 
-- Written when the API is listening (so its presence and a live `pid` mean the host is up).
+- Written when the API is listening. It stays when the host ends; a host that starts finds the old
+  one's API not answering and writes its own. So: the file and a `GET /control/state` that answers
+  mean the host is up.
 - **Owner-only.** On macOS and Linux it's created with mode `0600` (the folder is the owner's too).
   On Windows it's in the user's profile (`%APPDATA%`, which only the user, SYSTEM and Administrators
   can read), and the host also removes inherited permissions from the file and grants full control to
@@ -130,6 +133,7 @@ Every error is JSON with one `error` string written to be shown to a person as i
 | 404 | No such endpoint, or no such viewer, device, source. |
 | 405 | The endpoint exists, not with this method. |
 | 409 | Not in this state: starting what's already sharing, kicking when not sharing, pairing that's off. |
+| 413 | A body over 1 MB. |
 | 500 | It failed: a port in use, a source that won't open, a file that can't be written. |
 
 Times are RFC 3339 in UTC (`2026-10-13T09:30:00.123Z`). Keys that mirror `host.toml` are written as
@@ -198,8 +202,10 @@ data: {"viewers":[ … the same rows as GET /control/viewers ]}
 - `links`: one per way to reach this machine, best first. **Each is the key to the screen** (the
   token is in it; a relay link has its end-to-end key after `#`): show them as such. `qr` is the text
   to draw as a QR code (the same as `url`). `kind` is `tailnet`, `lan`, `local` or `relay`. Empty
-  when not sharing, or when the host listens on one address only (then `listen` says where).
-  The token in them lasts as long as the host process; stopping and starting sharing keeps it.
+  when not sharing. When the host listens on one address only (`listen` set to one), one `local` link
+  for that address. The token in them lasts as long as the host process; stopping and starting
+  sharing keeps it.
+- `listen`: where viewers connect (`ADDR:PORT` while sharing; the setting when not).
 - `pairing`: `enabled` is the `pair` setting as it applies now (pairing needs sharing on); `code` is the
   open code (`null` when there's none: used, expired, five wrong tries, or pairing off). `url`/`qr`:
   the link a phone's camera opens to pair with this code. The code lasts 10 minutes and pairs one
@@ -218,8 +224,8 @@ Answers with the new state (as `GET /control/state`).
 
 ### `POST /control/sharing/stop`
 
-Optional body `{"reason":"…"}` (shown to viewers). Every viewer is told (a `Notice`: "the host stopped
-sharing", or the reason) and their sessions end; the server stops listening (its ports are free when
+Optional body `{"reason":"…"}` (shown to viewers). Every viewer is told (a `Notice`, code 3, whose
+text is the reason, or "the host stopped sharing") and their sessions end; the server stops listening (its ports are free when
 this answers); `sharing = false` is remembered. Answers with the new state. `409` when not sharing.
 
 ### `POST /control/sharing/restart`
@@ -341,8 +347,9 @@ One row per session (a viewer that reconnects is a new row):
 
 ### `POST /control/viewers/{id}/kick`
 
-Optional body `{"reason": "…"}`. The viewer is sent a `Notice` (code 3, "ended by the host", with
-the reason as its text when given), then the session closes; it's written to the audit log
+Optional body `{"reason": "…"}`. The viewer is sent a `Notice` (code 3, `NOTICE_ENDED`) whose text
+is "the host ended this session" (with the reason: "the host ended this session: REASON"), then the
+session closes; it's written to the audit log
 (`session_kicked`, then `session_end` with reason `kicked`). Answers `{"viewers":[…]}` (without it).
 `404` when no session has that id.
 
@@ -546,7 +553,7 @@ kept). Applied like settings (`applied`, `restart_needed`). Answers as GET plus 
 
 ### Live sessions: `GET /control/admin/sessions`
 
-The rows of `GET /control/viewers`, each with the policy's view of it too: `groups` (from the
+`{"sessions": [ … ]}`: the rows of `GET /control/viewers`, each with the policy's view of it too: `groups` (from the
 identity provider), `rule` (the policy rule that let them in; `none` without a policy), `clipboard`,
 `audio`, `recorded`, and `ends_at` (a time limit's end, or `null`). Kick with
 `POST /control/viewers/{id}/kick`.

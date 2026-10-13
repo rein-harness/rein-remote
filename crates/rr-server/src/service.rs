@@ -767,7 +767,7 @@ mod tests {
         );
         let p = install_plan(&s, Os::Windows);
         assert_eq!(p.steps.len(), 1, "created, not run: {:?}", p.steps);
-        assert!(p.steps[0].argv.last().unwrap().ends_with("rein-remote host"));
+        assert!(p.steps[0].argv.last().unwrap().ends_with("rein-remote\" host"), "{:?}", p.steps[0]);
         assert_eq!(uninstall_plan(&s, Os::Windows).steps.len(), 1);
     }
 
