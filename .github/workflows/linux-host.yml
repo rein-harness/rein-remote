@@ -1,0 +1,48 @@
+name: Linux host app
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  # The Linux host app (crates/rr-host-gtk: GTK4, libadwaita, a StatusNotifierItem tray icon) on
+  # `rein-remote host`'s control API: linted and built with GTK (the workspace's other jobs build it
+  # without, as the client library and a stub), the client tested against docs/control-api.md's
+  # examples, then the real app driven through AT-SPI on Xvfb (with a D-Bus session and the
+  # accessibility bus) against the real host it starts: crates/rr-host-gtk/tests/ui. Screenshots of
+  # each page are the `linux-host-app` artifact.
+  linux-host:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
+      - name: Packages (GTK4 and libadwaita to build; Xvfb, AT-SPI and pyatspi to test)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libgtk-4-dev libadwaita-1-dev libudev-dev libxkbcommon-x11-0 \
+            xvfb at-spi2-core python3-pyatspi gir1.2-atspi-2.0 dbus-x11 imagemagick xdotool libglib2.0-bin \
+            adwaita-icon-theme librsvg2-common fonts-cantarell desktop-file-utils > /dev/null
+          dpkg-query -W -f '${Package} ${Version}\n' libgtk-4-dev libadwaita-1-dev at-spi2-core python3-pyatspi
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Format
+        run: cargo fmt -p rr-host-gtk --check
+      - name: Lint (with GTK)
+        run: cargo clippy -p rr-host-gtk --features gtk --all-targets -- -D warnings
+      - name: The control API's client, against the doc's examples and a fake host
+        run: cargo test -p rr-host-gtk --features gtk
+      - name: Build (the app and rein-remote, side by side)
+        run: cargo build --release -p rr-server -p rr-host-gtk --features rr-host-gtk/gtk
+      - name: The .desktop file
+        run: desktop-file-validate crates/rr-host-gtk/data/dev.reinharness.RemoteHost.desktop
+      - name: UI test (AT-SPI on Xvfb, the app starting a real rein-remote host --test-pattern 1280x720)
+        run: SHOTS=$RUNNER_TEMP/shots crates/rr-host-gtk/tests/ui/run.sh target/release
+      - name: Screenshots
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-host-app
+          path: ${{ runner.temp }}/shots
+          if-no-files-found: warn

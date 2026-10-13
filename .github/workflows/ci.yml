@@ -285,6 +285,123 @@ jobs:
           kill %1 || true
           # What the server said (its per-second stats left out): the encoder, each viewer, adapting.
           grep -v '^rein-remote: {' serve.log || true
+  # The Windows host app (clients/windows-host, WinUI 3): the control API's client unit-tested against
+  # docs/control-api.md's examples, the app built, then driven through UI Automation (FlaUI) against a
+  # real `rein-remote host --test-pattern`: share, the source, pairing, a viewer kicked, a setting in
+  # host.toml, a bad policy's message, the audit log, the host gone and back. Screenshots of each page,
+  # and the app as a tester installs it (docs/verification/windows-host-app.md), as artifacts.
+  windows-host:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: windows-host
+          cache-on-failure: true
+      - name: The server
+        run: cargo build --release -p rr-server
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 10.0.x
+      - name: The screen
+        shell: pwsh
+        run: |
+          dotnet --list-sdks
+          try { Set-DisplayResolution -Width 1920 -Height 1080 -Force -ErrorAction Stop } catch { "Set-DisplayResolution: $_" }
+          Add-Type -AssemblyName System.Windows.Forms
+          [System.Windows.Forms.Screen]::AllScreens | Format-List DeviceName, Bounds, WorkingArea, Primary
+      - name: The API client's unit tests (fixtures from docs/control-api.md)
+        run: dotnet test clients/windows-host/ReinRemote.Host.Core.Tests -c Release --logger "console;verbosity=normal"
+      - name: The app (WinUI 3, unpackaged)
+        id: app
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          dotnet build clients/windows-host/ReinRemote.Host/ReinRemote.Host.csproj -c Release -p:Platform=x64
+          $app = Get-ChildItem clients/windows-host/ReinRemote.Host/bin -Recurse -Filter ReinRemoteHost.exe | Select-Object -First 1
+          $app.FullName
+          if (-not (Test-Path (Join-Path $app.DirectoryName rein-remote.exe))) { throw 'rein-remote.exe is not beside the app' }
+          "REIN_REMOTE_APP=$($app.FullName)" >> $env:GITHUB_ENV
+      - name: UI test (FlaUI) against rein-remote host --test-pattern
+        if: ${{ !cancelled() && steps.app.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          $env:REIN_REMOTE_EXE = "$PWD\target\release\rein-remote.exe"
+          $env:REIN_REMOTE_SCREENSHOTS = "$PWD\screenshots"
+          $env:REIN_REMOTE_TEST_HOMES = "${{ runner.temp }}"
+          dotnet test clients/windows-host/ReinRemote.Host.UiTests -c Release --logger "console;verbosity=detailed"
+      # What a tester installs (docs/verification/windows-host-app.md): the app, rein-remote.exe beside
+      # it, .NET and the Windows App SDK inside, nothing else needed.
+      - name: The app as shipped (self-contained)
+        if: ${{ !cancelled() && steps.app.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          dotnet publish clients/windows-host/ReinRemote.Host/ReinRemote.Host.csproj -c Release -p:Platform=x64 --self-contained -o "$env:RUNNER_TEMP\Rein Remote"
+          Get-ChildItem "$env:RUNNER_TEMP\Rein Remote" -Filter *.exe | Format-Table Name, Length
+          if (-not (Test-Path "$env:RUNNER_TEMP\Rein Remote\rein-remote.exe")) { throw 'rein-remote.exe is not in the published app' }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() && steps.app.outcome == 'success' }}
+        with:
+          name: windows-host-app-build
+          path: ${{ runner.temp }}/Rein Remote/
+          retention-days: 14
+      - name: Screenshots and logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-host-app
+          path: |
+            screenshots/
+            ${{ runner.temp }}/rr-app-*/*.log
+          if-no-files-found: warn
+  # The Windows installer (packaging/windows): the app windows-host built (windows-host-app-build) as an
+  # .msi with WiX v5, its executables and the .msi signed with a certificate made here (as `signing`
+  # does), then installed and uninstalled silently, per user and for all users:
+  # packaging/windows/smoke.ps1 says what each checks. docs/verification/installers.md has the rest.
+  windows-installer:
+    needs: windows-host
+    # The artifact is made before the UI test's result is known: build the installer either way.
+    if: ${{ !cancelled() }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-host-app-build
+          path: ${{ runner.temp }}/Rein Remote
+      - name: WiX v5
+        run: dotnet tool install --global wix --version 5.0.2
+      - name: Sign the executables (a self-signed certificate, as release.yml would with a real one)
+        shell: pwsh
+        run: ./tools/sign/windows.ps1 "$env:RUNNER_TEMP\Rein Remote\ReinRemoteHost.exe" "$env:RUNNER_TEMP\Rein Remote\rein-remote.exe" -SelfSigned
+      - name: The .msi
+        shell: pwsh
+        run: ./packaging/windows/build.ps1 -AppDir "$env:RUNNER_TEMP\Rein Remote" -OutDir out
+      - name: Sign the .msi
+        shell: pwsh
+        run: ./tools/sign/windows.ps1 (Get-Item out\*.msi).FullName -SelfSigned
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-installer
+          path: out/*.msi
+          retention-days: 14
+      - name: Install, run, uninstall (per user, no administrator)
+        shell: pwsh
+        run: ./packaging/windows/smoke.ps1 -Msi (Get-Item out\*.msi).FullName -Scope user
+      - name: Install, run, uninstall (ALLUSERS=1, Program Files, STARTATLOGIN=0)
+        shell: pwsh
+        run: ./packaging/windows/smoke.ps1 -Msi (Get-Item out\*.msi).FullName -Scope machine -NoStartAtLogin
+      - name: msiexec logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-installer-logs
+          path: ${{ runner.temp }}/rr-msi-*
+          if-no-files-found: warn
   # SAML sign-in (`--features saml`): samael verifies signatures with xmlsec1, which needs libxml2,
   # libxmlsec1 (OpenSSL) and clang for its bindings; off by default, so the other builds don't need them.
   saml:

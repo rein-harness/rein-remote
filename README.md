@@ -33,7 +33,6 @@ Early: the design is done and being built one verified piece at a time
 | Client: Windows / macOS / Linux (`rein-remote-viewer`, Rust) | working on this Mac: VideoToolbox decoded straight into the window (no copy), 9 / 12 ms glass to glass p50 / p95 at 60 fps, ~10% of one core; mouse, keys and text, the remote pointer, a picker of machines on the network, pairing; Windows and Linux on CI runners in software (11 / 16 ms Windows); GPU decoders (Media Foundation, VA-API) and real gamepads still to verify ([manual test](docs/verification/desktop-client.md)) (phase 5) |
 | Client: iOS / iPadOS (`clients/ios`, Swift on the Rust core) | in the simulator: VideoToolbox H.264 and HEVC, 60 fps, 9 / 15 ms glass to glass over WebTransport datagrams, Opus in sync (15–22 ms), a UIKit tap as a click, pairing, Bonjour, real certificates; a real iPhone and iPad still to verify ([manual test](docs/verification/ios-client.md)) (phase 5) |
 | Client: Android (`clients/android`, Kotlin on the Rust core) | in the emulator: 59.6 fps, 13 / 29 ms glass to glass at 720p (the emulator's codec, decoding on the host), MediaCodec decode (H.264, HEVC), a tap seen as a click, pairing, WebTransport and the WebSocket, Opus decoded; keyboards, gamepads and the other gestures unit-tested; a real phone still to verify ([docs/verification/android-client.md](docs/verification/android-client.md)) (phase 5) |
-| Host app: macOS (`clients/macos-host`, SwiftUI) | working on a Mac and on CI: a menu-bar app on `rein-remote host` (the server inside it): sharing on and off, the source, links and QR codes, pairing, viewers and kicking, paired devices, settings, permissions, sign-in, policy, sessions, the audit log, metrics; UI tests against a real host; a real phone and the permission panes still to verify ([manual test](docs/verification/macos-host-app.md)) (phase 7) |
 | Transport: WebSocket | working, with keyframe-and-skip when the link backs up (phase 1) |
 | Transport: WebTransport (QUIC) | working: a stream per frame, self-signed certificate by hash, falls back to the WebSocket by itself (phase 4) |
 | Transport: relay (behind NAT, no open ports) | working: `rein-remote relay` (self-hosted), `serve --relay`, end-to-end sealed; NAT hole punching moves the session onto a direct QUIC path (behind two NATs in Docker: 0.5–1.2 s, round trip 97 → 45 ms; [real NATs](docs/verification/nat-hole-punching.md)) (phase 4) |
@@ -41,6 +40,31 @@ Early: the design is done and being built one verified piece at a time
 | Adaptive bitrate and resolution, audio | working: frame rate first (for games): the bitrate then the picture (¾, ½, ⅓) give way before frames do; the top bitrate follows the picture (up to 1 Gbit/s); 1280×720 at 240 asked: 188–200 fps, 11 ms glass to glass on a Mac; bad links in a Linux VM (tc netem): 50–55 fps at 2–5% loss over datagrams; a game on a bad link and 240 fps on a GPU machine: [manual](docs/verification/bad-link-game.md) [tests](docs/verification/high-refresh.md); intra refresh on VA-API and Media Foundation encoders that offer it ([manual test](docs/verification/intra-refresh.md)); Opus sound 10.4 ms after its picture (median, Chrome on a Mac); Windows' sound capture: [manual test](docs/verification/audio.md) (phase 4) |
 | Enterprise sign-in, policy, audit, recording | working: OIDC and SAML sign-in, policies (view only, clipboard, audio, sources, time limit), a JSON-lines audit log, MP4 recording; verified with Keycloak in Docker: a viewer's input dropped, an unknown user refused, the recording decoded ([real IdP test](docs/verification/identity.md)) (phase 6) |
 | Relay fleet, metrics, config file, services, signing | working: several relays per machine with failover (a frame through the other in 60 ms), `/healthz` and `/metrics`, `--config FILE.toml`, `install-service` on all three (installed in CI), binaries signed in CI with runner-made identities; real certificates and notarization: [manual test](docs/verification/signing.md) (phase 6) |
+| Host app: macOS (`clients/macos-host`, SwiftUI) | on a Mac and a CI runner: a menu-bar app on `rein-remote host` (the server inside it): sharing on and off, the source, links and QR codes, pairing, viewers and kicking, paired devices, settings, permissions, sign-in, policy, sessions, the audit log, metrics; driven through XCUITest against a real host, light and dark ([screenshots](docs/verification/macos-host-app/)); a real phone and the permission panes still to verify ([manual test](docs/verification/macos-host-app.md)) (phase 7) |
+| Host app: Windows (`clients/windows-host`, WinUI 3) | on CI runners: a tray icon and a window on `rein-remote host`'s control API (sharing, the source, links with QR codes, pairing, viewers and kicks, paired devices, settings, sign-in, policy, sessions, the audit log, metrics), driven through UI Automation against a real host, light and dark ([screenshots](docs/verification/windows-host-app/)); a real PC with a phone still to verify ([manual test](docs/verification/windows-host-app.md)) (phase 7) |
+| Host app: Linux (`crates/rr-host-gtk`, GTK4 and libadwaita, a tray icon) | on a CI runner: the app driven through AT-SPI on Xvfb against the real `rein-remote host` it starts: sharing on and off, the source switched, a new pairing code, a viewer kicked (asked first) and the kick in the audit log, a setting saved to `host.toml`, a bad policy refused with the parser's message, the tray's D-Bus menu, the host killed and found again; a real GNOME and KDE desktop and a phone still to verify ([manual test](docs/verification/linux-host-app.md)) (phase 7) |
+
+## Install
+
+The host app (a tray or menu-bar icon and a window to share this screen, pair devices and see who's
+watching) and `rein-remote` itself, from a [release](https://github.com/rein-harness/rein-remote/releases):
+
+| | File | |
+|---|---|---|
+| Windows 10 1809+ / 11 | `rein-remote-VERSION-x64.msi` | Installs for you alone, no administrator needed (`%LOCALAPPDATA%\Programs\Rein Remote`), and starts in the tray when you sign in. For every user: `msiexec /i rein-remote-VERSION-x64.msi ALLUSERS=1` (Program Files). Without the sign-in item: `STARTATLOGIN=0`. |
+| Ubuntu 24.04+, Debian 13 | `rein-remote_VERSION_amd64.deb` | `sudo apt install ./rein-remote_VERSION_amd64.deb`, then *Rein Remote* in the menu. |
+| Ubuntu 22.04+, other Linux | `rein-remote-VERSION-x86_64.AppImage` | `chmod +x` it and run it (FUSE 2: `libfuse2`). |
+| macOS 14+ | `rein-remote-VERSION-macos-universal.dmg` | Drag *Rein Remote* to Applications. `rein-remote` is in the app (`Contents/MacOS/rein-remote`). |
+
+On Linux and macOS, starting at login is a switch in the app's Settings. Uninstalling: Settings →
+Apps (Windows), `sudo apt remove rein-remote`, or delete the AppImage or the app; your settings and
+pairings (`~/.rein-remote`, `%APPDATA%\rein-remote`) are kept. Builds from a release are signed
+when the project has the certificates ([signing.md](docs/verification/signing.md)); what Windows
+SmartScreen and macOS Gatekeeper say otherwise, and how each installer was tested:
+[docs/verification/installers.md](docs/verification/installers.md).
+
+Just the command-line binary: the `.tar.gz` / `.zip` archives in the same release, or
+`npx rein-remote` (npm).
 
 ## Try it
 
@@ -135,8 +159,20 @@ command line wins over the file. See [docs/verification/service-install.md](docs
 `rein-remote host` is the long-running process the platform apps drive: sharing on and off, the
 source switched live, viewers listed and ended, pairing, settings (`~/.rein-remote/host.toml`) and
 the admin pages, through a local HTTP + JSON control API with live events. The contract:
-[docs/control-api.md](docs/control-api.md). On macOS, the menu-bar app on it is `clients/macos-host`
-([docs/verification/macos-host-app.md](docs/verification/macos-host-app.md)).
+[docs/control-api.md](docs/control-api.md).
+
+On macOS, the Rein Remote app (`clients/macos-host`, SwiftUI) is that UI: a menu-bar icon and a window
+on demand; it has `rein-remote` inside it and starts the host when none is running
+([manual test](docs/verification/macos-host-app.md)).
+
+On Windows, the Rein Remote app (`clients/windows-host`, WinUI 3) is that UI: an icon in the
+notification area and a window for sharing, pairing, viewers, settings and the admin pages; it ships
+`rein-remote.exe` beside it and starts the host when none is running
+([manual test](docs/verification/windows-host-app.md)).
+
+On Linux the app is `rein-remote-host-gtk` (GTK4, libadwaita and a tray icon; `crates/rr-host-gtk`):
+`cargo build --release -p rr-server -p rr-host-gtk --features rr-host-gtk/gtk`, then
+`crates/rr-host-gtk/install.sh` ([docs/verification/linux-host-app.md](docs/verification/linux-host-app.md)).
 
 ### Signed binaries
 

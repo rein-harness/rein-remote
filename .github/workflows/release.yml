@@ -4,6 +4,8 @@ name: Release
 # secrets for it (docs/verification/signing.md): macOS with a Developer ID and notarized, Windows with
 # Authenticode, timestamped; without them, those steps are skipped and the build is as before. SHA256SUMS
 # is signed with cosign, keyless (Sigstore, this workflow's GitHub identity: no secret needed).
+# With them, the installers (packaging/, docs/verification/installers.md): the Windows .msi, the Linux
+# .deb and AppImage, and the macOS .dmg (once clients/macos-host is in the tree), signed the same way.
 on:
   push:
     tags: ['v*']
@@ -85,8 +87,154 @@ jobs:
             file="$name.tar.gz"
           fi
           gh release upload "$GITHUB_REF_NAME" "$file" --repo "$GITHUB_REPOSITORY"
+  # The installers. Each builds what it packages (as CI's installer jobs do) and uploads to the draft.
+  installer-windows:
+    needs: create
+    permissions:
+      contents: write
+    env:
+      HAS_WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE != '' }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 10.0.x
+      - name: Build rein-remote.exe and the app (self-contained, rein-remote.exe beside it)
+        shell: pwsh
+        run: |
+          cargo build --release -p rr-server
+          if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
+          dotnet publish clients/windows-host/ReinRemote.Host/ReinRemote.Host.csproj -c Release -p:Platform=x64 --self-contained -o "$env:RUNNER_TEMP\Rein Remote"
+          if (-not (Test-Path "$env:RUNNER_TEMP\Rein Remote\rein-remote.exe")) { throw 'rein-remote.exe is not in the published app' }
+      - name: Sign the executables (Authenticode)
+        if: env.HAS_WINDOWS_CERTIFICATE == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
+        run: ./tools/sign/windows.ps1 "$env:RUNNER_TEMP\Rein Remote\ReinRemoteHost.exe" "$env:RUNNER_TEMP\Rein Remote\rein-remote.exe"
+      - name: The .msi
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          ./packaging/windows/build.ps1 -AppDir "$env:RUNNER_TEMP\Rein Remote" -OutDir out
+      - name: Sign the .msi (Authenticode)
+        if: env.HAS_WINDOWS_CERTIFICATE == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
+        run: ./tools/sign/windows.ps1 (Get-Item out\*.msi).FullName
+      - name: Upload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" out/*.msi --repo "$GITHUB_REPOSITORY"
+  installer-deb:
+    needs: create
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Packages
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libgtk-4-dev libadwaita-1-dev libudev-dev > /dev/null
+      - name: Build and package
+        run: |
+          cargo build --release -p rr-server -p rr-host-gtk --features rr-host-gtk/gtk
+          packaging/linux/build-deb.sh out
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" out/*.deb --repo "$GITHUB_REPOSITORY"
+  installer-appimage:
+    needs: create
+    permissions:
+      contents: write
+    runs-on: ubuntu-22.04
+    env:
+      GTK_PREFIX: /opt/rr-gtk
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Packages
+        run: sudo packaging/linux/gtk-stack.sh deps && sudo mkdir -p $GTK_PREFIX && sudo chown "$USER" $GTK_PREFIX
+      - name: The GTK stack (cached by installers.yml on main)
+        id: stack
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /opt/rr-gtk
+          key: gtk-stack-ubuntu-22.04-${{ runner.arch }}-${{ hashFiles('packaging/linux/gtk-stack.sh') }}
+      - name: Build GTK 4.14 and libadwaita 1.5
+        if: steps.stack.outputs.cache-hit != 'true'
+        run: packaging/linux/gtk-stack.sh
+      - name: Build and package
+        run: |
+          PKG_CONFIG_PATH=$GTK_PREFIX/lib/pkgconfig:$GTK_PREFIX/share/pkgconfig cargo build --release -p rr-server -p rr-host-gtk --features rr-host-gtk/gtk
+          packaging/linux/build-appimage.sh out
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" out/*.AppImage --repo "$GITHUB_REPOSITORY"
+  installer-dmg:
+    needs: create
+    permissions:
+      contents: write
+    env:
+      HAS_MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE != '' }}
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Is the macOS host app here?
+        id: app
+        run: |
+          if [ -f clients/macos-host/project.yml ]; then echo "present=true" >> "$GITHUB_OUTPUT"
+          else echo "::notice::clients/macos-host isn't in this release: no .dmg"; fi
+      - name: Build Rein Remote.app (arm64 and x86_64)
+        if: steps.app.outputs.present == 'true'
+        run: |
+          rustup toolchain install stable --profile minimal && rustup default stable
+          brew install xcodegen
+          UNIVERSAL=1 packaging/macos/build-dmg.sh app "$RUNNER_TEMP/stage"
+      # With a Developer ID: signed, notarized and stapled; without, ad hoc (as CI).
+      - name: Sign (and notarize) the app
+        if: steps.app.outputs.present == 'true'
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: sh tools/sign/macos.sh "$RUNNER_TEMP/stage/Rein Remote.app"
+      - name: The .dmg
+        if: steps.app.outputs.present == 'true'
+        run: packaging/macos/build-dmg.sh dmg "$RUNNER_TEMP/stage" out
+      - name: Sign (and notarize) the .dmg
+        if: steps.app.outputs.present == 'true'
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: sh tools/sign/macos.sh out/*.dmg
+      - name: Upload
+        if: steps.app.outputs.present == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" out/*.dmg --repo "$GITHUB_REPOSITORY"
   publish:
-    needs: build
+    needs: [build, installer-windows, installer-deb, installer-appimage, installer-dmg]
     runs-on: ubuntu-latest
     permissions:
       contents: write
