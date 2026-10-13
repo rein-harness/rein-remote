@@ -470,3 +470,62 @@ fn the_audit_logs_tail_filters_and_pages() {
     assert_eq!(h.api("GET", "/control/admin/audit?limit=0", Value::Null).0, 400);
     let _ = std::fs::remove_dir_all(&h.home);
 }
+
+#[test]
+fn the_first_run_makes_its_home_folder() {
+    let base = home("fresh");
+    let dir = base.join("not-yet").join("made");
+    let h = host(&dir, &[]);
+    assert!(dir.join("control.json").exists() && dir.join("audit.jsonl").exists());
+    assert_eq!(h.ok("GET", "/control/state", Value::Null)["sharing"], false);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn events_come_as_they_happen() {
+    use std::io::{BufRead, BufReader};
+    let h = host(&home("events"), &[]);
+    let mut s = std::net::TcpStream::connect(&h.addr).unwrap();
+    s.set_read_timeout(Some(T)).unwrap();
+    write!(
+        s,
+        "GET /control/events HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\n\r\n",
+        h.addr, h.token
+    )
+    .unwrap();
+    let mut lines = BufReader::new(s).lines().map_while(Result::ok);
+    assert!(lines.next().unwrap().starts_with("HTTP/1.1 200"));
+    // Each event: `event: NAME` then `data: JSON`.
+    let mut next = |name: &str, want: &dyn Fn(&Value) -> bool| -> Value {
+        let mut event = String::new();
+        for l in lines.by_ref() {
+            if let Some(e) = l.strip_prefix("event: ") {
+                event = e.to_string();
+            } else if let Some(d) = l.strip_prefix("data: ") {
+                let v: Value = serde_json::from_str(d).unwrap();
+                if event == name && want(&v) {
+                    return v;
+                }
+            }
+        }
+        panic!("no {name} event")
+    };
+    // One of each when it connects.
+    let first = next("state", &|_| true);
+    assert_eq!(first["sharing"], false);
+    next("viewers", &|_| true);
+    next("devices", &|_| true);
+    next("settings", &|_| true);
+    // Then what changes.
+    let link = h.share();
+    let started = next("state", &|v| v["sharing"] == true);
+    assert_eq!(started["links"][0]["url"].as_str(), Some(link.as_str()));
+    let viewer = connect(&link, websocket()).unwrap();
+    let joined = next("viewers", &|v| v["viewers"].as_array().is_some_and(|a| !a.is_empty()));
+    assert_eq!(joined["viewers"][0]["via"], "token");
+    drop(viewer);
+    next("viewers", &|v| v["viewers"] == json!([]));
+    h.ok("PUT", "/control/settings", json!({"prefer": "quality"}));
+    next("settings", &|v| v["settings"]["prefer"] == "quality");
+    let _ = std::fs::remove_dir_all(&h.home);
+}

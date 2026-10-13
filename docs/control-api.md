@@ -287,8 +287,9 @@ live**: each viewer gets a new `Config` (the new size) and a keyframe, with no r
 whose policy rule doesn't allow the new source is told why and its session ends. Answers with the
 new state.
 
-- `400` for an id that isn't one; `500` when it can't be opened (a window that closed, no
-  permission): what was shared before stays.
+- `400` for an id that isn't one. While sharing, `500` when it can't be opened (a window that
+  closed, no permission), and what was shared before stays. When not sharing it's only remembered:
+  a source that can't be opened shows in `state.error` when sharing starts.
 - **Sound** stays with the source sharing started with until sharing restarts (macOS captures an
   app's or a display's sound with its picture).
 

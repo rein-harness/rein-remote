@@ -165,6 +165,13 @@ impl Host {
     /// The host with its settings (`path`, else `host.toml` in the home folder) and this run's flags.
     pub fn open(path: Option<PathBuf>, cli: Vec<(String, String)>) -> Result<Arc<Host>, String> {
         let home = crate::identity::home();
+        // The first run on this machine: the folder made (owner-only, as the files in it are).
+        std::fs::create_dir_all(&home).map_err(|e| format!("{}: {e}", home.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700));
+        }
         let path = path.unwrap_or_else(|| home.join("host.toml"));
         let file: toml::Table = match std::fs::read_to_string(&path) {
             Ok(text) => text.parse().map_err(|e: toml::de::Error| format!("{}: {}", path.display(), e.message()))?,
@@ -264,7 +271,12 @@ impl Host {
 
     fn reopen_audit(&self) -> Result<(), String> {
         let a = match self.audit_path() {
-            Some(p) => crate::audit::Audit::open(&p)?,
+            Some(p) => {
+                if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                crate::audit::Audit::open(&p)?
+            }
             None => crate::audit::Audit::default(),
         };
         *self.audit.lock().unwrap() = Arc::new(a);
@@ -1189,9 +1201,11 @@ pub fn run(args: &[String]) -> Result<(), String> {
             _ => cli.push((key.to_string(), value.unwrap_or_else(|| "on".into()))),
         }
     }
-    let host = Host::open(config, cli)?;
-    let control = host.home.join("control.json");
+    crate::metrics::start();
+    // Not a second host for this folder (before opening anything of the first one's).
+    let control = crate::identity::home().join("control.json");
     crate::control::refuse_second(&control)?;
+    let host = Host::open(config, cli)?;
     let listen = listen.or_else(|| host.file_value("control-listen")).unwrap_or_else(|| "127.0.0.1:0".into());
     let remote = remote || on(host.file_value("control-remote").as_deref(), false);
     let tls = if remote {
