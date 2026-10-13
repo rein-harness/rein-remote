@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Page
+    x:Class="ReinRemote.Host.Pages.DevicesPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:core="using:ReinRemote.Host.Core"
+    NavigationCacheMode="Required">
+    <ScrollViewer Padding="24,8,24,24">
+        <StackPanel MaxWidth="980">
+            <TextBlock Text="Paired devices" Style="{StaticResource PageTitle}" AutomationProperties.HeadingLevel="Level1" AutomationProperties.AutomationId="PageTitle" />
+            <TextBlock Style="{StaticResource Hint}" Margin="0,0,0,12"
+                       Text="Devices that paired with a code connect again with their own key, no code needed. Unpairing ends their sessions; they'd need a new code." />
+            <InfoBar x:Name="DevicesResult" IsClosable="True" Margin="0,0,0,12" AutomationProperties.AutomationId="DevicesResult" AutomationProperties.Name="Result" />
+            <TextBlock x:Name="NoDevices" Text="No devices paired. Pair one from Sharing with its code." Style="{StaticResource BodyTextBlockStyle}" AutomationProperties.AutomationId="NoDevices" />
+            <ListView x:Name="DeviceList" SelectionMode="None" AutomationProperties.AutomationId="DeviceList" AutomationProperties.Name="Paired devices">
+                <ListView.ItemTemplate>
+                    <DataTemplate x:DataType="core:Device">
+                        <Grid ColumnSpacing="16" Padding="0,10">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <FontIcon Glyph="&#xE8EA;" FontSize="20" VerticalAlignment="Center" AutomationProperties.AccessibilityView="Raw" />
+                            <StackPanel Grid.Column="1">
+                                <TextBlock Text="{x:Bind Name}" Style="{StaticResource BodyStrongTextBlockStyle}" />
+                                <TextBlock Text="{x:Bind Id}" Style="{StaticResource Hint}" FontFamily="Cascadia Mono, Consolas" IsTextSelectionEnabled="True" />
+                                <TextBlock Text="{x:Bind SinceText}" Style="{StaticResource Hint}" />
+                            </StackPanel>
+                            <Button Grid.Column="2" Content="Unpair" Tag="{x:Bind}" Click="Unpair_Click" VerticalAlignment="Center"
+                                    AutomationProperties.AutomationId="UnpairButton" AutomationProperties.Name="{x:Bind UnpairName}" />
+                        </Grid>
+                    </DataTemplate>
+                </ListView.ItemTemplate>
+            </ListView>
+        </StackPanel>
+    </ScrollViewer>
+</Page>
