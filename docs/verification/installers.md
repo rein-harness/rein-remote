@@ -136,10 +136,12 @@ Best on a PC (or a fresh VM) that has never had .NET or the Visual C++ runtime i
 
 ### For every user, and without the login item
 
-15. In an elevated prompt: `msiexec /i rein-remote-…-x64.msi ALLUSERS=1 STARTATLOGIN=0`. **Expect
-    UAC**, then `C:\Program Files\Rein Remote`, the shortcut in every user's Start menu, no Run key.
+15. From an **elevated** prompt (Terminal → *Run as administrator*; the .msi says it needs no
+    elevation, so msiexec doesn't ask on its own and an unelevated `ALLUSERS=1` fails with error
+    1925 or similar: note what you see): `msiexec /i rein-remote-…-x64.msi ALLUSERS=1 STARTATLOGIN=0`.
+    Expect `C:\Program Files\Rein Remote`, the shortcut in every user's Start menu, no Run key.
     Sign in as another user: Start → Rein Remote works for them too. Uninstall from Installed apps
-    (asks for UAC).
+    (it asks for an administrator), or `msiexec /x` from the elevated prompt.
 16. An upgrade: install this version, then a newer one (a later PR's artifact or a release) over it
     with the app running: one *Rein Remote* in Installed apps afterwards, the newer version, the app
     restarted by its Run key at the next sign-in.
