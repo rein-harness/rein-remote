@@ -41,6 +41,7 @@ Early: the design is done and being built one verified piece at a time
 | Enterprise sign-in, policy, audit, recording | working: OIDC and SAML sign-in, policies (view only, clipboard, audio, sources, time limit), a JSON-lines audit log, MP4 recording; verified with Keycloak in Docker: a viewer's input dropped, an unknown user refused, the recording decoded ([real IdP test](docs/verification/identity.md)) (phase 6) |
 | Relay fleet, metrics, config file, services, signing | working: several relays per machine with failover (a frame through the other in 60 ms), `/healthz` and `/metrics`, `--config FILE.toml`, `install-service` on all three (installed in CI), binaries signed in CI with runner-made identities; real certificates and notarization: [manual test](docs/verification/signing.md) (phase 6) |
 | Host app: Windows (`clients/windows-host`, WinUI 3) | on CI runners: a tray icon and a window on `rein-remote host`'s control API (sharing, the source, links with QR codes, pairing, viewers and kicks, paired devices, settings, sign-in, policy, sessions, the audit log, metrics), driven through UI Automation against a real host, light and dark ([screenshots](docs/verification/windows-host-app/)); a real PC with a phone still to verify ([manual test](docs/verification/windows-host-app.md)) (phase 7) |
+| Host app: Linux (`crates/rr-host-gtk`, GTK4 and libadwaita, a tray icon) | on a CI runner: the app driven through AT-SPI on Xvfb against the real `rein-remote host` it starts: sharing on and off, the source switched, a new pairing code, a viewer kicked (asked first) and the kick in the audit log, a setting saved to `host.toml`, a bad policy refused with the parser's message, the tray's D-Bus menu, the host killed and found again; a real GNOME and KDE desktop and a phone still to verify ([manual test](docs/verification/linux-host-app.md)) (phase 7) |
 
 ## Try it
 
@@ -141,6 +142,10 @@ On Windows, the Rein Remote app (`clients/windows-host`, WinUI 3) is that UI: an
 notification area and a window for sharing, pairing, viewers, settings and the admin pages; it ships
 `rein-remote.exe` beside it and starts the host when none is running
 ([manual test](docs/verification/windows-host-app.md)).
+
+On Linux the app is `rein-remote-host-gtk` (GTK4, libadwaita and a tray icon; `crates/rr-host-gtk`):
+`cargo build --release -p rr-server -p rr-host-gtk --features rr-host-gtk/gtk`, then
+`crates/rr-host-gtk/install.sh` ([docs/verification/linux-host-app.md](docs/verification/linux-host-app.md)).
 
 ### Signed binaries
 
