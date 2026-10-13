@@ -30,11 +30,22 @@ if ($LASTEXITCODE -ne 0) { throw "wix build failed ($LASTEXITCODE)" }
 # Per user without UAC: Summary Information's Word Count (property 15) gets bit 3, "elevated privileges
 # are not required" (WiX 5's perUserOrMachine leaves it off, so a standard user would be asked for an
 # administrator). ALLUSERS=1 is then for an elevated prompt (msiexec doesn't ask on its own).
-# MsiInfo.exe (Windows SDK) sets it: /w is Word Count, 2 (compressed) + 8 = 10.
-$msiinfo = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\MsiInfo.exe" |
-  Sort-Object FullName -Descending | Select-Object -First 1
-if (-not $msiinfo) { throw 'MsiInfo.exe not found (Windows SDK)' }
-& $msiinfo.FullName $Out /w 10 | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "MsiInfo /w failed ($LASTEXITCODE)" }
-& $msiinfo.FullName $Out | Select-String 'Word Count'
+# Set through msi.dll's own API (no SDK tool needed; its COM setter refuses PowerShell's values).
+Add-Type -Namespace RR -Name Msi -MemberDefinition @'
+[DllImport("msi.dll", CharSet = CharSet.Unicode)] public static extern uint MsiGetSummaryInformation(IntPtr db, string path, uint updates, out IntPtr handle);
+[DllImport("msi.dll", CharSet = CharSet.Unicode)] public static extern uint MsiSummaryInfoGetProperty(IntPtr h, uint pid, out uint type, out int value, IntPtr ft, System.Text.StringBuilder sb, ref uint len);
+[DllImport("msi.dll", CharSet = CharSet.Unicode)] public static extern uint MsiSummaryInfoSetProperty(IntPtr h, uint pid, uint type, int value, IntPtr ft, string s);
+[DllImport("msi.dll")] public static extern uint MsiSummaryInfoPersist(IntPtr h);
+[DllImport("msi.dll")] public static extern uint MsiCloseHandle(IntPtr h);
+'@
+$h = [IntPtr]::Zero
+if ([RR.Msi]::MsiGetSummaryInformation([IntPtr]::Zero, $Out, 1, [ref]$h) -ne 0) { throw 'MsiGetSummaryInformation failed' }
+try {
+  $type = [uint32]0; $wc = 0; $len = [uint32]0
+  if ([RR.Msi]::MsiSummaryInfoGetProperty($h, 15, [ref]$type, [ref]$wc, [IntPtr]::Zero, $null, [ref]$len) -ne 0) { throw 'reading Word Count failed' }
+  # 3: VT_I4
+  if ([RR.Msi]::MsiSummaryInfoSetProperty($h, 15, 3, ($wc -bor 8), [IntPtr]::Zero, $null) -ne 0) { throw 'setting Word Count failed' }
+  if ([RR.Msi]::MsiSummaryInfoPersist($h) -ne 0) { throw 'MsiSummaryInfoPersist failed' }
+  Write-Host "Word Count: $wc -> $($wc -bor 8) (no elevation needed)"
+} finally { [void][RR.Msi]::MsiCloseHandle($h) }
 Get-Item $Out | Format-Table Name, Length
