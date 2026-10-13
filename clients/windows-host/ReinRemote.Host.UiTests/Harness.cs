@@ -209,6 +209,7 @@ sealed class AppSession : IDisposable
     public string Pick(string comboId, string prefix)
     {
         var combo = ById(comboId);
+        Env.Until(() => combo.IsEnabled, $"{comboId} enabled");
         combo.Patterns.ExpandCollapse.Pattern.Expand();
         Thread.Sleep(500);
         var item = Env.Until(() => combo.FindAllDescendants(cf => cf.ByControlType(ControlType.ListItem))

@@ -125,7 +125,7 @@ public sealed partial class SharingPage : Page
     {
         if (string.IsNullOrEmpty(id))
             return "the main display";
-        var known = sources.FirstOrDefault(x => x.Id == id);
+        var known = sources.FirstOrDefault(x => x.Id == id && x.Group != "Now");
         return known is not null ? known.Display : id switch
         {
             "display" => "the main display",
@@ -157,11 +157,11 @@ public sealed partial class SharingPage : Page
             return;
         }
         var all = list.All();
+        sources = all;
         // What's shared now stays in the list even when the listing doesn't have it (a test pattern's size, a closed window).
         var now = M.State?.Source;
         if (!string.IsNullOrEmpty(now) && all.All(x => x.Id != now))
             all.Insert(0, new SourceItem { Id = now, Name = Describe(now), Group = "Now" });
-        sources = all;
         settingSource = true;
         SourcePicker.ItemsSource = sources;
         settingSource = false;
