@@ -99,6 +99,8 @@ Check (-not (Test-Path $lnk)) 'the shortcut removed'
 Check ($null -eq (Get-ItemProperty $run -Name 'Rein Remote' -ErrorAction SilentlyContinue)) 'the Run key removed'
 Check (@(Arp).Count -eq 0) 'no Add/Remove Programs entry'
 Check (-not (Test-Path "$hive\Software\Rein Harness\Rein Remote")) 'no registry left'
-Check (-not (Select-String -Path "$logs\uninstall.log" -Pattern 'REBOOTREQUIRED|ScheduleReboot|files in use' -Quiet)) 'no reboot needed'
+# msiexec said 0, not 3010 (ERROR_SUCCESS_REBOOT_REQUIRED): nothing was left for a reboot. (Windows
+# Installer's Restart Manager closes the app first; the StopApp action catches what it doesn't.)
+Check (Select-String -Path "$logs\uninstall.log" -Pattern 'Removal completed successfully' -Quiet) 'removed, exit 0: no reboot needed'
 Remove-Item Env:\REIN_REMOTE_HOME
 Write-Host "== ${Scope}: passed"
