@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Window
+    x:Class="ReinRemote.Host.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="Rein Remote">
+    <Window.SystemBackdrop>
+        <MicaBackdrop />
+    </Window.SystemBackdrop>
+    <Grid x:Name="Root">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+        <!-- The title bar (the window's content extends into it, so it follows the theme). -->
+        <Grid x:Name="AppTitleBar" Grid.Row="0" Height="40" Padding="14,0,0,0">
+            <StackPanel Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
+                <Image Source="ms-appx:///Assets/rein-remote.ico" Width="18" Height="18" AutomationProperties.AccessibilityView="Raw" />
+                <TextBlock x:Name="TitleText" Text="Rein Remote" Style="{StaticResource CaptionTextBlockStyle}" VerticalAlignment="Center" />
+            </StackPanel>
+        </Grid>
+        <!-- The link to rein-remote host: hidden while connected. -->
+        <InfoBar x:Name="ConnectionBar" Grid.Row="1" Margin="12,0,12,8" IsOpen="True" IsClosable="False" Severity="Informational"
+                 Title="Connecting" Message="Looking for rein-remote host…"
+                 AutomationProperties.AutomationId="ConnectionBar" AutomationProperties.Name="Connection to rein-remote host"
+                 AutomationProperties.LiveSetting="Assertive" />
+        <NavigationView x:Name="Nav" Grid.Row="2" PaneDisplayMode="Left" IsBackButtonVisible="Collapsed"
+                        IsSettingsVisible="False" IsPaneToggleButtonVisible="False" OpenPaneLength="200"
+                        SelectionChanged="Nav_SelectionChanged"
+                        AutomationProperties.AutomationId="Nav" AutomationProperties.Name="Pages">
+            <NavigationView.MenuItems>
+                <NavigationViewItem Content="Sharing" Tag="Sharing" AutomationProperties.AutomationId="NavSharing" AutomationProperties.Name="Sharing">
+                    <NavigationViewItem.Icon><FontIcon Glyph="&#xE7F4;" /></NavigationViewItem.Icon>
+                </NavigationViewItem>
+                <NavigationViewItem x:Name="NavViewers" Content="Viewers" Tag="Viewers" AutomationProperties.AutomationId="NavViewers" AutomationProperties.Name="Viewers">
+                    <NavigationViewItem.Icon><FontIcon Glyph="&#xE716;" /></NavigationViewItem.Icon>
+                    <NavigationViewItem.InfoBadge>
+                        <InfoBadge x:Name="ViewersBadge" Visibility="Collapsed" AutomationProperties.AutomationId="ViewersBadge" />
+                    </NavigationViewItem.InfoBadge>
+                </NavigationViewItem>
+                <NavigationViewItem Content="Paired devices" Tag="Devices" AutomationProperties.AutomationId="NavDevices" AutomationProperties.Name="Paired devices">
+                    <NavigationViewItem.Icon><FontIcon Glyph="&#xE8EA;" /></NavigationViewItem.Icon>
+                </NavigationViewItem>
+                <NavigationViewItem Content="Settings" Tag="Settings" AutomationProperties.AutomationId="NavSettings" AutomationProperties.Name="Settings">
+                    <NavigationViewItem.Icon><FontIcon Glyph="&#xE713;" /></NavigationViewItem.Icon>
+                </NavigationViewItem>
+                <NavigationViewItem Content="Admin" Tag="Admin" AutomationProperties.AutomationId="NavAdmin" AutomationProperties.Name="Admin">
+                    <NavigationViewItem.Icon><FontIcon Glyph="&#xE7EF;" /></NavigationViewItem.Icon>
+                </NavigationViewItem>
+            </NavigationView.MenuItems>
+            <Frame x:Name="ContentFrame" AutomationProperties.AutomationId="ContentFrame" />
+        </NavigationView>
+    </Grid>
+</Window>
