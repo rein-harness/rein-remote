@@ -217,7 +217,18 @@ sealed class AppSession : IDisposable
                 .FirstOrDefault(i => (i.Name ?? "").StartsWith(prefix, StringComparison.Ordinal)),
             $"an item starting {prefix} in {comboId}");
         var name = item.Name;
-        item.Patterns.SelectionItem.Pattern.Select();
+        output.WriteLine($"picking \"{name}\" (enabled {item.IsEnabled}, offscreen {item.IsOffscreen})");
+        try
+        {
+            item.Patterns.SelectionItem.Pattern.Select();
+        }
+        catch (Exception e)
+        {
+            // A WinUI combo box's item may refuse UIA's Select: click it as a person would.
+            output.WriteLine($"Select refused ({e.GetType().Name}): clicking it");
+            item.ScrollIntoView();
+            item.Click();
+        }
         Thread.Sleep(300);
         try
         {
