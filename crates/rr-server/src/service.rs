@@ -1,8 +1,8 @@
 //! `rein-remote install-service` / `uninstall-service`: `serve` or `relay` started with the machine
 //! (or the user's session), with its flags from a config file (`--config`, see `config.rs`).
 //!
-//!   rein-remote install-service [serve|relay] [--config FILE.toml] [--system] [--name NAME] [--print]
-//!   rein-remote uninstall-service [serve|relay] [--system] [--name NAME] [--print]
+//!   rein-remote install-service [serve|relay|host] [--config FILE.toml] [--system] [--name NAME] [--print]
+//!   rein-remote uninstall-service [serve|relay|host] [--system] [--name NAME] [--print]
 //!
 //! - Linux: a systemd unit, the user's (`systemctl --user`, the default) or the system's (`--system`).
 //! - macOS: a launchd LaunchAgent in the user's session (the default: screen capture needs it) or a
@@ -49,6 +49,8 @@ pub struct Spec {
     /// Where systemd looks for the user's units: `$XDG_CONFIG_HOME`, else `~/.config`.
     pub config_home: PathBuf,
     pub uid: u32,
+    /// Started (or stopped) now too, not only at the next login or boot.
+    pub now: bool,
 }
 
 /// A command to run; `may_fail`: its failure is expected sometimes (stopping what isn't running).
@@ -98,10 +100,10 @@ impl Spec {
     }
 
     fn what(&self) -> &'static str {
-        if self.command == "relay" {
-            "relay"
-        } else {
-            "server"
+        match self.command.as_str() {
+            "relay" => "relay",
+            "host" => "host",
+            _ => "server",
         }
     }
 
@@ -244,17 +246,24 @@ pub fn install_plan(s: &Spec, os: Os) -> Plan {
             let unit = format!("{}.service", s.name);
             let ctl: &[&str] = if s.system { &["systemctl"] } else { &["systemctl", "--user"] };
             p.steps.push(step(&[ctl, &["daemon-reload"]].concat()));
-            p.steps.push(step(&[ctl, &["enable", "--now", &unit]].concat()));
-            // Started again if it was already running (an update of the binary or the unit).
-            p.steps.push(step(&[ctl, &["restart", &unit]].concat()));
+            if s.now {
+                p.steps.push(step(&[ctl, &["enable", "--now", &unit]].concat()));
+                // Started again if it was already running (an update of the binary or the unit).
+                p.steps.push(step(&[ctl, &["restart", &unit]].concat()));
+            } else {
+                p.steps.push(step(&[ctl, &["enable", &unit]].concat()));
+            }
         }
         Os::Mac => {
             let path = unit_path(s, os).unwrap();
             let path_s = path.display().to_string();
             p.files.push((path, launchd_plist(s)));
             let domain = if s.system { "system".to_string() } else { format!("gui/{}", s.uid) };
-            p.steps.push(quietly(&["launchctl", "bootout", &format!("{domain}/{}", s.label())]));
-            p.steps.push(step(&["launchctl", "bootstrap", &domain, &path_s]));
+            // (Not now: launchd loads it at the next login.)
+            if s.now {
+                p.steps.push(quietly(&["launchctl", "bootout", &format!("{domain}/{}", s.label())]));
+                p.steps.push(step(&["launchctl", "bootstrap", &domain, &path_s]));
+            }
         }
         Os::Windows if s.system => {
             let bin = std::iter::once(s.exe.display().to_string())
@@ -311,7 +320,9 @@ pub fn install_plan(s: &Spec, os: Os) -> Plan {
                 "/TR",
                 &run,
             ]));
-            p.steps.push(step(&["schtasks.exe", "/Run", "/TN", &s.name]));
+            if s.now {
+                p.steps.push(step(&["schtasks.exe", "/Run", "/TN", &s.name]));
+            }
         }
     }
     p
@@ -323,24 +334,30 @@ pub fn uninstall_plan(s: &Spec, os: Os) -> Plan {
         Os::Linux => {
             let unit = format!("{}.service", s.name);
             let ctl: &[&str] = if s.system { &["systemctl"] } else { &["systemctl", "--user"] };
-            p.steps.push(may_fail(&[ctl, &["stop", &unit]].concat()));
+            if s.now {
+                p.steps.push(may_fail(&[ctl, &["stop", &unit]].concat()));
+            }
             p.steps.push(may_fail(&[ctl, &["disable", &unit]].concat()));
             p.remove.push(unit_path(s, os).unwrap());
-            p.remove_after = 2;
+            p.remove_after = p.steps.len();
             p.steps.push(step(&[ctl, &["daemon-reload"]].concat()));
         }
         Os::Mac => {
             let domain = if s.system { "system".to_string() } else { format!("gui/{}", s.uid) };
-            p.steps.push(may_fail(&["launchctl", "bootout", &format!("{domain}/{}", s.label())]));
+            if s.now {
+                p.steps.push(may_fail(&["launchctl", "bootout", &format!("{domain}/{}", s.label())]));
+            }
             p.remove.push(unit_path(s, os).unwrap());
-            p.remove_after = 1;
+            p.remove_after = p.steps.len();
         }
         Os::Windows if s.system => {
             p.steps.push(may_fail(&["sc.exe", "stop", &s.name]));
             p.steps.push(step(&["sc.exe", "delete", &s.name]));
         }
         Os::Windows => {
-            p.steps.push(may_fail(&["schtasks.exe", "/End", "/TN", &s.name]));
+            if s.now {
+                p.steps.push(may_fail(&["schtasks.exe", "/End", "/TN", &s.name]));
+            }
             p.steps.push(step(&["schtasks.exe", "/Delete", "/F", "/TN", &s.name]));
         }
     }
@@ -449,7 +466,7 @@ pub fn run(args: &[String], install: bool) -> Result<(), String> {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "serve" | "relay" => command = a.clone(),
+            "serve" | "relay" | "host" => command = a.clone(),
             "--config" => config = Some(it.next().ok_or("--config needs a file")?.clone()),
             "--system" => system = true,
             "--user" => system = false,
@@ -457,17 +474,15 @@ pub fn run(args: &[String], install: bool) -> Result<(), String> {
             "--print" | "--dry-run" => print = true,
             _ => {
                 return Err(format!(
-                    "{a}? (install-service [serve|relay] [--config FILE.toml] [--system] [--name NAME] [--print])"
+                    "{a}? (install-service [serve|relay|host] [--config FILE.toml] [--system] [--name NAME] [--print])"
                 ))
             }
         }
     }
-    let name = name.unwrap_or_else(|| {
-        if command == "relay" {
-            "rein-remote-relay".into()
-        } else {
-            "rein-remote".into()
-        }
+    let name = name.unwrap_or_else(|| match command.as_str() {
+        "relay" => "rein-remote-relay".into(),
+        "host" => HOST_NAME.into(),
+        _ => "rein-remote".into(),
     });
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)) {
         return Err("--name: letters, digits, - _ and . only".into());
@@ -483,19 +498,7 @@ pub fn run(args: &[String], install: bool) -> Result<(), String> {
         }
         _ => None,
     };
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let spec = Spec {
-        command,
-        name,
-        exe: plain(exe.canonicalize().unwrap_or(exe)),
-        config,
-        system,
-        config_home: std::env::var_os("XDG_CONFIG_HOME")
-            .filter(|v| !v.is_empty())
-            .map_or_else(|| home().join(".config"), PathBuf::from),
-        home: home(),
-        uid: uid(),
-    };
+    let spec = spec(command, name, config, system, true)?;
     let os = Os::current();
     let plan = if install { install_plan(&spec, os) } else { uninstall_plan(&spec, os) };
     if print {
@@ -520,6 +523,56 @@ pub fn run(args: &[String], install: bool) -> Result<(), String> {
         }
     );
     Ok(())
+}
+
+/// What `install-service` installs for this user (or the system), running this binary.
+fn spec(command: String, name: String, config: Option<PathBuf>, system: bool, now: bool) -> Result<Spec, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    Ok(Spec {
+        command,
+        name,
+        exe: plain(exe.canonicalize().unwrap_or(exe)),
+        config,
+        system,
+        config_home: std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|v| !v.is_empty())
+            .map_or_else(|| home().join(".config"), PathBuf::from),
+        home: home(),
+        uid: uid(),
+        now,
+    })
+}
+
+/// The host's service (`rein-remote host`, the user's, started at login).
+pub const HOST_NAME: &str = "rein-remote-host";
+
+/// Whether the host starts at login: it's installed, what kind of service it is, and its file.
+pub fn host_at_login() -> Result<(bool, &'static str, Option<PathBuf>), String> {
+    let s = spec("host".into(), HOST_NAME.into(), None, false, false)?;
+    let os = Os::current();
+    let kind = match os {
+        Os::Linux => "systemd",
+        Os::Mac => "launchd",
+        Os::Windows => "task",
+    };
+    Ok(match unit_path(&s, os) {
+        Some(path) => (path.exists(), kind, Some(path)),
+        None => {
+            let found = std::process::Command::new("schtasks.exe")
+                .args(["/Query", "/TN", HOST_NAME])
+                .output()
+                .is_ok_and(|o| o.status.success());
+            (found, kind, None)
+        }
+    })
+}
+
+/// The host started at login from now on (or not): for the next login, neither starting another
+/// host now nor stopping this one.
+pub fn set_host_at_login(on: bool) -> Result<(), String> {
+    let s = spec("host".into(), HOST_NAME.into(), None, false, false)?;
+    let os = Os::current();
+    carry_out(&if on { install_plan(&s, os) } else { uninstall_plan(&s, os) })
 }
 
 fn absolute(p: &Path) -> PathBuf {
@@ -638,6 +691,7 @@ mod tests {
             home: PathBuf::from("/home/me"),
             config_home: PathBuf::from("/home/me/.config"),
             uid: 501,
+            now: true,
         }
     }
 
@@ -688,6 +742,33 @@ mod tests {
         let d = launchd_plist(&spec("relay", true));
         assert!(!d.contains("Aqua") && d.contains("/Library/Logs/rein-remote-relay.log"), "{d}");
         assert_eq!(install_plan(&spec("relay", true), Os::Mac).steps[1].argv[2], "system");
+    }
+
+    #[test]
+    fn the_host_is_installed_for_the_next_login_without_starting_another() {
+        let mut s = spec("host", false);
+        s.name = HOST_NAME.into();
+        s.config = None;
+        s.now = false;
+        let p = install_plan(&s, Os::Linux);
+        assert!(
+            systemd_unit(&s).contains("ExecStart=\"/opt/rein remote/rein-remote\" host\n"),
+            "{}",
+            systemd_unit(&s)
+        );
+        assert_eq!(p.steps.last().unwrap().argv, ["systemctl", "--user", "enable", "rein-remote-host.service"]);
+        let p = uninstall_plan(&s, Os::Linux);
+        assert!(p.steps.iter().all(|x| !x.argv.contains(&"stop".to_string())), "{:?}", p.steps);
+        assert!(install_plan(&s, Os::Mac).steps.is_empty(), "launchd loads it at login");
+        assert!(uninstall_plan(&s, Os::Mac).steps.is_empty());
+        assert_eq!(
+            install_plan(&s, Os::Mac).files[0].0,
+            PathBuf::from("/home/me/Library/LaunchAgents/com.rein-harness.rein-remote-host.plist")
+        );
+        let p = install_plan(&s, Os::Windows);
+        assert_eq!(p.steps.len(), 1, "created, not run: {:?}", p.steps);
+        assert!(p.steps[0].argv.last().unwrap().ends_with("rein-remote host"));
+        assert_eq!(uninstall_plan(&s, Os::Windows).steps.len(), 1);
     }
 
     #[test]

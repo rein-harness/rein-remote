@@ -138,13 +138,20 @@ fn glob(pat: &str, s: &str, fold: bool) -> bool {
 impl Policy {
     pub fn load(path: &std::path::Path) -> Result<Self, String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("--policy {}: {e}", path.display()))?;
-        let p: Policy = if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("json")) {
-            serde_json::from_str(&text).map_err(|e| format!("--policy {}: {e}", path.display()))?
+        let json = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("json"));
+        Self::parse(&text, json).map_err(|e| format!("--policy {}: {e}", path.display()))
+    }
+
+    /// A policy from its text (TOML, or JSON): what's wrong with it as the parser says, or that it
+    /// has no rules (it would refuse everyone).
+    pub fn parse(text: &str, json: bool) -> Result<Self, String> {
+        let p: Policy = if json {
+            serde_json::from_str(text).map_err(|e| e.to_string())?
         } else {
-            toml::from_str(&text).map_err(|e| format!("--policy {}: {e}", path.display()))?
+            toml::from_str(text).map_err(|e| e.to_string())?
         };
         if p.rules.is_empty() {
-            return Err(format!("--policy {}: no [[rule]]s, so it would refuse everyone", path.display()));
+            return Err("no [[rule]]s, so it would refuse everyone".into());
         }
         Ok(p)
     }

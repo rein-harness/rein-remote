@@ -356,12 +356,14 @@ pub fn start(source: Box<dyn Source>, opts: Options) -> Result<Running, String> 
     }
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
     // A pairing link opens this machine's page on the local network (where a phone is).
-    let pair_page = {
+    let pair_page = if addr.ip().is_unspecified() {
         let host = crate::links::places()
             .into_iter()
             .find(|p| p.label == "this network")
             .map_or("localhost".to_string(), |p| p.host);
         format!("http://{host}:{}/", addr.port())
+    } else {
+        format!("http://{addr}/")
     };
     if let Some(code) = gate.new_code() {
         let url = format!("{pair_page}#pair={}&id={}", code.replace('-', ""), gate.fingerprint().unwrap_or_default());

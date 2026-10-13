@@ -9,6 +9,7 @@
 //!   rein-remote serve --display 2          # a display (macOS: its number in `displays`; Linux: :N)
 //!   rein-remote windows [--json]           # the windows it can show
 //!   rein-remote serve --config serve.toml  # flags from a file (TOML, each key a flag's name)
+//!   rein-remote host                       # long-running, for the apps: sharing on and off, a control API (docs/control-api.md)
 //!   rein-remote install-service --config serve.toml [--print]   # started with the session (systemd, launchd, a task)
 //!   rein-remote displays                   # the displays (macOS)
 //!   rein-remote discover                   # Rein Remote servers on this network (mDNS)
@@ -28,6 +29,7 @@ mod capture;
 mod config;
 mod conn;
 mod connect;
+mod control;
 mod encode;
 #[cfg(windows)]
 mod encode_mf;
@@ -39,6 +41,7 @@ mod fleet;
 mod gamepad;
 #[cfg(target_os = "linux")]
 mod h264;
+mod host;
 mod identity;
 mod link;
 mod links;
@@ -56,7 +59,7 @@ use capture::{Source, TestPattern};
 
 fn usage() -> ! {
     eprintln!(
-        "rein-remote {}\n\nusage:\n  rein-remote serve [--config FILE.toml] [--display :N | --window APP|TITLE|ID | --app NAME | --kms [CONNECTOR] | --vnc HOST:PORT [--vnc-password P] | --pipe WxH | --test-pattern [WxH] [--motion full]] [--listen ADDR] [--fps auto|N] [--codec h264|h265|auto] [--bitrate KBPS|auto] [--prefer framerate|quality] [--token T] [--webtransport on|off] [--tls-cert PEM --tls-key PEM] [--tailscale-cert on|off] [--mdns on|off] [--pair on|off] [--relay ws(s)://HOST:PORT ... [--room CODE] [--relay-secret S]] [--audio on|off] [--public-url URL --oidc-issuer URL --oidc-client-id ID [--oidc-client-secret-file F] [--oidc-scopes S] [--oidc-user-claim C] [--oidc-groups-claim C] | --saml-idp-metadata FILE|URL [--saml-entity-id ID] [--saml-user-attr A] [--saml-groups-attr A]] [--policy FILE] [--audit FILE] [--record DIR]\n  rein-remote relay [--config FILE.toml] [--listen ADDR] [--secret S] [--metrics-listen ADDR|PORT|off]\n  rein-remote install-service [serve|relay] [--config FILE.toml] [--system] [--name NAME] [--print]\n  rein-remote uninstall-service [serve|relay] [--system] [--name NAME] [--print]\n  rein-remote windows [--json]\n  rein-remote displays\n  rein-remote discover [SECONDS]\n  rein-remote paired | unpair ID\n  rein-remote connect URL|NAME [--seconds N] [--pair CODE] [--json] [--webtransport on|off] [--datagrams on|off] [--direct on|off]\n  rein-remote selftest [--window Q | --display :N | --kms [CONNECTOR] | --test-pattern [WxH]] [--type TEXT] [--encode OUT.h264 [--frames N]]\n  rein-remote --version",
+        "rein-remote {}\n\nusage:\n  rein-remote serve [--config FILE.toml] [--display :N | --window APP|TITLE|ID | --app NAME | --kms [CONNECTOR] | --vnc HOST:PORT [--vnc-password P] | --pipe WxH | --test-pattern [WxH] [--motion full]] [--listen ADDR] [--fps auto|N] [--codec h264|h265|auto] [--bitrate KBPS|auto] [--prefer framerate|quality] [--token T] [--webtransport on|off] [--tls-cert PEM --tls-key PEM] [--tailscale-cert on|off] [--mdns on|off] [--pair on|off] [--relay ws(s)://HOST:PORT ... [--room CODE] [--relay-secret S]] [--audio on|off] [--public-url URL --oidc-issuer URL --oidc-client-id ID [--oidc-client-secret-file F] [--oidc-scopes S] [--oidc-user-claim C] [--oidc-groups-claim C] | --saml-idp-metadata FILE|URL [--saml-entity-id ID] [--saml-user-attr A] [--saml-groups-attr A]] [--policy FILE] [--audit FILE] [--record DIR]\n  rein-remote host [--config host.toml] [--control-listen ADDR] [--control-remote on] [--sharing on|off] [serve's flags]\n  rein-remote relay [--config FILE.toml] [--listen ADDR] [--secret S] [--metrics-listen ADDR|PORT|off]\n  rein-remote install-service [serve|relay|host] [--config FILE.toml] [--system] [--name NAME] [--print]\n  rein-remote uninstall-service [serve|relay|host] [--system] [--name NAME] [--print]\n  rein-remote windows [--json]\n  rein-remote displays\n  rein-remote discover [SECONDS]\n  rein-remote paired | unpair ID\n  rein-remote connect URL|NAME [--seconds N] [--pair CODE] [--json] [--webtransport on|off] [--datagrams on|off] [--direct on|off]\n  rein-remote selftest [--window Q | --display :N | --kms [CONNECTOR] | --test-pattern [WxH]] [--type TEXT] [--encode OUT.h264 [--frames N]]\n  rein-remote --version",
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(2);
@@ -183,6 +186,12 @@ fn dispatch(mut args: Vec<String>) -> i32 {
                 return 1;
             }
         }
+        Some("host") => {
+            if let Err(e) = host::run(&args[1..]) {
+                eprintln!("rein-remote: {e}");
+                return 1;
+            }
+        }
         Some(c @ ("install-service" | "uninstall-service")) => {
             if let Err(e) = service::run(&args[1..], c == "install-service") {
                 eprintln!("rein-remote: {e}");
@@ -202,6 +211,59 @@ fn dispatch(mut args: Vec<String>) -> i32 {
 }
 
 fn serve_cmd(args: &[String]) -> Result<(), String> {
+    let (source, opts) = build_serve(args)?;
+    serve::run(source, opts)
+}
+
+/// What to show, as `serve`'s flags pick it (one of them; none: the display).
+#[derive(Default, Clone, Debug)]
+pub struct Pick {
+    pub display: Option<String>,
+    pub window: Option<String>,
+    pub app: Option<String>,
+    pub vnc: Option<String>,
+    pub vnc_password: Option<String>,
+    pub pipe: Option<(usize, usize)>,
+    pub pattern: Option<(usize, usize)>,
+    pub full_motion: bool,
+    pub kms: Option<Option<String>>,
+}
+
+impl Pick {
+    /// What it shows, as a policy's `sources` names it.
+    pub fn label(&self) -> String {
+        match (&self.pattern, &self.window) {
+            (Some(_), _) => "test-pattern".into(),
+            (None, _) if self.kms.is_some() => "kms".into(),
+            (None, _) if self.pipe.is_some() => "pipe".into(),
+            (None, _) if self.vnc.is_some() => format!("vnc:{}", self.vnc.as_deref().unwrap()),
+            (None, Some(q)) => format!("window:{q}"),
+            (None, None) if self.app.is_some() => format!("app:{}", self.app.as_deref().unwrap()),
+            (None, None) => self.display.as_ref().map_or("display".into(), |d| format!("display:{d}")),
+        }
+    }
+
+    /// The source, opened, and the sound that goes with it (`sound`: `--audio`, when given).
+    pub fn open(&self, sound: Option<bool>) -> Result<(Box<dyn Source>, Sound), String> {
+        let elsewhere = || if sound == Some(true) { Sound::System } else { Sound::Off };
+        Ok(match (self.pattern, &self.window) {
+            (Some((w, h)), _) if self.full_motion => (Box::new(TestPattern::full_motion(w, h)), Sound::Tone),
+            (Some((w, h)), _) => (Box::new(TestPattern::new(w, h)), Sound::Tone),
+            (None, _) if self.kms.is_some() => (open_kms(self.kms.clone().unwrap().as_deref())?, Sound::System),
+            (None, _) if self.pipe.is_some() => (Box::new(capture::pipe::Pipe::open(self.pipe.unwrap().0, self.pipe.unwrap().1)), elsewhere()),
+            (None, _) if self.vnc.is_some() => (
+                Box::new(capture::vnc::Vnc::open(self.vnc.as_deref().unwrap(), self.vnc_password.as_deref())?),
+                elsewhere(),
+            ),
+            (None, Some(q)) => open_window(q)?,
+            (None, None) if self.app.is_some() => open_app(self.app.as_deref().unwrap())?,
+            (None, None) => open_display(self.display.as_deref())?,
+        })
+    }
+}
+
+/// `serve`'s flags as the source to show and the server's options (the source opened, sign-in set up).
+fn build_serve(args: &[String]) -> Result<(Box<dyn Source>, serve::Options), String> {
     let mut opts = serve::Options {
         // Not given: every interface (your tailnet, this network), behind a token in the link.
         listen: "auto".into(),
@@ -237,15 +299,10 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
     let (mut policy, mut audit) = (None, None);
     let (mut relay, mut room, mut relay_secret) = (Vec::new(), None, std::env::var("REIN_REMOTE_RELAY_SECRET").ok());
     let (mut tls_cert, mut tls_key) = (None, None);
-    let mut display: Option<String> = None;
-    let mut window: Option<String> = None;
-    let mut app: Option<String> = None;
-    let mut vnc: Option<String> = None;
-    let mut pipe: Option<(usize, usize)> = None;
-    let mut vnc_password = std::env::var("REIN_REMOTE_VNC_PASSWORD").ok();
-    let mut pattern: Option<(usize, usize)> = None;
-    let mut full_motion = false;
-    let mut kms: Option<Option<String>> = None;
+    let mut pick = Pick {
+        vnc_password: std::env::var("REIN_REMOTE_VNC_PASSWORD").ok(),
+        ..Default::default()
+    };
     // Sound: on unless turned off; for a VNC display or piped frames, off unless turned on (this
     // machine's sound isn't theirs).
     let mut sound: Option<bool> = None;
@@ -272,17 +329,17 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
             }
             "--prefer" => opts.prefer = adapt::Prefer::parse(&val()?).ok_or("--prefer is framerate or quality")?,
             "--bitrate" => opts.bitrate_kbps = match val()?.as_str() { "auto" => 0, v => v.parse().map_err(|_| "--bitrate is kbit/s (or auto)")? },
-            "--display" => display = Some(val()?),
-            "--window" => window = Some(val()?),
-            "--app" => app = Some(val()?),
-            "--motion" => full_motion = val()? == "full",
-            "--vnc" => vnc = Some(val()?),
+            "--display" => pick.display = Some(val()?),
+            "--window" => pick.window = Some(val()?),
+            "--app" => pick.app = Some(val()?),
+            "--motion" => pick.full_motion = val()? == "full",
+            "--vnc" => pick.vnc = Some(val()?),
             "--pipe" => {
                 let v = val()?;
                 let (w, h) = v.split_once('x').ok_or("--pipe WxH")?;
-                pipe = Some((w.parse().map_err(|_| "--pipe WxH")?, h.parse().map_err(|_| "--pipe WxH")?));
+                pick.pipe = Some((w.parse().map_err(|_| "--pipe WxH")?, h.parse().map_err(|_| "--pipe WxH")?));
             }
-            "--vnc-password" => vnc_password = Some(val()?),
+            "--vnc-password" => pick.vnc_password = Some(val()?),
             "--token" => opts.token = Some(val()?),
             "--public-url" => public_url = Some(val()?),
             "--oidc-issuer" => oidc_issuer = Some(val()?),
@@ -311,13 +368,13 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
             "--webtransport" => opts.webtransport = !matches!(val()?.as_str(), "off" | "false" | "no"),
             // `on`/`off` too (what `true`/`false` are in a config file).
             "--test-pattern" => {
-                pattern = match on_off(&mut it) {
+                pick.pattern = match on_off(&mut it) {
                     Some(false) => None,
                     _ => Some(size_arg(&mut it)?.unwrap_or((1280, 720))),
                 }
             }
             "--kms" => {
-                kms = match on_off(&mut it) {
+                pick.kms = match on_off(&mut it) {
                     Some(false) => None,
                     Some(true) => Some(None),
                     None => Some(optional_arg(&mut it)),
@@ -382,31 +439,10 @@ fn serve_cmd(args: &[String]) -> Result<(), String> {
         opts.relay = Some((relay, room, relay_secret));
     }
     // What it shows, as a policy's `sources` names it.
-    opts.source_label = match (&pattern, &window) {
-        (Some(_), _) => "test-pattern".into(),
-        (None, _) if kms.is_some() => "kms".into(),
-        (None, _) if pipe.is_some() => "pipe".into(),
-        (None, _) if vnc.is_some() => format!("vnc:{}", vnc.as_deref().unwrap()),
-        (None, Some(q)) => format!("window:{q}"),
-        (None, None) if app.is_some() => format!("app:{}", app.as_deref().unwrap()),
-        (None, None) => display.as_ref().map_or("display".into(), |d| format!("display:{d}")),
-    };
-    let elsewhere = || if sound == Some(true) { Sound::System } else { Sound::Off };
-    let (source, with): (Box<dyn Source>, Sound) = match (pattern, window) {
-        (Some((w, h)), _) if full_motion => (Box::new(TestPattern::full_motion(w, h)), Sound::Tone),
-        (Some((w, h)), _) => (Box::new(TestPattern::new(w, h)), Sound::Tone),
-        (None, _) if kms.is_some() => (open_kms(kms.unwrap().as_deref())?, Sound::System),
-        (None, _) if pipe.is_some() => (Box::new(capture::pipe::Pipe::open(pipe.unwrap().0, pipe.unwrap().1)), elsewhere()),
-        (None, _) if vnc.is_some() => (
-            Box::new(capture::vnc::Vnc::open(vnc.as_deref().unwrap(), vnc_password.as_deref())?),
-            elsewhere(),
-        ),
-        (None, Some(q)) => open_window(&q)?,
-        (None, None) if app.is_some() => open_app(app.as_deref().unwrap())?,
-        (None, None) => open_display(display.as_deref())?,
-    };
+    opts.source_label = pick.label();
+    let (source, with) = pick.open(sound)?;
     opts.audio = audio::Audio::new(if sound == Some(false) { Sound::Off } else { with });
-    serve::run(source, opts)
+    Ok((source, opts))
 }
 
 struct SignInArgs {
