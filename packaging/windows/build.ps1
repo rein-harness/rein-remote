@@ -32,9 +32,10 @@ if ($LASTEXITCODE -ne 0) { throw "wix build failed ($LASTEXITCODE)" }
 # administrator). ALLUSERS=1 is then for an elevated prompt (msiexec doesn't ask on its own).
 $installer = New-Object -ComObject WindowsInstaller.Installer
 $si = $installer.GetType().InvokeMember('SummaryInformation', 'GetProperty', $null, $installer, @($Out, 1))
-$wc = $si.GetType().InvokeMember('Property', 'GetProperty', $null, $si, @(15))
-$si.GetType().InvokeMember('Property', 'SetProperty', $null, $si, @(15, ($wc -bor 8))) | Out-Null
+$wc = [int]$si.GetType().InvokeMember('Property', 'GetProperty', $null, $si, @(15))
+$new = [int]($wc -bor 8)   # plain Int32s: COM refuses a PowerShell-wrapped value (DISP_E_TYPEMISMATCH)
+$si.GetType().InvokeMember('Property', 'SetProperty', $null, $si, [object[]]@([int]15, $new)) | Out-Null
 $si.GetType().InvokeMember('Persist', 'InvokeMethod', $null, $si, $null) | Out-Null
 [void][Runtime.InteropServices.Marshal]::ReleaseComObject($si)
-Write-Host "Word Count: $wc -> $($wc -bor 8) (no elevation needed)"
+Write-Host "Word Count: $wc -> $new (no elevation needed)"
 Get-Item $Out | Format-Table Name, Length
