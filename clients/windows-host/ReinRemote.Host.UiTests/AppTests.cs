@@ -85,7 +85,7 @@ public class AppTests
             Env.Until(() => host.Get(c => c.GetViewers()).Viewers.Count == 0, "the viewer gone at the host");
             Env.Until(() => app.Find("NoViewers") is { IsOffscreen: false }, "no viewers on the page");
             Assert.True(viewers[0].WaitForExit(30000), "rein-remote connect ended when kicked");
-            Assert.Contains("session_kicked", File.ReadAllText(Path.Combine(home, "audit.jsonl")));
+            Assert.Contains("session_kicked", Env.Read(Path.Combine(home, "audit.jsonl")));
 
             Step("live sessions, with a second viewer");
             viewers.Add(Viewer(link));
@@ -103,7 +103,7 @@ public class AppTests
             app.Type("FpsBox", "30");
             app.Press("SaveSettings");
             Env.Until(() => app.AllText("SettingsResult").Contains("Saved"), "Saved shown");
-            Env.Until(() => File.ReadAllText(HostHome.HostToml(home)).Contains("fps = 30"), "fps = 30 in host.toml");
+            Env.Until(() => Env.Read(HostHome.HostToml(home)).Contains("fps = 30"), "fps = 30 in host.toml");
             Assert.Equal("30", host.Get(c => c.GetSettings()).Settings["fps"]!.ToString());
             app.Type("FpsBox", "500");
             app.Press("SaveSettings");
@@ -172,7 +172,7 @@ public class AppTests
             output.WriteLine("--- host log\n" + host.Log);
             var log = Path.Combine(home, "app.log");
             if (File.Exists(log))
-                output.WriteLine("--- app.log\n" + File.ReadAllText(log));
+                output.WriteLine("--- app.log\n" + Env.Read(log));
             try { app.Shot("failure"); } catch (Exception) { }
             throw;
         }
@@ -221,7 +221,7 @@ public class AppTests
             output.WriteLine(app.Dump());
             foreach (var f in new[] { "app.log", "host.log" })
                 if (File.Exists(Path.Combine(home, f)))
-                    output.WriteLine($"--- {f}\n" + File.ReadAllText(Path.Combine(home, f)));
+                    output.WriteLine($"--- {f}\n" + Env.Read(Path.Combine(home, f)));
             throw;
         }
         finally

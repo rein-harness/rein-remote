@@ -30,6 +30,13 @@ static class Env
         return d;
     }
 
+    /// <summary>A file another process may hold open for writing (the host's audit log).</summary>
+    public static string Read(string path)
+    {
+        using var r = new StreamReader(new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete));
+        return r.ReadToEnd();
+    }
+
     /// <summary>Polls <paramref name="f"/> until it gives something (or true), or fails the test saying what it waited for.</summary>
     public static T Until<T>(Func<T?> f, string what, double seconds = 30)
     {
