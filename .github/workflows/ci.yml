@@ -393,6 +393,8 @@ jobs:
         if: always()
         run: |
           grep -v '^rein-remote: {' serve.log || true
+          # What it sent (frames, bytes, encode times): the last few of its 5-second reports.
+          grep '^rein-remote: {' serve.log | tail -4 || true
   # The Android app: the Rust core (crates/rr-jni) built with cargo-ndk for a phone and the emulator,
   # the APK, and the unit tests (gestures, keys, gamepads, the barcode reader, links).
   android:
@@ -464,3 +466,5 @@ jobs:
         if: always()
         run: |
           grep -v '^rein-remote: {' serve.log || true
+          # What it sent (frames, bytes, encode times): the last few of its 5-second reports.
+          grep '^rein-remote: {' serve.log | tail -4 || true
